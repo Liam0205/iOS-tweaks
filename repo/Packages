@@ -1,16 +1,16 @@
 Package: com.liam.mybankbypass
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64
 Maintainer: Liam
 Installed-Size: 76
 Depends: mobilesubstrate (>= 0.9.5000)
-Filename: debs/com.liam.mybankbypass_1.0.0_iphoneos-arm64.deb
-Size: 7542
-MD5sum: db493f1beb01e5aed827b2cbc604fbd7
-SHA1: ace12fbcd2de51a496aa987cdcd671a201a199db
-SHA256: 5a4ef03c2c879e0adddf917525095e05bf4c885d7ceb1da1c32706186a1f4d5a
+Filename: debs/com.liam.mybankbypass_1.1.0_iphoneos-arm64.deb
+Size: 10300
+MD5sum: b37aed134029bb770c19f2210e2bd24e
+SHA1: 223e4db1de3957005a63f3e02d56ac9daf85230b
+SHA256: 7d7133c51463638309c310255a360840084eaf477c7288a4a9e388b424c87aa3
 Section: Tweaks
-Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。目前支持网商银行 4.6.4 版本，适用于 rootless 越狱（Dopamine 等）。
+Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。支持网商银行 4.6.4 ~ 4.7.36 版本，适用于 rootless 越狱（Dopamine 等）。
 Author: Liam
 Name: MYBankBypass-网商银行反检测-rootless
 
