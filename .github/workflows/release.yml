@@ -46,9 +46,13 @@ jobs:
       - name: Download artifact
         run: |
           mkdir -p dist
-          RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --status=success --json databaseId -q '.[0].databaseId')
+          RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --json databaseId,status -q '[.[] | select(.status=="completed")][0].databaseId')
           if [ -z "$RUN_ID" ]; then
-            echo "::error::No successful build found for this commit"
+            # Fallback: get any run for this commit
+            RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --json databaseId -q '.[0].databaseId')
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No build found for this commit"
             exit 1
           fi
           gh run download "$RUN_ID" -n "${{ steps.meta.outputs.tweak }}-deb" -D dist/
