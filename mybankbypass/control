@@ -5,6 +5,6 @@ Architecture: iphoneos-arm64
 Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。支持网商银行 4.6.4 ~ 4.7.36 版本，适用于 rootless 越狱（Dopamine 等）。
 Maintainer: Liam
 Author: Liam
-Section: Tweaks
+Section: 反检测
 Depends: mobilesubstrate (>= 0.9.5000)
 SileoDepiction: https://tweaks.0x01.page/depictions/com.liam.mybankbypass.json
