@@ -119,6 +119,47 @@ jobs:
             done
           } > Release.tmp && mv Release.tmp Release
 
+      - name: Update depiction
+        run: |
+          TWEAK="${{ steps.meta.outputs.tweak }}"
+          PKG_ID=$(grep '^Package:' "$TWEAK/control" | cut -d: -f2- | xargs)
+          DESC=$(grep '^Description:' "$TWEAK/control" | cut -d: -f2- | xargs)
+          CHANGELOG_FILE="$TWEAK/CHANGELOG.md"
+
+          mkdir -p repo/depictions
+
+          # Read changelog content (strip leading "# Changelog" header)
+          if [ -f "$CHANGELOG_FILE" ]; then
+            CHANGELOG=$(sed '1{/^# /d;}' "$CHANGELOG_FILE")
+          else
+            CHANGELOG="## ${{ steps.meta.outputs.version }}\n\nRelease ${{ steps.meta.outputs.version }}"
+          fi
+
+          # Escape for JSON
+          DESC_JSON=$(printf '%s' "$DESC" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+          CL_JSON=$(printf '%s' "$CHANGELOG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+
+          cat > "repo/depictions/${PKG_ID}.json" <<DEPICTION
+          {
+            "minVersion": "0.1",
+            "headerImage": "",
+            "tintColor": "#2196F3",
+            "tabs": [
+              {
+                "tabname": "详情",
+                "views": [{"class": "DepictionMarkdownView", "markdown": $DESC_JSON}],
+                "class": "DepictionStackView"
+              },
+              {
+                "tabname": "更新日志",
+                "views": [{"class": "DepictionMarkdownView", "markdown": $CL_JSON}],
+                "class": "DepictionStackView"
+              }
+            ],
+            "class": "DepictionTabView"
+          }
+          DEPICTION
+
       - name: Commit repo update
         run: |
           git config user.name "github-actions[bot]"
