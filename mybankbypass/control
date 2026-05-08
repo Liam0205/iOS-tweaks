@@ -1,8 +1,8 @@
 Package: com.liam.mybankbypass
-Name: MYBankBypass
+Name: MYBankBypass-网商银行反检测-rootless
 Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: Bypass jailbreak detection for MYBank (网商银行)
+Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。目前支持网商银行 4.6.4 版本，适用于 rootless 越狱（Dopamine 等）。
 Maintainer: Liam
 Author: Liam
 Section: Tweaks
