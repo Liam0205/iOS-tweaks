@@ -7,10 +7,9 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     permissions:
       contents: write
-      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,14 +19,11 @@ jobs:
         id: meta
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          # Tag format: <tweak-dir>_<version>
           TWEAK="${TAG%_*}"
           VERSION="${TAG##*_}"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "tweak=$TWEAK" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-          # Read display name from control file
           if [ -f "$TWEAK/control" ]; then
             NAME=$(grep '^Name:' "$TWEAK/control" | cut -d: -f2- | xargs)
           else
@@ -35,36 +31,28 @@ jobs:
           fi
           echo "name=$NAME" >> $GITHUB_OUTPUT
 
-      - name: Wait for build workflow
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: build (${{ steps.meta.outputs.tweak }})
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 15
+      - name: Install Theos
+        run: |
+          brew install ldid dpkg
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Download artifact
+      - name: Build
+        working-directory: ${{ steps.meta.outputs.tweak }}
+        run: |
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Prepare deb
         run: |
           mkdir -p dist
-          RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --json databaseId,status -q '[.[] | select(.status=="completed")][0].databaseId')
-          if [ -z "$RUN_ID" ]; then
-            # Fallback: get any run for this commit
-            RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --json databaseId -q '.[0].databaseId')
-          fi
-          if [ -z "$RUN_ID" ]; then
-            echo "::error::No build found for this commit"
-            exit 1
-          fi
-          gh run download "$RUN_ID" -n "${{ steps.meta.outputs.tweak }}-deb" -D dist/
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cp ${{ steps.meta.outputs.tweak }}/packages/*.deb dist/
 
       - name: Generate release notes
         id: notes
         run: |
           TWEAK="${{ steps.meta.outputs.tweak }}"
           TAG="${{ steps.meta.outputs.tag }}"
-          # Find previous tag for same tweak
           PREV_TAG=$(git tag --sort=-creatordate | grep "^${TWEAK}_" | grep -v "^${TAG}$" | head -1)
           if [ -z "$PREV_TAG" ]; then
             RANGE="HEAD"
@@ -92,19 +80,16 @@ jobs:
 
       - name: Update Sileo repo
         run: |
-          # Read package ID from control
           TWEAK="${{ steps.meta.outputs.tweak }}"
           PKG_ID=$(grep '^Package:' "$TWEAK/control" | cut -d: -f2- | xargs)
 
-          # Remove old debs for this package, add new
           rm -f repo/debs/${PKG_ID}_*.deb
           cp dist/*.deb repo/debs/
 
-          # Regenerate Packages from ALL debs in repo
           cd repo
           dpkg-scanpackages debs /dev/null > Packages 2>/dev/null
 
-          # Patch Packages with fields from each tweak's control (SileoDepiction, Section)
+          # Patch Packages with fields from control files
           cd ..
           for ctrl in */control; do
             pkg=$(grep '^Package:' "$ctrl" | cut -d: -f2- | xargs)
@@ -112,12 +97,11 @@ jobs:
             section=$(grep '^Section:' "$ctrl" | cut -d: -f2- | xargs)
             if [ -n "$pkg" ]; then
               if [ -n "$section" ]; then
-                sed -i "/^Package: $pkg/,/^$/{s|^Section:.*|Section: $section|}" repo/Packages
+                sed -i '' "/^Package: $pkg/,/^$/{s|^Section:.*|Section: $section|;}" repo/Packages
               fi
               if [ -n "$depiction" ]; then
-                # Remove any existing depiction lines (case-insensitive), then add correct one
-                sed -i "/^Package: $pkg/,/^$/{/^[Ss]ileo[Dd]epiction:/d}" repo/Packages
-                sed -i "/^Package: $pkg/,/^$/s|^Name:.*|&\nSileoDepiction: $depiction|" repo/Packages
+                sed -i '' "/^Package: $pkg/,/^$/{/^[Ss]ileo[Dd]epiction:/d;}" repo/Packages
+                sed -i '' "/^Package: $pkg/,/^$/{s|^Name:.*|&\\"$'\n'"SileoDepiction: $depiction|;}" repo/Packages
               fi
             fi
           done
@@ -132,14 +116,14 @@ jobs:
             echo "MD5Sum:"
             for f in Packages Packages.gz Packages.bz2; do
               SIZE=$(wc -c < "$f" | tr -d ' ')
-              HASH=$(md5sum "$f" | cut -d' ' -f1)
-              echo " $HASH $SIZE $f"
+              HASH=$(md5 -q "$f")
+              printf " %s %s %s\n" "$HASH" "$SIZE" "$f"
             done
             echo "SHA256:"
             for f in Packages Packages.gz Packages.bz2; do
               SIZE=$(wc -c < "$f" | tr -d ' ')
-              HASH=$(sha256sum "$f" | cut -d' ' -f1)
-              echo " $HASH $SIZE $f"
+              HASH=$(shasum -a 256 "$f" | cut -d' ' -f1)
+              printf " %s %s %s\n" "$HASH" "$SIZE" "$f"
             done
           } > Release.tmp && mv Release.tmp Release
 
@@ -152,14 +136,12 @@ jobs:
 
           mkdir -p repo/depictions
 
-          # Read changelog content (strip leading "# Changelog" header)
           if [ -f "$CHANGELOG_FILE" ]; then
             CHANGELOG=$(sed '1{/^# /d;}' "$CHANGELOG_FILE")
           else
             CHANGELOG="## ${{ steps.meta.outputs.version }}\n\nRelease ${{ steps.meta.outputs.version }}"
           fi
 
-          # Escape for JSON
           DESC_JSON=$(printf '%s' "$DESC" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
           CL_JSON=$(printf '%s' "$CHANGELOG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 
@@ -183,6 +165,7 @@ jobs:
             "class": "DepictionTabView"
           }
           DEPICTION
+          sed -i '' 's/^          //' "repo/depictions/${PKG_ID}.json"
 
       - name: Generate index.html
         run: |
@@ -192,9 +175,9 @@ jobs:
             desc=$(grep '^Description:' "$ctrl" | cut -d: -f2- | xargs)
             version=$(grep '^Version:' "$ctrl" | cut -d: -f2- | xargs)
             [ -z "$name" ] && continue
-            ITEMS="${ITEMS}<li><strong>${name}</strong> <small>v${version}</small><br><span class=\"desc\">${desc}</span></li>\n"
+            ITEMS="${ITEMS}<li><strong>${name}</strong> <small>v${version}</small><br><span class=\"desc\">${desc}</span></li>"
           done
-          cat > repo/index.html <<INDEXEOF
+          cat > repo/index.html <<'INDEXEOF'
           <!DOCTYPE html>
           <html>
           <head>
@@ -215,7 +198,9 @@ jobs:
             <p>适用于 rootless 越狱 (Dopamine / palera1n) 的插件仓库。</p>
             <h2>可用插件</h2>
             <ul>
-          $(printf "$ITEMS")
+          INDEXEOF
+          echo "$ITEMS" >> repo/index.html
+          cat >> repo/index.html <<'INDEXEOF'
             </ul>
             <h2>添加软件源</h2>
             <p>在 Sileo 中添加以下地址：</p>
@@ -224,8 +209,7 @@ jobs:
           </body>
           </html>
           INDEXEOF
-          # Remove leading whitespace from heredoc
-          sed -i 's/^          //' repo/index.html
+          sed -i '' 's/^          //' repo/index.html
 
       - name: Commit and push to master
         run: |
