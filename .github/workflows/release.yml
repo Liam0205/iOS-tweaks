@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'mybankbypass_[0-9]+.[0-9]+.[0-9]+'
+      - '*_[0-9]+.[0-9]+.[0-9]+'
 
 jobs:
   release:
@@ -16,23 +16,34 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version from tag
+      - name: Parse tag
         id: meta
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#mybankbypass_}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # Tag format: <tweak-dir>_<version>
+          TWEAK="${TAG%_*}"
+          VERSION="${TAG##*_}"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tweak=$TWEAK" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Read display name from control file
+          if [ -f "$TWEAK/control" ]; then
+            NAME=$(grep '^Name:' "$TWEAK/control" | cut -d: -f2- | xargs)
+          else
+            NAME="$TWEAK"
+          fi
+          echo "name=$NAME" >> $GITHUB_OUTPUT
 
       - name: Wait for build workflow
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
           ref: ${{ github.sha }}
-          check-name: build
+          check-name: build (${{ steps.meta.outputs.tweak }})
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 15
 
-      - name: Download artifact from build workflow
+      - name: Download artifact
         run: |
           mkdir -p dist
           RUN_ID=$(gh run list --workflow=build.yml --commit=${{ github.sha }} --status=success --json databaseId -q '.[0].databaseId')
@@ -40,20 +51,23 @@ jobs:
             echo "::error::No successful build found for this commit"
             exit 1
           fi
-          gh run download "$RUN_ID" -n mybankbypass-deb -D dist/
+          gh run download "$RUN_ID" -n "${{ steps.meta.outputs.tweak }}-deb" -D dist/
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate release notes
         id: notes
         run: |
-          PREV_TAG=$(git tag --sort=-creatordate | grep '^mybankbypass_' | sed -n '2p')
+          TWEAK="${{ steps.meta.outputs.tweak }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          # Find previous tag for same tweak
+          PREV_TAG=$(git tag --sort=-creatordate | grep "^${TWEAK}_" | grep -v "^${TAG}$" | head -1)
           if [ -z "$PREV_TAG" ]; then
             RANGE="HEAD"
           else
             RANGE="${PREV_TAG}..HEAD"
           fi
-          NOTES=$(git log "$RANGE" --pretty=format:"- %s" -- mybankbypass/)
+          NOTES=$(git log "$RANGE" --pretty=format:"- %s" -- "$TWEAK/")
           if [ -z "$NOTES" ]; then
             NOTES="- Release ${{ steps.meta.outputs.version }}"
           fi
@@ -63,22 +77,26 @@ jobs:
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
-      - name: Create prerelease
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: MYBankBypass v${{ steps.meta.outputs.version }}
+          name: "${{ steps.meta.outputs.name }} v${{ steps.meta.outputs.version }}"
           body: ${{ steps.notes.outputs.notes }}
           prerelease: false
           files: dist/*.deb
 
       - name: Update Sileo repo
         run: |
-          # Remove old mybankbypass debs, add new one
-          rm -f repo/debs/com.liam.mybankbypass_*.deb
+          # Read package ID from control
+          TWEAK="${{ steps.meta.outputs.tweak }}"
+          PKG_ID=$(grep '^Package:' "$TWEAK/control" | cut -d: -f2- | xargs)
+
+          # Remove old debs for this package, add new
+          rm -f repo/debs/${PKG_ID}_*.deb
           cp dist/*.deb repo/debs/
 
-          # Regenerate Packages
+          # Regenerate Packages from ALL debs in repo
           cd repo
           dpkg-scanpackages debs /dev/null > Packages 2>/dev/null
           gzip -k -f Packages
@@ -89,5 +107,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add repo/
-          git commit -m "repo: update mybankbypass to ${{ steps.meta.outputs.version }}" || true
+          git commit -m "repo: update ${{ steps.meta.outputs.tweak }} to ${{ steps.meta.outputs.version }}" || true
           git push origin HEAD:master
