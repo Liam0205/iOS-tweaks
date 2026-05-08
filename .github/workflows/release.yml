@@ -102,6 +102,23 @@ jobs:
           gzip -k -f Packages
           bzip2 -k -f Packages
 
+          # Regenerate Release with checksums
+          {
+            grep -v '^MD5Sum:\|^SHA256:\|^ ' Release 2>/dev/null || true
+            echo "MD5Sum:"
+            for f in Packages Packages.gz Packages.bz2; do
+              SIZE=$(wc -c < "$f" | tr -d ' ')
+              HASH=$(md5sum "$f" | cut -d' ' -f1)
+              echo " $HASH $SIZE $f"
+            done
+            echo "SHA256:"
+            for f in Packages Packages.gz Packages.bz2; do
+              SIZE=$(wc -c < "$f" | tr -d ' ')
+              HASH=$(sha256sum "$f" | cut -d' ' -f1)
+              echo " $HASH $SIZE $f"
+            done
+          } > Release.tmp && mv Release.tmp Release
+
       - name: Commit repo update
         run: |
           git config user.name "github-actions[bot]"
@@ -109,3 +126,8 @@ jobs:
           git add repo/
           git commit -m "repo: update ${{ steps.meta.outputs.tweak }} to ${{ steps.meta.outputs.version }}" || true
           git push origin HEAD:master
+
+      - name: Trigger Pages deployment
+        run: gh workflow run pages.yml --ref master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
