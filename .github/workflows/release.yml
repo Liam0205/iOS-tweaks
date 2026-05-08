@@ -8,9 +8,16 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
     permissions:
       contents: write
       actions: read
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +106,27 @@ jobs:
           # Regenerate Packages from ALL debs in repo
           cd repo
           dpkg-scanpackages debs /dev/null > Packages 2>/dev/null
+
+          # Patch Packages with fields from each tweak's control (SileoDepiction, Section)
+          cd ..
+          for ctrl in */control; do
+            dir=$(dirname "$ctrl")
+            pkg=$(grep '^Package:' "$ctrl" | cut -d: -f2- | xargs)
+            depiction=$(grep '^SileoDepiction:' "$ctrl" | cut -d: -f2- | xargs)
+            section=$(grep '^Section:' "$ctrl" | cut -d: -f2- | xargs)
+            if [ -n "$pkg" ]; then
+              if [ -n "$depiction" ] && ! grep -A20 "^Package: $pkg" repo/Packages | grep -q "^SileoDepiction:"; then
+                sed -i "/^Package: $pkg/,/^$/{/^$/i\\
+SileoDepiction: $depiction
+}" repo/Packages
+              fi
+              if [ -n "$section" ]; then
+                sed -i "/^Package: $pkg/,/^$/{s|^Section:.*|Section: $section|}" repo/Packages
+              fi
+            fi
+          done
+          cd repo
+
           gzip -k -f Packages
           bzip2 -k -f Packages
 
@@ -168,7 +196,10 @@ jobs:
           git commit -m "repo: update ${{ steps.meta.outputs.tweak }} to ${{ steps.meta.outputs.version }}" || true
           git push origin HEAD:master
 
-      - name: Trigger Pages deployment
-        run: gh workflow run pages.yml --ref master
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo/
+
+      - name: Publish Pages
+        uses: actions/deploy-pages@v4
