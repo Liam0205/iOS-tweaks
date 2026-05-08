@@ -6,3 +6,11 @@ Codename: stable
 Architectures: iphoneos-arm64
 Components: main
 Description: Liam's Jailbreak Tweaks Repository
+MD5Sum:
+ 1a9d4c9d54300d9b5b6d760a3900d59b 649 Packages
+ 3b4cb95fd76a1cc31e1fd8ea8124ceff 532 Packages.gz
+ 9bb6a3593790497f90bcfeb5db5baeb5 576 Packages.bz2
+SHA256:
+ 7bccbdbc9b71824dce2543e24d13e15611d051182713fbe720086aa93fa766c9 649 Packages
+ 96435d255d63778c5a3989a3937940f56e32a0a3925eade8df5fb06a8f5e3cdf 532 Packages.gz
+ 8e32e5f5b1e9070eef5cb3ff66bc0ab316b0f4b07cc19071222332b9cce3e240 576 Packages.bz2
