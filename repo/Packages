@@ -14,7 +14,6 @@ Description: 绕过交通银行的越狱环境检测，使其在越狱设备上�
 Author: Liam
 Name: BankcommBypass-交通银行反检测-rootless
 SileoDepiction: https://tweaks.0x01.page/depictions/com.liam.bankcommbypass.json
-Sileodepiction: https://tweaks.0x01.page/depictions/com.liam.bankcommbypass.json
 
 Package: com.liam.mybankbypass
 Version: 1.1.1
@@ -23,14 +22,13 @@ Maintainer: Liam
 Installed-Size: 76
 Depends: mobilesubstrate (>= 0.9.5000)
 Filename: debs/com.liam.mybankbypass_1.1.1_iphoneos-arm64.deb
-Size: 10340
-MD5sum: c1b42f4dbfe0d8d11e9f36408716892f
-SHA1: 9a5c06c9c4e5aa51f8c04244b8a1768cbb9b8153
-SHA256: 9d8ce09571668b8d601d72a59b80e6b6b0dba55357b18aac714109ed6d6ff080
+Size: 10314
+MD5sum: 66c9c3246a3a9e70e272f7b93cfd198a
+SHA1: c08a333e67ebd233d1ba81ebcf77490360d186e0
+SHA256: 2be7e0023739919e51282be01497d069efdc05dd4d512709d17e29fdb3d8434a
 Section: 反检测
 Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。支持网商银行 4.6.4 ~ 4.7.36 版本，适用于 rootless 越狱（Dopamine 等）。
 Author: Liam
 Name: MYBankBypass-网商银行反检测-rootless
 SileoDepiction: https://tweaks.0x01.page/depictions/com.liam.mybankbypass.json
-Sileodepiction: https://tweaks.0x01.page/depictions/com.liam.mybankbypass.json
 
