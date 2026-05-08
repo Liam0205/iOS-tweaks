@@ -7,8 +7,31 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tweaks: ${{ steps.find.outputs.tweaks }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find tweak directories
+        id: find
+        run: |
+          # Find directories containing both Makefile and control (Theos tweaks)
+          TWEAKS=$(find . -maxdepth 2 -name "control" -path "*/control" | while read f; do
+            dir=$(dirname "$f")
+            if [ -f "$dir/Makefile" ]; then
+              basename "$dir"
+            fi
+          done | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "tweaks=$TWEAKS" >> $GITHUB_OUTPUT
+          echo "Found tweaks: $TWEAKS"
+
   build:
+    needs: discover
     runs-on: macos-latest
+    strategy:
+      matrix:
+        tweak: ${{ fromJson(needs.discover.outputs.tweaks) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,8 +41,8 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Build package
-        working-directory: mybankbypass
+      - name: Build ${{ matrix.tweak }}
+        working-directory: ${{ matrix.tweak }}
         run: |
           make clean
           make FINALPACKAGE=1
@@ -28,5 +51,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mybankbypass-deb
-          path: mybankbypass/packages/*.deb
+          name: ${{ matrix.tweak }}-deb
+          path: ${{ matrix.tweak }}/packages/*.deb
