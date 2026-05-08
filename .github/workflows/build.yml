@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          brew install ldid dpkg
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Build package
+        working-directory: mybankbypass
+        run: |
+          make clean
+          make FINALPACKAGE=1
+          make package FINALPACKAGE=1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mybankbypass-deb
+          path: mybankbypass/packages/*.deb
