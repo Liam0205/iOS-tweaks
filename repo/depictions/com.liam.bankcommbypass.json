@@ -10,7 +10,7 @@
     },
     {
       "tabname": "更新日志",
-      "views": [{"class": "DepictionMarkdownView", "markdown": "## 0.1.0\\n\\nRelease 0.1.0"}],
+      "views": [{"class": "DepictionMarkdownView", "markdown": "## 0.1.0\\n\\n- 初始版本\\n- 绕过交通银行 10.3.0 越狱环境检测\\n- Hook BangcleCheck、SecureUtilityPlus、CWDeviceStatusManager 等安全类\\n- Hook C 层文件检测（stat/lstat/access/fopen）\\n- Hook dyld 枚举、sysctl 调试检测、fork\\n- 拦截越狱提示弹窗与 exit/abort 退出调用\\n- 隐藏越狱相关 URL Scheme 和环境变量"}],
       "class": "DepictionStackView"
     }
   ],
