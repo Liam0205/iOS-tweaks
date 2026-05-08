@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\u7ed5\u8fc7\u4ea4\u901a\u94f6\u884c\u7684\u8d8a\u72f1\u73af\u5883\u68c0\u6d4b\uff0c\u4f7f\u5176\u5728\u8d8a\u72f1\u8bbe\u5907\u4e0a\u6b63\u5e38\u8fd0\u884c\u3002\u652f\u6301\u4ea4\u901a\u94f6\u884c 10.3.0 \u7248\u672c\uff0c\u9002\u7528\u4e8e rootless \u8d8a\u72f1\uff08Dopamine \u7b49\uff09\u3002"}],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "## 0.1.0\\n\\nRelease 0.1.0"}],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}
