@@ -1,0 +1,8 @@
+Origin: LiamRepo
+Label: LiamRepo
+Suite: stable
+Version: 1.0
+Codename: stable
+Architectures: iphoneos-arm64
+Components: main
+Description: Liam's Jailbreak Tweaks Repository

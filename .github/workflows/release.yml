@@ -69,5 +69,25 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: MYBankBypass v${{ steps.meta.outputs.version }}
           body: ${{ steps.notes.outputs.notes }}
-          prerelease: true
+          prerelease: false
           files: dist/*.deb
+
+      - name: Update Sileo repo
+        run: |
+          # Remove old mybankbypass debs, add new one
+          rm -f repo/debs/com.liam.mybankbypass_*.deb
+          cp dist/*.deb repo/debs/
+
+          # Regenerate Packages
+          cd repo
+          dpkg-scanpackages debs /dev/null > Packages 2>/dev/null
+          gzip -k -f Packages
+          bzip2 -k -f Packages
+
+      - name: Commit repo update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add repo/
+          git commit -m "repo: update mybankbypass to ${{ steps.meta.outputs.version }}" || true
+          git push origin HEAD:master
