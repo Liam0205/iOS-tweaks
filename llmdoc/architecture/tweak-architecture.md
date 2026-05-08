@@ -2,7 +2,7 @@
 
 ## 架构目标
 
-`mybankbypass/Tweak.x` 的目标不是只绕过一个检测点，而是同时切断“发现越狱迹象”和“检测后自杀退出”两条链路。当前稳定版本采用“多层拦截 + 最终终止保护”的结构。
+`mybankbypass/Tweak.x` 的目标不是只绕过一个检测点，而是同时切断“发现越狱迹象”和“检测后自杀退出”两条链路。当前稳定版本采用“多层拦截 + 业务层中和 + 最终终止保护”的结构。
 
 ## 整体执行模型
 
@@ -12,7 +12,7 @@
 2. `%ctor` 在 dylib 加载时执行
 3. 先安装退出相关 Hook，优先阻断检测命中后的 kill/exit 路径
 4. 再安装文件系统、进程、环境变量、dyld 等 C 层 Hook
-5. 最后执行运行时方法替换，覆盖 `IOSSecuritySuite` 与 SecurityGuard 相关 ObjC/Swift 暴露接口
+5. 最后执行运行时方法替换，覆盖 `IOSSecuritySuite`、SecurityGuard 以及 App 自身 launcher/controller 级别的越狱判断
 
 这意味着当前架构同时依赖两类能力：
 
@@ -44,6 +44,8 @@
 - `realpath`
 - `readlink`
 - `creat`
+- `statfs`
+- `statvfs`
 
 关键实现约束：
 
@@ -64,6 +66,7 @@ App 可通过 `UIApplication canOpenURL:` 检查 Cydia、Sileo、Filza、Zebra �
 - `NSProcessInfo environment`：删除 `DYLD_INSERT_LIBRARIES`、`DYLD_LIBRARY_PATH`、`_MSSafeMode`、`_SafeMode`
 - `getenv`：对同类注入痕迹直接返回 `NULL`
 - `fork`：恒定返回 `-1` 并设置 `ENOSYS`，模拟正常 iOS 沙盒限制
+- `getppid`：返回安全父进程语义，减少越狱注入环境可见性
 - `sysctl`：清除 `P_TRACED` 标志，降低调试检测可见性
 - `sysctlbyname`：对 `security.mac.amfi.developer_mode_status` 返回可接受结果
 
@@ -98,6 +101,7 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 
 - `IOSSecuritySuite`
 - Ant Group / Alibaba `SecurityGuard` 相关类
+- App 自身 launcher/controller 级别的越狱决策逻辑
 
 当前实现通过运行时查类和替换方法实现：
 
@@ -105,8 +109,10 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 - `amIJailbrokenWithFailedChecks` 返回未越狱、空失败项
 - `amIJailbrokenWithFailMessage` 返回未越狱、空消息
 - 对类名中与 root/jailbreak/checkEnv 相关的 SecurityGuard 方法，根据返回类型替换为 `NO` 或 `0`
+- 直接 Hook `MYBLauncherController.checkJailbroken`，阻断 App 业务层根据越狱状态进入冻结/退出流程
+- 额外中和 `MAJailbreakChecker`、`MASecurityUtil`、`RDSSecurityCheck`、`DTDeviceInfo`、`RVPBridgeExtension4Jailbroken`、`BinAOP` 等组件的越狱判断结果
 
-这层的目标不是精确理解所有 SDK 内部逻辑，而是把其对外暴露的“越狱判断结果”统一钳制到安全值。
+这层的目标不是精确理解所有 SDK 内部逻辑，而是把其对外暴露的“越狱判断结果”统一钳制到安全值，并切断 launcher/controller 的业务分支。
 
 ### 6. 终止保护层
 
@@ -142,6 +148,10 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 
 这是绕过能稳定工作的另一个关键条件。终止函数 Hook 的目标不是“放行返回”，而是“拦住当前线程并保持调用语义不返回”。
 
+### 业务冻结优先排查 launcher/controller
+
+`4.7.36` 暴露出的关键问题不是简单闪退，而是“App 不退出但业务冻结”。根因是 launcher 检测到越狱后触发 exit 链路，而 tweak 的终止 Hook 把进程保活成“假活”状态：主线程 RunLoop 仍在，但业务交互已被中断。出现这一现象时，应先检查 launcher/controller 的 jailbreak check 流程，确认是否仍有上层布尔判断未被中和。
+
 ## 依赖与边界
 
 - 构建依赖：Theos、Substrate/ElleKit 兼容环境、UIKit/Foundation
@@ -153,6 +163,7 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 
 - 目标 App 升级后新增检测路径、类名或 selector
 - SecurityGuard 内部接口命名变化，导致运行时方法替换覆盖不足
+- launcher/controller 级别的本地越狱布尔判断路径变化
 - rootless 路径出现新变体但未加入路径/子串表
 - 低层 Hook 如果再次引入 ObjC 逻辑，会重新带回稳定性问题
 - 终止链路若新增 `posix_spawn`、自定义 crash 或更底层 syscall 退出路径，需要补充保护

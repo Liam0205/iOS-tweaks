@@ -2,12 +2,12 @@
 
 ## 目的
 
-本文档汇总网商银行 `4.6.4` 当前已知的越狱检测向量，说明它们来自哪些分析结论、当前 tweak 如何覆盖，以及哪些点是稳定实现中的关键经验。
+本文档汇总网商银行 `4.6.4` 与 `4.7.36` 当前已知的越狱检测向量，说明它们来自哪些分析结论、当前 tweak 如何覆盖，以及哪些点是稳定实现中的关键经验。
 
 ## 目标与背景
 
 - 目标 App：`com.mybank.ios.phone`
-- 已验证版本：`4.6.4`
+- 已验证版本：`4.6.4`、`4.7.36`
 - 主进程：`Portal`
 - 核心安全框架：阿里系 / 蚂蚁系 `SecurityGuard` SDK
 - 其他高层检测组件：`IOSSecuritySuite`
@@ -52,7 +52,7 @@ rootless 环境还必须特别关注：
 当前覆盖：
 
 - ObjC：`NSFileManager` 多个文件查询接口
-- C：`stat`、`lstat`、`access`、`open`、`fopen`、`realpath`、`readlink`、`creat`
+- C：`stat`、`lstat`、`access`、`open`、`fopen`、`realpath`、`readlink`、`creat`、`statfs`、`statvfs`
 
 稳定经验：
 
@@ -127,24 +127,28 @@ App 可枚举已加载镜像、检查注入痕迹或通过符号/路径判断当
 已知手段包括：
 
 - `fork()`：判断是否能突破普通 iOS 沙盒限制
+- `getppid()`：根据父进程语义识别异常注入环境
 - `sysctl()`：查看进程调试标志，例如 `P_TRACED`
 - `sysctlbyname()`：读取系统安全状态
 - `ptrace` / 调试相关流程
 - 向受保护路径创建文件，验证文件系统是否可写
+- `statfs()` / `statvfs()`：通过文件系统类型或挂载特征识别 rootless/越狱环境
 
 当前覆盖：
 
 - `fork`：固定返回失败
+- `getppid`：返回安全父进程语义
 - `sysctl`：清理 `P_TRACED`
 - `sysctlbyname`：对特定 developer mode 状态返回安全值
 - `creat`：拦截典型沙盒写测试文件
+- `statfs` / `statvfs`：中和文件系统层检测
 
 说明：
 
 - 当前源码没有单独 Hook `ptrace`，但已有覆盖足以支撑已验证版本工作。
 - 若后续版本对反调试更激进，`ptrace` 可能重新成为补点。
 
-### 6. 高层安全框架检测
+### 6. 高层安全框架与业务层检测
 
 #### IOSSecuritySuite
 
@@ -170,11 +174,27 @@ App 可枚举已加载镜像、检查注入痕迹或通过符号/路径判断当
 当前覆盖：
 
 - 运行时扫描实例方法与类方法，只要 selector 名称包含 root / jail / jailbreak / checkEnv 等语义，就按返回类型替换为 `NO` 或 `0`
+- 额外中和 `MAJailbreakChecker`、`MASecurityUtil`、`RDSSecurityCheck`、`DTDeviceInfo`、`RVPBridgeExtension4Jailbroken`、`BinAOP` 等组件
 
 说明：
 
 - 这是“结果钳制”策略，而不是完整还原 SDK 内部协议。
 - 对当前已验证版本足够有效，但 SDK 改名后应优先检查此层是否失效。
+
+#### App 自身 launcher/controller 检测
+
+`4.7.36` 新增的关键业务层检测点是：
+
+- `MYBLauncherController.checkJailbroken`
+
+当前覆盖：
+
+- 直接 Hook `MYBLauncherController.checkJailbroken`，阻断 launcher 将越狱状态传播到后续冻结/退出链路
+
+稳定经验：
+
+- 如果现象是“App 不退出但业务冻结”，优先检查 launcher/controller 的本地越狱布尔判断。
+- 这种冻结通常不是 RPC 层故障，而是上层已命中本地安全分支，终止 Hook 又把进程保活成“假活”状态。
 
 ### 7. 检测后的退出链路
 
@@ -183,6 +203,11 @@ App 可枚举已加载镜像、检查注入痕迹或通过符号/路径判断当
 - 启动后 3-5 秒退出
 - `is_jailbroken_kill_app_report`
 - `degrade_jailbreaking_track_ph`
+
+`4.7.36` 额外暴露出的行为特征：
+
+- launcher 命中越狱分支后，可能先导致业务初始化冻结，再落入 exit 链路
+- 若 exit 被 tweak 拦下，进程会停留在前台，但处于“主线程 RunLoop 仍活着、业务交互异常”的假活状态
 
 当前覆盖：
 
@@ -196,21 +221,30 @@ App 可枚举已加载镜像、检查注入痕迹或通过符号/路径判断当
 
 - `exit` / `_exit` / `abort` 属于 `noreturn` 终止函数，Hook 后不能返回。
 - 主线程上应维持 RunLoop，后台线程上应永久阻塞。
+- 仅靠终止保护不能替代上游检测中和；否则容易把“退出”问题变成“冻结”问题。
 
 ## 当前版本的关键修正
 
-对本项目而言，以下三点不是“优化项”，而是让 tweak 真正稳定工作的关键修正：
+对本项目而言，以下几点不是“优化项”，而是让 tweak 真正稳定工作的关键修正：
 
 1. C Hook 中改用纯 C 字符串匹配，避免 ObjC 参与低层文件 API。
 2. 移除 `opendir` Hook，避免触发 watchdog 或异常目录访问行为。
 3. 将退出 Hook 改成 `noreturn` 安全实现，而不是拦截后直接返回。
+4. 为 `4.7.36` 新增 `MYBLauncherController.checkJailbroken` Hook，切断业务层冻结入口。
+5. 扩展 `MAJailbreakChecker`、`MASecurityUtil`、`RDSSecurityCheck`、`DTDeviceInfo`、`RVPBridgeExtension4Jailbroken`、`BinAOP`、`statfs`、`statvfs`、`getppid` 等检测中和点。
+
+## 调试与适配经验
+
+- 当前环境下 Frida 的 ObjC bridge 不可用，做运行时类/方法枚举时应优先使用 `libobjc` 原生 C 接口手工 introspection。
+- Frida 中进程名可能显示为中文“网商银行”，判断进程状态与附加目标时应以 bundle id `com.mybank.ios.phone` 为准，而不是依赖显示名。
+- 当新版本出现“看起来没退出但业务不可用”的情况，应优先排查 launcher/controller 的 jailbreak check 流程，而不是先怀疑网络或 RPC 层。
 
 ## 版本适配时的优先检查顺序
 
 当网商银行升级后，建议优先检查以下几层是否发生变化：
 
-1. SecurityGuard / IOSSecuritySuite 相关类名与 selector 是否变化
-2. 新增的 rootless 路径、Frida 路径或其它文件特征
-3. dyld 枚举是否改为其他镜像查询接口
-4. 是否新增 `ptrace`、`posix_spawn`、更底层 syscall 或服务端联动退出
+1. launcher/controller 级别的本地越狱布尔判断是否变化，尤其是类似 `checkJailbroken` 的业务入口
+2. SecurityGuard / IOSSecuritySuite 相关类名与 selector 是否变化
+3. 新增的 rootless 路径、Frida 路径或其它文件特征
+4. 是否新增 `statfs`、`statvfs`、`getppid`、`ptrace`、`posix_spawn`、更底层 syscall 或服务端联动退出
 5. 检测命中后退出是否改用新的自杀链路
