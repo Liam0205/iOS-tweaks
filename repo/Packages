@@ -13,4 +13,5 @@ Section: Tweaks
 Description: 绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。支持网商银行 4.6.4 ~ 4.7.36 版本，适用于 rootless 越狱（Dopamine 等）。
 Author: Liam
 Name: MYBankBypass-网商银行反检测-rootless
+SileoDepiction: https://tweaks.0x01.page/depictions/com.liam.mybankbypass.json
 
