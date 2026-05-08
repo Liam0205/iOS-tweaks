@@ -4,12 +4,14 @@
 #import <sys/stat.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
+#import <sys/statvfs.h>
 #import <signal.h>
 #import <dirent.h>
 #import <mach-o/dyld.h>
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <string.h>
+#import <pthread.h>
 
 // ============================================================
 // Pure C path checking (no ObjC, safe for low-level hooks)
@@ -24,15 +26,19 @@ static const char *jb_paths[] = {
     "/usr/bin/ssh",
     "/usr/lib/substrate",
     "/usr/lib/libjailbreak.dylib",
+    "/usr/lib/libsubstitute.dylib",
     "/usr/libexec/sftp-server",
     "/usr/sbin/frida-server",
     "/etc/apt",
+    "/etc/ssh/sshd_config",
+    "/etc/profile",
     "/private/var/lib/apt",
     "/private/var/lib/cydia",
     "/private/var/mobile/Library/SBSettings",
     "/var/jb",
     "/var/lib/dpkg/info/mobilesubstrate.md5sums",
     "/var/lib/undecimus/apt",
+    "/var/lib/cydia",
     "/tmp/frida-",
     "/jb/jailbreakd.plist",
     "/jb/libjailbreak.dylib",
@@ -41,12 +47,30 @@ static const char *jb_paths[] = {
     "/usr/share/jailbreak/injectme.plist",
     "/var/mobile/Library/Caches/cy-",
     "/System/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist",
+    "/System/Library/LaunchDaemons/com.ikey.bbot.plist",
     "/usr/libexec/cydia",
     "/usr/local/bin/cycript",
     "/var/checkra1n.dmg",
     "/var/binpack",
     "/Library/PreferenceBundles",
     "/Library/PreferenceLoader",
+    "/bootstrap/inject_criticald",
+    "/var/binpack/loaderd_hook",
+    "/.installed_unc0ver",
+    "/.installed_yaluX",
+    "/Library/LaunchDaemons/com.openssh.sshd.plist",
+    "/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist",
+    "/Library/LaunchDaemons/dhpdaemon.plist",
+    "/usr/bin/DHPDaemon",
+    "/Library/MobileSubstrate/DynamicLibraries/AWZ.dylib",
+    "/Library/MobileSubstrate/DynamicLibraries/axjj.dylib",
+    "/Library/MobileSubstrate/DynamicLibraries/ALS.dylib",
+    "/Library/MobileSubstrate/DynamicLibraries/rstweak.dylib",
+    "/Library/MobileSubstrate/DynamicLibraries/zorro.dylib",
+    "/Library/MobileSubstrate/DynamicLibraries/zorrod.dylib",
+    "/usr/bin/zorrodaemon.dylib",
+    "/var/jb/usr/sbin/frida-server",
+    "/bin/ssh",
     NULL
 };
 
@@ -54,11 +78,10 @@ static const char *jb_substrings[] = {
     "substrate", "Substrate", "cydia", "Cydia",
     "frida", "jailbreak", "cycript", "MobileSubstrate",
     "TweakInject", "ellekit", "libhooker", "substitute",
-    "SBSettings", "pspawn",
+    "SBSettings", "pspawn", "libsubstitute",
     NULL
 };
 
-// Pure C check - no ObjC allocation, safe in any context
 static int is_jb_path_c(const char *path) {
     if (!path) return 0;
 
@@ -77,7 +100,6 @@ static int is_jb_path_c(const char *path) {
     return 0;
 }
 
-// Thread-local reentrance guard for ObjC hooks
 static _Thread_local int g_reentrant = 0;
 
 // ============================================================
@@ -105,37 +127,32 @@ static int is_jb_dylib(const char *name) {
         strstr(name, "TweakInject") || strstr(name, "ellekit") ||
         strstr(name, "pspawn") || strstr(name, "rocketbootstrap") ||
         strstr(name, "MYBankBypass") || strstr(name, "mybankNoJb") ||
-        strstr(name, "/var/jb/")) {
+        strstr(name, "/var/jb/") ||
+        strstr(name, "AWZ.dylib") || strstr(name, "axjj.dylib") ||
+        strstr(name, "ALS.dylib") || strstr(name, "rstweak.dylib") ||
+        strstr(name, "zorro") || strstr(name, "zorrod")) {
         return 1;
     }
     return 0;
 }
 
 // ============================================================
+// MARK: Hook MYBLauncherController (prevent jailbreak check from calling exit)
+// ============================================================
+
+%hook MYBLauncherController
+
+- (void)checkJailbroken {
+    // No-op: prevent detection flow that leads to exit()
+}
+
+%end
+
+// ============================================================
 // MARK: Hook NSFileManager
 // ============================================================
 
 %hook NSFileManager
-
-- (BOOL)fileExistsAtPath:(NSString *)path {
-    if (isJailbreakPath(path)) return NO;
-    return %orig;
-}
-
-- (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory {
-    if (isJailbreakPath(path)) return NO;
-    return %orig;
-}
-
-- (BOOL)isReadableFileAtPath:(NSString *)path {
-    if (isJailbreakPath(path)) return NO;
-    return %orig;
-}
-
-- (BOOL)isWritableFileAtPath:(NSString *)path {
-    if (isJailbreakPath(path)) return NO;
-    return %orig;
-}
 
 - (NSArray *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
     if (g_reentrant) return %orig;
@@ -152,14 +169,6 @@ static int is_jb_dylib(const char *name) {
         }
     }
     return filtered;
-}
-
-- (NSDictionary *)attributesOfItemAtPath:(NSString *)path error:(NSError **)error {
-    if (isJailbreakPath(path)) {
-        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
-        return nil;
-    }
-    return %orig;
 }
 
 %end
@@ -187,6 +196,7 @@ static int is_jb_dylib(const char *name) {
     NSMutableDictionary *env = [%orig mutableCopy];
     [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [env removeObjectForKey:@"DYLD_LIBRARY_PATH"];
+    [env removeObjectForKey:@"DYLD_FRAMEWORK_PATH"];
     [env removeObjectForKey:@"_MSSafeMode"];
     [env removeObjectForKey:@"_SafeMode"];
     return env;
@@ -198,7 +208,6 @@ static int is_jb_dylib(const char *name) {
 // MARK: C function hooks (pure C checks only!)
 // ============================================================
 
-// --- stat / lstat ---
 static int (*orig_stat)(const char *path, struct stat *buf);
 static int hooked_stat(const char *path, struct stat *buf) {
     if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
@@ -211,14 +220,12 @@ static int hooked_lstat(const char *path, struct stat *buf) {
     return orig_lstat(path, buf);
 }
 
-// --- access ---
 static int (*orig_access)(const char *path, int mode);
 static int hooked_access(const char *path, int mode) {
     if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
 }
 
-// --- open ---
 static int (*orig_open)(const char *path, int flags, ...);
 static int hooked_open(const char *path, int flags, ...) {
     if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
@@ -233,14 +240,12 @@ static int hooked_open(const char *path, int flags, ...) {
     return orig_open(path, flags);
 }
 
-// --- fopen ---
 static FILE *(*orig_fopen)(const char *path, const char *mode);
 static FILE *hooked_fopen(const char *path, const char *mode) {
     if (is_jb_path_c(path)) { errno = ENOENT; return NULL; }
     return orig_fopen(path, mode);
 }
 
-// --- realpath ---
 static char *(*orig_realpath)(const char *path, char *resolved);
 static char *hooked_realpath(const char *path, char *resolved) {
     if (is_jb_path_c(path)) { errno = ENOENT; return NULL; }
@@ -249,7 +254,6 @@ static char *hooked_realpath(const char *path, char *resolved) {
     return result;
 }
 
-// --- readlink ---
 static ssize_t (*orig_readlink)(const char *path, char *buf, size_t bufsize);
 static ssize_t hooked_readlink(const char *path, char *buf, size_t bufsize) {
     if (is_jb_path_c(path)) { errno = EINVAL; return -1; }
@@ -264,14 +268,12 @@ static ssize_t hooked_readlink(const char *path, char *buf, size_t bufsize) {
     return ret;
 }
 
-// --- fork ---
 static pid_t (*orig_fork)(void);
 static pid_t hooked_fork(void) {
     errno = ENOSYS;
     return -1;
 }
 
-// --- getenv ---
 static char *(*orig_getenv)(const char *name);
 static char *hooked_getenv(const char *name) {
     if (name && (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
@@ -284,7 +286,6 @@ static char *hooked_getenv(const char *name) {
     return orig_getenv(name);
 }
 
-// --- sysctl (hide P_TRACED flag) ---
 static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 static int hooked_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
@@ -298,7 +299,6 @@ static int hooked_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 }
 
-// --- sysctlbyname ---
 static int (*orig_sysctlbyname)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name && strcmp(name, "security.mac.amfi.developer_mode_status") == 0) {
@@ -310,43 +310,48 @@ static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
+// --- getppid (hide injection parent) ---
+static pid_t (*orig_getppid)(void);
+static pid_t hooked_getppid(void) {
+    return 1;
+}
+
 // ============================================================
 // MARK: Hook _dyld functions
 // ============================================================
 
 static uint32_t (*orig_dyld_image_count)(void);
+static const char *(*orig_dyld_get_image_name)(uint32_t idx);
+
 static uint32_t hooked_dyld_image_count(void) {
     uint32_t count = orig_dyld_image_count();
     uint32_t hidden = 0;
     for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (is_jb_dylib(name)) hidden++;
+        const char *name = orig_dyld_get_image_name(i);
+        if (name && is_jb_dylib(name)) hidden++;
     }
     return count - hidden;
 }
-
-static const char *(*orig_dyld_get_image_name)(uint32_t idx);
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
     uint32_t count = orig_dyld_image_count();
     uint32_t visibleIdx = 0;
     for (uint32_t i = 0; i < count; i++) {
         const char *name = orig_dyld_get_image_name(i);
+        if (!name) continue;
         if (!is_jb_dylib(name)) {
             if (visibleIdx == idx) return name;
             visibleIdx++;
         }
     }
-    return NULL;
+    return orig_dyld_get_image_name(0);
 }
 
-// --- dlopen ---
 static void *(*orig_dlopen)(const char *path, int mode);
 static void *hooked_dlopen(const char *path, int mode) {
     if (path && is_jb_path_c(path)) return NULL;
     return orig_dlopen(path, mode);
 }
 
-// --- dladdr ---
 static int (*orig_dladdr)(const void *addr, Dl_info *info);
 static int hooked_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
@@ -357,6 +362,7 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     }
     return ret;
 }
+
 
 // ============================================================
 // MARK: Block sandbox write test
@@ -369,6 +375,32 @@ static int hooked_creat(const char *path, mode_t mode) {
         return -1;
     }
     return orig_creat(path, mode);
+}
+
+// --- statfs / statvfs: hide writable root filesystem ---
+static int (*orig_statfs)(const char *path, struct statfs *buf);
+static int hooked_statfs(const char *path, struct statfs *buf) {
+    int ret = orig_statfs(path, buf);
+    if (ret == 0 && buf) {
+        // Force MNT_RDONLY on root and other restricted paths
+        if (path && (strcmp(path, "/") == 0 || strncmp(path, "/var", 4) == 0 ||
+                     strncmp(path, "/private", 8) == 0 || strncmp(path, "/System", 7) == 0)) {
+            buf->f_flags |= MNT_RDONLY | MNT_NOSUID;
+        }
+    }
+    return ret;
+}
+
+static int (*orig_statvfs)(const char *path, struct statvfs *buf);
+static int hooked_statvfs(const char *path, struct statvfs *buf) {
+    int ret = orig_statvfs(path, buf);
+    if (ret == 0 && buf) {
+        if (path && (strcmp(path, "/") == 0 || strncmp(path, "/var", 4) == 0 ||
+                     strncmp(path, "/private", 8) == 0 || strncmp(path, "/System", 7) == 0)) {
+            buf->f_flag |= ST_RDONLY | ST_NOSUID;
+        }
+    }
+    return ret;
 }
 
 // ============================================================
@@ -404,6 +436,95 @@ static void hookIOSSecuritySuite(void) {
 }
 
 // ============================================================
+// MARK: Hook MAJailbreakChecker (app's built-in detection)
+// ============================================================
+
+static void hookMAJailbreakChecker(void) {
+    Class cls = objc_getClass("MAJailbreakChecker");
+    if (!cls) return;
+
+    Class metaCls = object_getClass(cls);
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(metaCls, &methodCount);
+    for (unsigned int i = 0; i < methodCount; i++) {
+        NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+        char retType[8];
+        method_getReturnType(methods[i], retType, sizeof(retType));
+
+        if ([selName isEqualToString:@"amIJailbroken"] ||
+            [selName hasPrefix:@"check"] ||
+            [selName isEqualToString:@"amIRunInEmulator"]) {
+            if (retType[0] == 'B' || retType[0] == 'c') {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+            }
+        } else if ([selName isEqualToString:@"amIJailbrokenWithFailMessage"]) {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^id(id s) {
+                return @{@"jailbroken": @NO, @"failMessage": @""};
+            }));
+        } else if ([selName isEqualToString:@"amIJailbrokenWithFailedChecks"]) {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^id(id s) {
+                return @{@"jailbroken": @NO, @"failedChecks": @[]};
+            }));
+        } else if ([selName isEqualToString:@"performChecks"]) {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^id(id s) {
+                return @NO;
+            }));
+        } else if ([selName isEqualToString:@"getResultFromCheckType:"]) {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^id(id s, int type) {
+                return @NO;
+            }));
+        }
+    }
+    if (methods) free(methods);
+}
+
+// ============================================================
+// MARK: Hook MASecurityUtil (risk flag)
+// ============================================================
+
+static void hookMASecurityUtil(void) {
+    Class cls = objc_getClass("MASecurityUtil");
+    if (!cls) return;
+
+    SEL sel = NSSelectorFromString(@"existRisk");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+    sel = NSSelectorFromString(@"setExistRisk:");
+    m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, BOOL v) {}));
+
+    sel = NSSelectorFromString(@"isInstalledViaTrollStore");
+    m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+    sel = NSSelectorFromString(@"searchMemContent");
+    m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s) {}));
+
+    sel = NSSelectorFromString(@"startCheckTimer:");
+    m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, ...) {}));
+}
+
+// ============================================================
+// MARK: Hook RDSSecurityCheck (dylib/tweak detection)
+// ============================================================
+
+static void hookRDSSecurityCheck(void) {
+    Class cls = objc_getClass("RDSSecurityCheck");
+    if (!cls) return;
+
+    SEL sel = NSSelectorFromString(@"checkDylibTweak");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+    sel = NSSelectorFromString(@"checkAntiDebugStauts");
+    m = class_getInstanceMethod(cls, sel);
+    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+}
+
+// ============================================================
 // MARK: Hook SecurityGuard RootDetect
 // ============================================================
 
@@ -418,7 +539,6 @@ static void hookSecurityGuard(void) {
         Class cls = objc_getClass(className.UTF8String);
         if (!cls) continue;
 
-        // Instance methods
         unsigned int methodCount = 0;
         Method *methods = class_copyMethodList(cls, &methodCount);
         for (unsigned int i = 0; i < methodCount; i++) {
@@ -439,7 +559,6 @@ static void hookSecurityGuard(void) {
         }
         if (methods) free(methods);
 
-        // Class methods
         Class metaClass = object_getClass(cls);
         methods = class_copyMethodList(metaClass, &methodCount);
         for (unsigned int i = 0; i < methodCount; i++) {
@@ -463,22 +582,277 @@ static void hookSecurityGuard(void) {
 }
 
 // ============================================================
+// MARK: Hook DTDeviceInfo (new in 4.7.x)
+// ============================================================
+
+static void hookDTDeviceInfo(void) {
+    Class cls = objc_getClass("DTDeviceInfo");
+    if (!cls) return;
+
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(cls, &methodCount);
+    for (unsigned int i = 0; i < methodCount; i++) {
+        NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+        if ([selName containsString:@"isJail"] ||
+            [selName containsString:@"isJailBreak"] ||
+            [selName containsString:@"isJailbreak"] ||
+            [selName containsString:@"jailbreaked"] ||
+            [selName containsString:@"checkJailbroken"]) {
+            char retType[8];
+            method_getReturnType(methods[i], retType, sizeof(retType));
+            if (retType[0] == 'B' || retType[0] == 'c') {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+            } else if (retType[0] == 'i' || retType[0] == 'l' || retType[0] == 'q') {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^int(id s, ...) { return 0; }));
+            }
+        }
+    }
+    if (methods) free(methods);
+
+    Class metaClass = object_getClass(cls);
+    methods = class_copyMethodList(metaClass, &methodCount);
+    for (unsigned int i = 0; i < methodCount; i++) {
+        NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+        if ([selName containsString:@"isJail"] ||
+            [selName containsString:@"isJailBreak"] ||
+            [selName containsString:@"isJailbreak"] ||
+            [selName containsString:@"jailbreaked"] ||
+            [selName containsString:@"checkJailbroken"]) {
+            char retType[8];
+            method_getReturnType(methods[i], retType, sizeof(retType));
+            if (retType[0] == 'B' || retType[0] == 'c') {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+            } else if (retType[0] == 'i' || retType[0] == 'l' || retType[0] == 'q') {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^int(id s, ...) { return 0; }));
+            }
+        }
+    }
+    if (methods) free(methods);
+}
+
+// ============================================================
+// MARK: Hook DTDeviceInfo_isJailbreak C function
+// ============================================================
+
+static BOOL (*orig_DTDeviceInfo_isJailbreak)(void);
+static BOOL hooked_DTDeviceInfo_isJailbreak(void) {
+    return NO;
+}
+
+// ============================================================
+// MARK: Hook RVPBridgeExtension4Jailbroken (H5/RPC bridge)
+// ============================================================
+
+static void hookJailbreakBridge(void) {
+    Class cls = objc_getClass("RVPBridgeExtension4Jailbroken");
+    if (!cls) return;
+
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(cls, &methodCount);
+    for (unsigned int i = 0; i < methodCount; i++) {
+        char retType[8];
+        method_getReturnType(methods[i], retType, sizeof(retType));
+        if (retType[0] == 'B' || retType[0] == 'c') {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+        } else if (retType[0] == '@') {
+            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selName containsString:@"jailb"] || [selName containsString:@"Jailb"] ||
+                [selName containsString:@"Jail"]) {
+                method_setImplementation(methods[i], imp_implementationWithBlock(^id(id s, ...) {
+                    return @{@"isJailBroken": @NO, @"jailbroken": @NO};
+                }));
+            }
+        }
+    }
+    if (methods) free(methods);
+
+    Class metaCls = object_getClass(cls);
+    methods = class_copyMethodList(metaCls, &methodCount);
+    for (unsigned int i = 0; i < methodCount; i++) {
+        char retType[8];
+        method_getReturnType(methods[i], retType, sizeof(retType));
+        if (retType[0] == 'B' || retType[0] == 'c') {
+            method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+        }
+    }
+    if (methods) free(methods);
+}
+
+// Force _jailbreaked ivar to NO on DTDeviceInfo singleton
+static void forceDTDeviceInfoClean(void) {
+    Class cls = objc_getClass("DTDeviceInfo");
+    if (!cls) return;
+
+    SEL sharedSel = NSSelectorFromString(@"sharedDTDeviceInfo");
+    if (!class_respondsToSelector(object_getClass(cls), sharedSel)) return;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    id instance = [cls performSelector:sharedSel];
+#pragma clang diagnostic pop
+    if (!instance) return;
+
+    Ivar ivar = class_getInstanceVariable(cls, "_jailbreaked");
+    if (ivar) {
+        ((void (*)(id, Ivar, BOOL))object_setIvar)(instance, ivar, NO);
+    }
+}
+
+static void hookBinAOPDetection(void) {
+    // APBinAOPDrill - the main detection orchestrator
+    Class drillClass = objc_getClass("APBinAOPDrill");
+    if (drillClass) {
+        // startHookDetect: - entry point for hook detection
+        SEL sel = NSSelectorFromString(@"startHookDetect:");
+        Method m = class_getInstanceMethod(drillClass, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, ...) {}));
+
+        // pollingCheckHook - periodic re-check
+        sel = NSSelectorFromString(@"pollingCheckHook");
+        m = class_getInstanceMethod(drillClass, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s) {}));
+
+        // checkHookDetectState - state query
+        sel = NSSelectorFromString(@"checkHookDetectState");
+        m = class_getInstanceMethod(drillClass, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+        // checkHookMethodStr:andBundlePath: - individual method check
+        sel = NSSelectorFromString(@"checkHookMethodStr:andBundlePath:");
+        m = class_getInstanceMethod(drillClass, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s, id str, id path) { return NO; }));
+
+        // Also try class methods
+        SEL sel2 = NSSelectorFromString(@"startHookDetect:");
+        Method m2 = class_getClassMethod(drillClass, sel2);
+        if (m2) method_setImplementation(m2, imp_implementationWithBlock(^(id s, ...) {}));
+
+        sel2 = NSSelectorFromString(@"pollingCheckHook");
+        m2 = class_getClassMethod(drillClass, sel2);
+        if (m2) method_setImplementation(m2, imp_implementationWithBlock(^(id s) {}));
+    }
+
+    // Neutralize hook detection on ALL possible classes that might carry it
+    NSArray *possibleClasses = @[
+        @"APBinAOPDrill", @"APBinAOPConfig", @"APBinAOPConfig_v2",
+        @"APBinAOPEntry", @"APBinAOPLifeCycle", @"APBinAOPGlobalStatusUtils",
+        @"APBinAOPReportActiveManager",
+    ];
+    for (NSString *className in possibleClasses) {
+        Class cls = objc_getClass(className.UTF8String);
+        if (!cls) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        for (unsigned int i = 0; i < methodCount; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selName containsString:@"hookDetect"] ||
+                [selName containsString:@"HookDetect"] ||
+                [selName containsString:@"hookDetection"] ||
+                [selName containsString:@"hookedDetection"] ||
+                [selName containsString:@"pollingCheck"] ||
+                [selName containsString:@"reportBINAOPHook"] ||
+                [selName containsString:@"startHookDetect"]) {
+                char retType[8];
+                method_getReturnType(methods[i], retType, sizeof(retType));
+                if (retType[0] == 'B' || retType[0] == 'c') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+                } else if (retType[0] == 'v') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^(id s, ...) {}));
+                }
+            }
+        }
+        if (methods) free(methods);
+
+        // Same for class methods
+        Class metaCls = object_getClass(cls);
+        methods = class_copyMethodList(metaCls, &methodCount);
+        for (unsigned int i = 0; i < methodCount; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selName containsString:@"hookDetect"] ||
+                [selName containsString:@"HookDetect"] ||
+                [selName containsString:@"hookDetection"] ||
+                [selName containsString:@"hookedDetection"] ||
+                [selName containsString:@"pollingCheck"] ||
+                [selName containsString:@"reportBINAOPHook"] ||
+                [selName containsString:@"startHookDetect"]) {
+                char retType[8];
+                method_getReturnType(methods[i], retType, sizeof(retType));
+                if (retType[0] == 'B' || retType[0] == 'c') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+                } else if (retType[0] == 'v') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^(id s, ...) {}));
+                }
+            }
+        }
+        if (methods) free(methods);
+    }
+
+    // Neutralize hookDetectionEnable / hookCheck properties on config classes
+    NSArray *configClasses = @[@"APBinAOPConfig", @"APBinAOPConfig_v2", @"APBinAOPDrill"];
+    for (NSString *className in configClasses) {
+        Class cls = objc_getClass(className.UTF8String);
+        if (!cls) continue;
+
+        SEL sel = NSSelectorFromString(@"hookDetectionEnable");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+        sel = NSSelectorFromString(@"hookCheck");
+        m = class_getInstanceMethod(cls, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s) { return NO; }));
+
+        sel = NSSelectorFromString(@"setHookDetectionEnable:");
+        m = class_getInstanceMethod(cls, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, BOOL v) {}));
+
+        sel = NSSelectorFromString(@"setHookCheck:");
+        m = class_getInstanceMethod(cls, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, BOOL v) {}));
+    }
+
+    // Neutralize microPageHookDetect (triggered by mini-program/webview loads)
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    for (unsigned int c = 0; c < classCount; c++) {
+        Class cls = allClasses[c];
+        const char *cname = class_getName(cls);
+        if (!cname) continue;
+        if (!strstr(cname, "BinAOP") && !strstr(cname, "binaop") && !strstr(cname, "Binaop")) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        for (unsigned int i = 0; i < methodCount; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selName containsString:@"microPageHookDetect"] ||
+                [selName containsString:@"hookDetectHaveEnd"] ||
+                [selName containsString:@"RESULT_HOOKED"]) {
+                char retType[8];
+                method_getReturnType(methods[i], retType, sizeof(retType));
+                if (retType[0] == 'B' || retType[0] == 'c') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^BOOL(id s, ...) { return NO; }));
+                } else if (retType[0] == 'v') {
+                    method_setImplementation(methods[i], imp_implementationWithBlock(^(id s, ...) {}));
+                }
+            }
+        }
+        if (methods) free(methods);
+    }
+    if (allClasses) free(allClasses);
+}
+
+// ============================================================
 // MARK: Block app termination
 // ============================================================
 
-// exit/abort are __attribute__((noreturn)) - we MUST NOT return from hooks
-// Instead, suspend the calling thread forever
-
 static void (*orig_exit)(int status);
 static void hooked_exit(int status) {
-    // If on main thread, just spin the run loop to keep app alive
     if ([NSThread isMainThread]) {
         while (1) {
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
         }
     }
-    // Background thread: sleep forever
-    while (1) { sleep(INT_MAX); }
+    pthread_exit(NULL);
     __builtin_unreachable();
 }
 
@@ -489,7 +863,7 @@ static void hooked__exit(int status) {
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
         }
     }
-    while (1) { sleep(INT_MAX); }
+    pthread_exit(NULL);
     __builtin_unreachable();
 }
 
@@ -500,11 +874,10 @@ static void hooked_abort(void) {
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
         }
     }
-    while (1) { sleep(INT_MAX); }
+    pthread_exit(NULL);
     __builtin_unreachable();
 }
 
-// Hook kill() to prevent self-kill (SIGKILL, SIGTERM, SIGABRT)
 static int (*orig_kill)(pid_t pid, int sig);
 static int hooked_kill(pid_t pid, int sig) {
     if (pid == getpid() || pid == 0) {
@@ -513,7 +886,6 @@ static int hooked_kill(pid_t pid, int sig) {
     return orig_kill(pid, sig);
 }
 
-// Hook raise() to prevent signal-based exit
 static int (*orig_raise)(int sig);
 static int hooked_raise(int sig) {
     if (sig == SIGKILL || sig == SIGTERM || sig == SIGABRT || sig == SIGTRAP) {
@@ -528,7 +900,10 @@ static int hooked_raise(int sig) {
 
 %ctor {
     @autoreleasepool {
-        // FIRST: Block all exit mechanisms
+        // Install Logos ObjC hooks
+        %init;
+
+        // Block all exit mechanisms FIRST
         MSHookFunction((void *)exit, (void *)hooked_exit, (void **)&orig_exit);
         MSHookFunction((void *)_exit, (void *)hooked__exit, (void **)&orig__exit);
         MSHookFunction((void *)abort, (void *)hooked_abort, (void **)&orig_abort);
@@ -544,12 +919,15 @@ static int hooked_raise(int sig) {
         MSHookFunction((void *)realpath, (void *)hooked_realpath, (void **)&orig_realpath);
         MSHookFunction((void *)readlink, (void *)hooked_readlink, (void **)&orig_readlink);
         MSHookFunction((void *)creat, (void *)hooked_creat, (void **)&orig_creat);
+        MSHookFunction((void *)statfs, (void *)hooked_statfs, (void **)&orig_statfs);
+        MSHookFunction((void *)statvfs, (void *)hooked_statvfs, (void **)&orig_statvfs);
 
         // Process hooks
         MSHookFunction((void *)fork, (void *)hooked_fork, (void **)&orig_fork);
         MSHookFunction((void *)getenv, (void *)hooked_getenv, (void **)&orig_getenv);
         MSHookFunction((void *)sysctl, (void *)hooked_sysctl, (void **)&orig_sysctl);
         MSHookFunction((void *)sysctlbyname, (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname);
+        MSHookFunction((void *)getppid, (void *)hooked_getppid, (void **)&orig_getppid);
 
         // Dyld hooks
         MSHookFunction((void *)_dyld_image_count, (void *)hooked_dyld_image_count, (void **)&orig_dyld_image_count);
@@ -557,8 +935,43 @@ static int hooked_raise(int sig) {
         MSHookFunction((void *)dlopen, (void *)hooked_dlopen, (void **)&orig_dlopen);
         MSHookFunction((void *)dladdr, (void *)hooked_dladdr, (void **)&orig_dladdr);
 
-        // ObjC runtime hooks
+        // ObjC runtime hooks for security frameworks
         hookIOSSecuritySuite();
+        hookMAJailbreakChecker();
+        hookMASecurityUtil();
+        hookRDSSecurityCheck();
         hookSecurityGuard();
+        hookDTDeviceInfo();
+        hookJailbreakBridge();
+        hookBinAOPDetection();
+
+        // Hook DTDeviceInfo_isJailbreak C function
+        void *sym = dlsym(RTLD_DEFAULT, "DTDeviceInfo_isJailbreak");
+        if (sym) {
+            MSHookFunction(sym, (void *)hooked_DTDeviceInfo_isJailbreak, (void **)&orig_DTDeviceInfo_isJailbreak);
+        }
+
+        // Force DTDeviceInfo singleton clean
+        forceDTDeviceInfoClean();
+
+        // Delayed retry: some classes may load after our ctor
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            hookMAJailbreakChecker();
+            hookMASecurityUtil();
+            hookRDSSecurityCheck();
+            hookDTDeviceInfo();
+            hookJailbreakBridge();
+            hookBinAOPDetection();
+            forceDTDeviceInfoClean();
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            hookMAJailbreakChecker();
+            hookMASecurityUtil();
+            hookRDSSecurityCheck();
+            hookDTDeviceInfo();
+            hookJailbreakBridge();
+            hookBinAOPDetection();
+            forceDTDeviceInfoClean();
+        });
     }
 }
