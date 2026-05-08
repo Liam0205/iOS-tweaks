@@ -11,8 +11,6 @@ jobs:
     permissions:
       contents: write
       actions: read
-      pages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,9 +111,9 @@ jobs:
                 sed -i "/^Package: $pkg/,/^$/{s|^Section:.*|Section: $section|}" repo/Packages
               fi
               if [ -n "$depiction" ]; then
-                if ! grep -A20 "^Package: $pkg" repo/Packages | grep -q "^SileoDepiction:"; then
-                  sed -i "/^Package: $pkg/,/^$/s|^Name:.*|&\nSileoDepiction: $depiction|" repo/Packages
-                fi
+                # Remove any existing depiction lines (case-insensitive), then add correct one
+                sed -i "/^Package: $pkg/,/^$/{/^[Ss]ileo[Dd]epiction:/d}" repo/Packages
+                sed -i "/^Package: $pkg/,/^$/s|^Name:.*|&\nSileoDepiction: $depiction|" repo/Packages
               fi
             fi
           done
@@ -182,7 +180,7 @@ jobs:
           }
           DEPICTION
 
-      - name: Commit repo update
+      - name: Commit and push to master
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -190,31 +188,12 @@ jobs:
           git commit -m "repo: update ${{ steps.meta.outputs.tweak }} to ${{ steps.meta.outputs.version }}" || true
           git push origin HEAD:master
 
-  deploy-pages:
-    needs: release
-    runs-on: ubuntu-latest
-    concurrency:
-      group: pages
-      cancel-in-progress: true
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    permissions:
-      pages: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: master
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: repo/
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Deploy to gh-pages
+        run: |
+          git checkout --orphan gh-pages-tmp
+          git rm -rf .
+          cp -r repo/* .
+          cp -r repo/.* . 2>/dev/null || true
+          git add -A
+          git commit -m "Deploy: ${{ steps.meta.outputs.tweak }} ${{ steps.meta.outputs.version }}"
+          git push origin gh-pages-tmp:gh-pages --force
