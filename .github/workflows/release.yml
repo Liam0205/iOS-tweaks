@@ -80,11 +80,12 @@ jobs:
 
       - name: Fetch repo from gh-pages
         run: |
-          git fetch origin gh-pages
-          mkdir -p repo
-          cd repo
-          git archive origin/gh-pages | tar -x
-          cd ..
+          git fetch origin gh-pages:gh-pages
+          git worktree add /tmp/gh-pages gh-pages
+          rm -rf repo
+          cp -r /tmp/gh-pages repo
+          rm -rf repo/.git
+          git worktree remove /tmp/gh-pages
 
       - name: Update Sileo repo
         run: |
