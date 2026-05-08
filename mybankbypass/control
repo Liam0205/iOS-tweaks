@@ -1,0 +1,9 @@
+Package: com.liam.mybankbypass
+Name: MYBankBypass
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: Bypass jailbreak detection for MYBank
+Maintainer: Liam
+Author: Liam
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
