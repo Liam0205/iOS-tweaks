@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- 修正 CI 发版流程（自动生成 index.html、修复 Pages 部署）
+
 ## 0.1.0
 
 - 初始版本
