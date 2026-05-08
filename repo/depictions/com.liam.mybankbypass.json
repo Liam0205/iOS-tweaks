@@ -1,0 +1,28 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "绕过网商银行的越狱环境检测，使其在越狱设备上正常运行。\n\n支持网商银行 4.6.4 ~ 4.7.36 版本，适用于 rootless 越狱（Dopamine 等）。\n\n### 功能\n\n- 中和多层越狱检测（MAJailbreakChecker、SecurityGuard、BinAOP 等）\n- 拦截业务层检测导致的退出/冻结流程\n- 隐藏越狱文件路径与 dylib 指纹\n- 伪装文件系统只读状态"
+        }
+      ],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "## 1.1.0\n\n适配网商银行 4.7.36 版本。\n\n### 新增\n\n- 中和 MAJailbreakChecker 内置越狱检测库\n- 中和 MYBLauncherController.checkJailbroken，防止检测触发 exit 导致主线程死锁\n- 中和 MASecurityUtil 风险标记与内存扫描\n- 中和 RDSSecurityCheck dylib/tweak 检测与反调试检查\n- 新增 DTDeviceInfo 越狱相关方法 hook\n- 新增 RVPBridgeExtension4Jailbroken H5/RPC bridge 越狱状态中和\n- 新增 BinAOP hook detection 全面中和\n- 新增 statfs / statvfs hook，隐藏文件系统可写状态\n- 新增 getppid hook\n- 扩充越狱路径指纹列表与 dylib 隐藏列表\n\n### 修复\n\n- 修复 _dyld_image_count / _dyld_get_image_name 过滤一致性 bug\n- 改进 exit/_exit/abort hook：后台线程使用 pthread_exit 替代 sleep(INT_MAX)\n\n### 移除\n\n- 移除大部分 NSFileManager ObjC 层 hook，改由底层 C hook 覆盖\n\n## 1.0.0\n\n初始版本，支持网商银行 4.6.4。"
+        }
+      ],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}
