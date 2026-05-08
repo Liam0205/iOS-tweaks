@@ -10,7 +10,7 @@
     },
     {
       "tabname": "更新日志",
-      "views": [{"class": "DepictionMarkdownView", "markdown": "## 0.1.0\\n\\n- 初始版本\\n- 绕过交通银行 10.3.0 越狱环境检测\\n- Hook BangcleCheck、SecureUtilityPlus、CWDeviceStatusManager 等安全类\\n- Hook C 层文件检测（stat/lstat/access/fopen）\\n- Hook dyld 枚举、sysctl 调试检测、fork\\n- 拦截越狱提示弹窗与 exit/abort 退出调用\\n- 隐藏越狱相关 URL Scheme 和环境变量"}],
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\n## 0.1.0\n\n- \u521d\u59cb\u7248\u672c\n- \u7ed5\u8fc7\u4ea4\u901a\u94f6\u884c 10.3.0 \u8d8a\u72f1\u73af\u5883\u68c0\u6d4b\n- Hook BangcleCheck\u3001SecureUtilityPlus\u3001CWDeviceStatusManager \u7b49\u5b89\u5168\u7c7b\n- Hook C \u5c42\u6587\u4ef6\u68c0\u6d4b\uff08stat/lstat/access/fopen\uff09\n- Hook dyld \u679a\u4e3e\u3001sysctl \u8c03\u8bd5\u68c0\u6d4b\u3001fork\n- \u62e6\u622a\u8d8a\u72f1\u63d0\u793a\u5f39\u7a97\u4e0e exit/abort \u9000\u51fa\u8c03\u7528\n- \u9690\u85cf\u8d8a\u72f1\u76f8\u5173 URL Scheme \u548c\u73af\u5883\u53d8\u91cf"}],
       "class": "DepictionStackView"
     }
   ],

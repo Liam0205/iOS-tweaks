@@ -1,14 +1,14 @@
 Package: com.liam.bankcommbypass
-Version: 0.1.0
+Version: 0.1.1
 Architecture: iphoneos-arm64
 Maintainer: Liam
 Installed-Size: 76
 Depends: mobilesubstrate (>= 0.9.5000)
-Filename: debs/com.liam.bankcommbypass_0.1.0_iphoneos-arm64.deb
-Size: 6688
-MD5sum: dfe3a4b06a627019dd1e062227916137
-SHA1: fd447f06fafc2115360b08ff7d59485ae07d235f
-SHA256: 24ea3c3a70c90c1431eeec6ebf125f51286b5b693b6336a201d3b4c0294ebf15
+Filename: debs/com.liam.bankcommbypass_0.1.1_iphoneos-arm64.deb
+Size: 6696
+MD5sum: 9452ce1b07e1f05c581fa36b42a5c5ca
+SHA1: 5ea8550efffd2e4a3960a252090f4211476d23ff
+SHA256: 54f11ef0e4ddcf218b5ce662e617efa252f72c458e22fba0e59aea5c93c7d7b0
 Section: 反检测
 Description: 绕过交通银行的越狱环境检测，使其在越狱设备上正常运行。支持交通银行 10.3.0 版本，适用于 rootless 越狱（Dopamine 等）。
 Author: Liam
