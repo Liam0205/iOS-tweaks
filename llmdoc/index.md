@@ -8,16 +8,16 @@
 
 ## overview/
 
-- `llmdoc/overview/project-overview.md`：项目目标、目标环境、当前工作状态，以及文档边界。
+- `llmdoc/overview/project-overview.md`：项目目标、目标环境、当前工作状态，以及已验证适配版本与关键稳定结论。
 
 ## architecture/
 
-- `llmdoc/architecture/tweak-architecture.md`：绕过 tweak 的核心执行模型、Hook 分层、关键约束与已验证经验。
+- `llmdoc/architecture/tweak-architecture.md`：绕过 tweak 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 
 ## reference/
 
-- `llmdoc/reference/detection-vectors.md`：目标 App 已知越狱检测向量、对应证据与当前覆盖情况。
+- `llmdoc/reference/detection-vectors.md`：目标 App 已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 
 ## guides/
 
-- `llmdoc/guides/build-deploy.md`：构建、打包、安装、验证和常见回归检查流程。
+- `llmdoc/guides/build-deploy.md`：构建、安装、发版 tag 规则、CI Release workflow 触发条件与回归验证流程。
