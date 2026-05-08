@@ -78,6 +78,14 @@ jobs:
           prerelease: false
           files: dist/*.deb
 
+      - name: Fetch repo from gh-pages
+        run: |
+          git fetch origin gh-pages
+          mkdir -p repo
+          cd repo
+          git archive origin/gh-pages | tar -x
+          cd ..
+
       - name: Update Sileo repo
         run: |
           TWEAK="${{ steps.meta.outputs.tweak }}"
@@ -210,14 +218,6 @@ jobs:
           </html>
           INDEXEOF
           sed -i '' 's/^          //' repo/index.html
-
-      - name: Commit and push to master
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add repo/
-          git commit -m "repo: update ${{ steps.meta.outputs.tweak }} to ${{ steps.meta.outputs.version }}" || true
-          git push origin HEAD:master
 
       - name: Deploy to gh-pages
         run: |
