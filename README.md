@@ -6,8 +6,8 @@ iOS 越狱 Tweak 仓库，基于 Theos 构建，面向 rootless 越狱环境（D
 
 | 包名 | 目标 App | 支持版本 | 说明 |
 |------|----------|----------|------|
-| `com.liam.mybankbypass` | 网商银行 | 4.6.4 ~ 4.7.36 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
-| `com.liam.bankcommbypass` | 交通银行 | 10.3.0 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
+| `page.0x01.mybankbypass` | 网商银行 | 4.6.4 ~ 4.7.36 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
+| `page.0x01.bankcommbypass` | 交通银行 | 10.3.0 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
 
 ## 安装
 
@@ -49,15 +49,14 @@ bankcommbypass/        # BankcommBypass tweak 源码
 ├── control
 ├── BankcommBypass.plist
 └── CHANGELOG.md
-repo/                  # Sileo 软件源（GitHub Pages 托管）
+repo/                  # Sileo 软件源（gh-pages 分支托管）
 ├── depictions/        # Native depiction JSON
 ├── debs/              # 已发布 deb 包
 ├── Packages           # 包索引
 └── Release            # 源元数据
 .github/workflows/     # CI/CD
 ├── build.yml          # 自动构建（push/PR 触发）
-├── release.yml        # 自动发版（tag 触发）
-└── pages.yml          # 软件源部署到 GitHub Pages
+└── release.yml        # 自动发版（tag 触发，含编译/部署 Pages）
 ```
 
 ## 发版流程

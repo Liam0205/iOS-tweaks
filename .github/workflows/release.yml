@@ -8,6 +8,9 @@ on:
 jobs:
   release:
     runs-on: macos-latest
+    concurrency:
+      group: release-deploy
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -91,8 +94,10 @@ jobs:
         run: |
           TWEAK="${{ steps.meta.outputs.tweak }}"
           PKG_ID=$(grep '^Package:' "$TWEAK/control" | cut -d: -f2- | xargs)
+          OLD_PKG=$(grep '^Conflicts:' "$TWEAK/control" | cut -d: -f2- | xargs)
 
           rm -f repo/debs/${PKG_ID}_*.deb
+          [ -n "$OLD_PKG" ] && rm -f repo/debs/${OLD_PKG}_*.deb
           cp dist/*.deb repo/debs/
 
           cd repo
@@ -119,9 +124,16 @@ jobs:
           gzip -k -f Packages
           bzip2 -k -f Packages
 
-          # Regenerate Release with checksums
+          # Generate Release from scratch
           {
-            grep -v '^MD5Sum:\|^SHA256:\|^ ' Release 2>/dev/null || true
+            echo "Origin: 0x01"
+            echo "Label: 0x01"
+            echo "Suite: stable"
+            echo "Version: 1.0"
+            echo "Codename: stable"
+            echo "Architectures: iphoneos-arm64"
+            echo "Components: main"
+            echo "Description: 0x01 Jailbreak Tweaks Repository"
             echo "MD5Sum:"
             for f in Packages Packages.gz Packages.bz2; do
               SIZE=$(wc -c < "$f" | tr -d ' ')
@@ -134,16 +146,18 @@ jobs:
               HASH=$(shasum -a 256 "$f" | cut -d' ' -f1)
               printf " %s %s %s\n" "$HASH" "$SIZE" "$f"
             done
-          } > Release.tmp && mv Release.tmp Release
+          } > Release
 
       - name: Update depiction
         run: |
           TWEAK="${{ steps.meta.outputs.tweak }}"
           PKG_ID=$(grep '^Package:' "$TWEAK/control" | cut -d: -f2- | xargs)
+          OLD_PKG=$(grep '^Conflicts:' "$TWEAK/control" | cut -d: -f2- | xargs)
           DESC=$(grep '^Description:' "$TWEAK/control" | cut -d: -f2- | xargs)
           CHANGELOG_FILE="$TWEAK/CHANGELOG.md"
 
           mkdir -p repo/depictions
+          [ -n "$OLD_PKG" ] && rm -f "repo/depictions/${OLD_PKG}.json"
 
           if [ -f "$CHANGELOG_FILE" ]; then
             CHANGELOG=$(sed '1{/^# /d;}' "$CHANGELOG_FILE")
@@ -192,7 +206,7 @@ jobs:
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Liam's Tweaks Repo</title>
+            <title>0x01 Tweaks</title>
             <style>
               body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
               h1 { font-size: 1.5em; }
@@ -203,7 +217,7 @@ jobs:
             </style>
           </head>
           <body>
-            <h1>Liam's Tweaks Repository</h1>
+            <h1>0x01 Tweaks</h1>
             <p>适用于 rootless 越狱 (Dopamine / palera1n) 的插件仓库。</p>
             <h2>可用插件</h2>
             <ul>

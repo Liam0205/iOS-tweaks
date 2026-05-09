@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0
+
+- 更换包名为 page.0x01.bankcommbypass
+- 已安装用户可无缝升级
+
 ## 0.1.2
 
 - 修正 CI 发版流程（自动生成 index.html、修复 Pages 部署）
