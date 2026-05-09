@@ -820,32 +820,21 @@ static int g_app_send_event_count = 0;
     if ([vc isKindOfClass:[UIAlertController class]]) {
         if (objc_getAssociatedObject(vc, "jb_blocked")) {
             UIAlertController *alert = (UIAlertController *)vc;
-            for (UIAlertAction *action in alert.actions) {
-                void (^safeHandler)(UIAlertAction *) = ^(UIAlertAction *a) {
-                    [alert dismissViewControllerAnimated:NO completion:^{
-                        for (UIWindow *win in [UIApplication sharedApplication].windows) {
-                            win.userInteractionEnabled = YES;
-                            if (win.rootViewController.view) {
-                                win.rootViewController.view.userInteractionEnabled = YES;
-                            }
-                        }
-                    }];
-                };
-                [action setValue:safeHandler forKey:@"handler"];
-            }
-            %orig(vc, flag, completion);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (vc.presentingViewController) {
-                    [vc dismissViewControllerAnimated:NO completion:^{
-                        for (UIWindow *win in [UIApplication sharedApplication].windows) {
-                            win.userInteractionEnabled = YES;
-                            if (win.rootViewController.view) {
-                                win.rootViewController.view.userInteractionEnabled = YES;
-                            }
-                        }
-                    }];
+            if (g_log_path[0]) {
+                FILE *f = fopen(g_log_path, "a");
+                if (f) {
+                    fprintf(f, "[ALERT-BLOCKED] title=%s msg=%s actions=%d\n",
+                            alert.title ? alert.title.UTF8String : "nil",
+                            alert.message ? [alert.message substringToIndex:MIN(alert.message.length, 60)].UTF8String : "nil",
+                            (int)alert.actions.count);
+                    for (UIAlertAction *a in alert.actions) {
+                        fprintf(f, "[ALERT-BLOCKED]   action: '%s' style=%ld\n",
+                                a.title ? a.title.UTF8String : "nil", (long)a.style);
+                    }
+                    fclose(f);
                 }
-            });
+            }
+            if (completion) completion();
             return;
         }
     }
@@ -916,7 +905,7 @@ static int g_app_send_event_count = 0;
         strncpy(g_log_path, logPath.UTF8String, sizeof(g_log_path) - 1);
 
         FILE *f = fopen(g_log_path, "w");
-        if (f) { fprintf(f, "[INIT] ICBCBypass v61 ctor started\n"); fclose(f); }
+        if (f) { fprintf(f, "[INIT] ICBCBypass v63 ctor started\n"); fclose(f); }
 
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"kUPWHomePageJailBrokenToastNotAgainKey"];
         [[NSUserDefaults standardUserDefaults] synchronize];

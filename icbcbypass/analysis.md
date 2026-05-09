@@ -792,21 +792,44 @@ APP 的"冻结"机制极其激进：
 
 ---
 
-## 当前阶段: 登录问题
+## 当前阶段: 登录成功，但性能问题
 
-### 现象 (v61)
-- ✅ APP 不再卡死，可以正常操作界面
-- ⚠️ 尝试登录时仍有越狱检测弹窗（短暂出现后被 tweak 自动关闭）
-- ❌ 最终无法完成登录
+### v62 闪退分析
+- 弹窗被拦截并记录：title="安全提示"，msg="您的设备环境存在隐私信息泄露..."
+- 唯一 action "确定" style=1 (Cancel) → handler 内部调用了 exit()
+- v62 错误地调用了该 handler → APP 自杀
 
-### 可能原因
-1. **服务端验证**: APP 在登录 API 请求中携带了设备安全状态标志，服务端拒绝
-2. **本地状态检查**: 虽然弹窗被关了，但内部 flag 仍标记为越狱 → 阻止登录流程
-3. **弹窗关闭逻辑不完整**: 可能 dismiss 后的 completion 回调中有阻断逻辑
-4. **登录接口加密/签名包含安全检测结果**: 即使本地绕过 UI，API 请求体中仍包含检测信息
+### ✅ v63: 登录成功！
 
-### 下一步
-1. 分析弹窗来源 — 确认是哪个检测方法仍在触发弹窗
-2. 检查登录失败的具体表现（网络错误？特定错误码？直接无响应？）
-3. 考虑 hook 网络层，观察登录请求/响应
-4. 可能需要更深入地 hook `SecureUtilityPlus` 的返回值
+**修复**: 完全静默弹窗（不展示、不调用 handler、直接 return）
+
+**被拦截的弹窗**:
+1. "安全提示" — "您的设备环境存在隐私信息泄露和非法信息攻击等风险，为了保护您的账户及资金安全，请您在其他安全设备上使用。" (action: "确定" style=Cancel)
+2. "风险提示" — "您的系统可能已经越狱，可能会给您带来财产损失、隐私泄露等风险，我行建议您更换终端进行操作。" (action: "确认" style=Default)
+
+**观察结果**:
+```
+[WATCHDOG] t=14s main_responsive=1 sema_blocked=6538 freeze_indicator=3205 sendEvent=84
+[WATCHDOG] t=20s main_responsive=1 sema_blocked=8497 freeze_indicator=3486 sendEvent=88
+[WATCHDOG] t=30s main_responsive=1 sema_blocked=10486 freeze_indicator=4098 sendEvent=128
+```
+
+### ⚠️ 性能问题: APP 极其卡顿
+
+**现象**: 每次点击/操作需要 3-4 秒才有响应（如勾选协议 checkbox、按钮点击等）
+
+**原因分析**: `dispatch_semaphore_wait` hook 过于激进
+- 我们拦截了主线程上所有 >0.5s 的 semaphore wait（共 10,486 次 in 30s）
+- 但很多是**合法的同步操作**（等网络响应、等数据加载）
+- 返回 0 后，调用方以为操作完成但实际数据未就绪 → 状态不一致/重试/延迟
+
+**freeze 循环 vs 合法等待的区别**:
+- freeze 循环: 启动后前 3-5 秒内密集调用（每秒数千次），timeout=FOREVER
+- 合法等待: 用户操作后偶尔调用（一次操作一次等待）
+
+### 下一步优化方向
+
+**方案: 时间窗口策略**
+- 只在 freeze 窗口期（前 8-10 秒）拦截 semaphore_wait
+- 之后放行所有 semaphore_wait（此时 freeze 循环已结束，剩余的是合法操作）
+- 这样既阻止 freeze 又不影响正常功能
