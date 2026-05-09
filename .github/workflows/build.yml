@@ -3,8 +3,26 @@ name: Build
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '*.md'
+      - 'CNAME'
+      - '.claude/**'
+      - '.gitignore'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'llmdoc/**'
+      - 'icon.svg'
   pull_request:
     types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '*.md'
+      - 'CNAME'
+      - '.claude/**'
+      - '.gitignore'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'llmdoc/**'
+      - 'icon.svg'
 
 jobs:
   discover:
