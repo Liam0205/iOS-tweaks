@@ -830,6 +830,71 @@ APP 的"冻结"机制极其激进：
 ### 下一步优化方向
 
 **方案: 时间窗口策略**
-- 只在 freeze 窗口期（前 8-10 秒）拦截 semaphore_wait
-- 之后放行所有 semaphore_wait（此时 freeze 循环已结束，剩余的是合法操作）
-- 这样既阻止 freeze 又不影响正常功能
+- 只在 freeze 窗口期（前 8-10 秒）拦截有限超时的 semaphore_wait
+- DISPATCH_TIME_FOREVER 始终拦截（freeze 机制专用）
+- 之后放行所有有限超时的 semaphore_wait（合法同步操作）
+
+### ✅ v64: 完全正常！发布版本 1.0.0
+
+**最终策略**:
+- `DISPATCH_TIME_FOREVER` 在主线程: **始终** return 0（freeze 机制永久使用此模式）
+- 有限长超时 (>2s): 仅在前 10s 内拦截（之后放行合法同步操作）
+
+**最终观测数据**:
+```
+[WATCHDOG] t=5s  main_responsive=1
+[WATCHDOG] t=10s main_responsive=1
+[WATCHDOG] t=14s main_responsive=1 sema_blocked=10216 freeze_indicator=3981 sendEvent=33
+[WATCHDOG] t=20s main_responsive=1 sema_blocked=12861 freeze_indicator=4633 sendEvent=59
+[WATCHDOG] t=30s main_responsive=1 sema_blocked=14083 freeze_indicator=4977 sendEvent=69
+```
+
+**最终状态**:
+- ✅ 主线程全程响应
+- ✅ 动画正常
+- ✅ 交互流畅（无卡顿）
+- ✅ 登录成功
+- ✅ 越狱弹窗静默
+- ✅ APP 正常使用
+
+---
+
+## 总结
+
+### 技术方案
+
+ICBC APP 的越狱检测+冻结机制分为三层：
+
+**第一层: 检测** (SecureUtilityPlus + IOSSecuritySuite + 自有方法)
+- 路径检测 → fishhook 拦截 stat/access/open/fopen/opendir 等
+- Runtime 检测 → hook isJailBreak*/amIJailbroken 等方法返回 NO
+- 环境变量检测 → hook NSProcessInfo.environment 过滤 DYLD_ 变量
+- dylib 枚举检测 → hook _dyld_image_count/_dyld_get_image_name
+- URL Scheme 检测 → hook canOpenURL: 过滤 cydia/sileo 等
+
+**第二层: 冻结** (持续运行的 freeze 循环)
+- dispatch_semaphore_wait(FOREVER) 在主线程: ~200 次/秒，永久运行
+- setAnimationsEnabled:NO: ~50 次/秒，永久运行
+- beginIgnoringInteractionEvents: 多次
+- setUserInteractionEnabled:NO: 持续调用
+- removeAllAnimations: 持续调用
+
+**第三层: 弹窗+退出** (检测到越狱时)
+- "安全提示" 弹窗，"确定"按钮 handler 调用 exit()
+- "风险提示" 弹窗，登录时触发
+
+### 绕过方案
+
+| 层 | 方法 | 效果 |
+|----|------|------|
+| 检测 | fishhook + ObjC runtime swizzle | 所有检测返回"安全" |
+| 冻结 | semaphore_wait(FOREVER) 始终返回 0 | 主线程不被阻塞 |
+| 冻结 | setAnimationsEnabled/setUserInteraction 时间门控 | 动画+交互正常 |
+| 冻结 | removeAllAnimations 时间门控 | 动画不被清除 |
+| 弹窗 | presentViewController 拦截 + 静默 | 弹窗不展示不退出 |
+
+### 关键教训
+
+1. **不要在 hook 内部进入嵌套 RunLoop** — 会导致调用者栈上的锁永远不释放 → 死锁
+2. **DISPATCH_TIME_FOREVER vs 有限超时区分对待** — 前者是 freeze 专用，后者可能是合法操作
+3. **弹窗 handler 可能包含 exit()** — 不能盲目调用被拦截弹窗的 action handler

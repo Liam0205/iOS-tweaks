@@ -14,6 +14,8 @@
 #import <string.h>
 #import "fishhook.h"
 
+#define ICBC_DEBUG_LOG 0
+
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -430,23 +432,24 @@ static int g_sema_block_count = 0;
 static void *hooked_dispatch_semaphore_wait(dispatch_semaphore_t sema, dispatch_time_t timeout) {
     if (pthread_main_np()) {
         CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - g_ctor_time;
-        if (elapsed > 3.0 && timeout != DISPATCH_TIME_NOW) {
-            int64_t diff = 0;
+        if (elapsed > 3.0) {
             if (timeout == DISPATCH_TIME_FOREVER) {
-                diff = INT64_MAX;
-            } else {
-                dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
-                diff = (int64_t)(timeout - now);
-            }
-            if (diff > 500000000LL) { // > 0.5 seconds
                 g_sema_block_count++;
                 if (g_sema_block_count <= 10 && g_log_path[0]) {
                     FILE *f = fopen(g_log_path, "a");
-                    if (f) { fprintf(f, "[BLOCK] semaphore_wait #%d elapsed=%.1f timeout=%s\n",
-                                     g_sema_block_count, elapsed,
-                                     timeout == DISPATCH_TIME_FOREVER ? "FOREVER" : "long"); fclose(f); }
+                    if (f) { fprintf(f, "[BLOCK] semaphore_wait #%d elapsed=%.1f timeout=FOREVER\n",
+                                     g_sema_block_count, elapsed); fclose(f); }
                 }
                 return (void *)0;
+            }
+            if (elapsed < 10.0 && timeout != DISPATCH_TIME_NOW) {
+                int64_t diff = 0;
+                dispatch_time_t now = dispatch_time(DISPATCH_TIME_NOW, 0);
+                diff = (int64_t)(timeout - now);
+                if (diff > 2000000000LL) { // > 2 seconds, only in first 10s
+                    g_sema_block_count++;
+                    return (void *)0;
+                }
             }
         }
     }
@@ -901,11 +904,13 @@ static int g_app_send_event_count = 0;
 
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
+#if ICBC_DEBUG_LOG
         NSString *logPath = [docs stringByAppendingPathComponent:@"icbc_fishhook.log"];
         strncpy(g_log_path, logPath.UTF8String, sizeof(g_log_path) - 1);
 
         FILE *f = fopen(g_log_path, "w");
-        if (f) { fprintf(f, "[INIT] ICBCBypass v63 ctor started\n"); fclose(f); }
+        if (f) { fprintf(f, "[INIT] ICBCBypass v1.0.0 ctor started\n"); fclose(f); }
+#endif
 
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"kUPWHomePageJailBrokenToastNotAgainKey"];
         [[NSUserDefaults standardUserDefaults] synchronize];
@@ -949,6 +954,7 @@ static int g_app_send_event_count = 0;
             {"CFRunLoopStop", (void *)hooked_CFRunLoopStop, (void **)&orig_CFRunLoopStop},
         }, 30);
 
+#if ICBC_DEBUG_LOG
         // Watchdog: background thread checks if main thread is responsive
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
             __block BOOL mainResponded = NO;
@@ -972,7 +978,6 @@ static int g_app_send_event_count = 0;
                 }
             });
         });
-        // Wave-2 diagnostic at t=12s: check semaphore diag count
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
             __block BOOL mainResponded = NO;
             dispatch_async(dispatch_get_main_queue(), ^{ mainResponded = YES; });
@@ -985,7 +990,6 @@ static int g_app_send_event_count = 0;
                 }
             });
         });
-        // Extended watchdogs at t=18s, t=28s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(18.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
             __block BOOL mainResponded = NO;
             dispatch_async(dispatch_get_main_queue(), ^{ mainResponded = YES; });
@@ -1012,6 +1016,7 @@ static int g_app_send_event_count = 0;
                 }
             });
         });
+#endif
 
         // Periodic unfreezer: re-enable interaction every 2s
         dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -1038,6 +1043,7 @@ static int g_app_send_event_count = 0;
             }
             [UIView setAnimationsEnabled:YES];
 
+#if ICBC_DEBUG_LOG
             // Deep diagnostic at count 3 (~9s after launch)
             if (unfreezeCount == 3 && g_log_path[0]) {
                 FILE *df = fopen(g_log_path, "a");
@@ -1118,6 +1124,7 @@ static int g_app_send_event_count = 0;
                     }
                 }
             }
+#endif
 
             if (unfreezeCount >= 15) dispatch_source_cancel(timer);
         });
