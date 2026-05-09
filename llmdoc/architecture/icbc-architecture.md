@@ -22,6 +22,27 @@ SecureUtilityPlus 内嵌 `MSHookFunctionChecker`，检测 C 函数 prologue 前�
 
 fishhook 修改 GOT/PLT 表指针而非函数 prologue，不被检测。这是整个 tweak 架构的前提约束。
 
+### 约束的本质：风险管理而非技术不可能
+
+MSHookFunctionChecker 的 ObjC 入口已通过 `method_setImplementation` 被替换（返回 NO）。理论上若确认：
+1. checker 仅在被调用时扫描（非模块加载时 static initializer）
+2. 所有检测路径都经过 ObjC dispatch（无 Swift 直接调用绕过）
+
+则 MSHookFunction 可安全使用。但当前选择 fishhook 是因为上述两项无法在不深度逆向 SecureUtilityPlus 二进制的前提下确认，且 fishhook 完全满足需求——零成本的安全决策。
+
+### Inline SVC 对抗哲学
+
+App 的 inline `svc #0x80` 检测（直接系统调用）在用户态完全不可拦截——不经 GOT、非独立函数入口。icbcbypass 的策略是：**接受检测命中，中和所有响应**。
+
+这一策略成立的前提：响应层（冻结循环、弹窗退出、属性传播）全部依赖可 Hook 的高层 API（UIKit/GCD/ObjC 方法）。App 防御方面临结构性两难：底层响应（inline SVC exit）用户体验差（直接闪退），而好的 UX（弹窗、冻结）必须经过可 Hook 的 API。这个矛盾是攻击者永远可以利用的弱点。
+
+### 假设 fishhook 也被禁
+
+当前 FishHookChecker 的 ObjC 入口已被同样方式中和。若未来 GOT 验证做到 inline 级别：
+- 自定义 trampoline（ADRP+ADD+BR 等非标模式）可绕过 prologue 模式检测
+- 纯 ObjC 响应端对抗（unfreezer timer）仍然有效
+- dispatch_semaphore_wait 作为 C 函数需要 ObjC 层补偿（周期性 endIgnoringInteractionEvents + setUserInteractionEnabled:YES）
+
 ## 分层设计
 
 ### 1. 检测绕过层

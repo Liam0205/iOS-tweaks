@@ -1,5 +1,6 @@
 /.llmdoc-tmp
 /old-plugin
+/blog
 frida
 app-binary
 tmp

@@ -84,3 +84,13 @@ Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号
 3. **退出 Hook 必须保持 noreturn 安全** — 主线程跑 RunLoop、后台线程永久阻塞
 4. **rootless 路径覆盖完整** — `/var/jb` 派生路径、Frida 痕迹
 5. **安全框架类名是否变化** — App 升级后检查 class/selector 变更
+
+## 发版检查清单
+
+新增 tweak 或发版前应确认：
+
+1. `control` 文件包含 `SileoDepiction: https://tweaks.0x01.page/depictions/<package-id>.json`
+2. tweak 目录下存在 `CHANGELOG.md`（否则 depiction 使用 fallback 文本）
+3. `release.yml` 第 93 行的 gh-pages 清理列表包含该 tweak 目录名
+4. `build.yml` 的 `paths-ignore` 列表中不要意外排除新 tweak 的文件
+5. Release notes 范围为 `PREV_TAG..TAG`（不是 HEAD），确认 workflow 逻辑正确

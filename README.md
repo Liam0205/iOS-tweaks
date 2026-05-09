@@ -1,4 +1,4 @@
-# DEV-iOS
+# iOS Tweaks
 
 iOS 越狱 Tweak 仓库，基于 Theos 构建，面向 rootless 越狱环境（Dopamine 等）。
 
@@ -34,39 +34,6 @@ make clean && make package FINALPACKAGE=1
 ```bash
 make install
 ```
-
-## 项目结构
-
-```
-mybankbypass/           # 网商银行 tweak 源码
-├── Tweak.x            # Hook 实现
-├── Makefile           # Theos 构建配置
-├── control            # Debian 包元数据
-├── MYBankBypass.plist # 注入过滤（仅目标 App）
-└── CHANGELOG.md       # 版本更新日志
-bankcommbypass/        # 交通银行 tweak 源码
-├── Tweak.x
-├── Makefile
-├── control
-├── BankcommBypass.plist
-└── CHANGELOG.md
-icbcbypass/            # 工商银行 tweak 源码
-├── Tweak.x
-├── Makefile
-├── control
-├── ICBCBypass.plist
-└── CHANGELOG.md
-.github/workflows/     # CI/CD
-├── build.yml          # 自动构建（push/PR 触发）
-└── release.yml        # 自动发版（tag 触发，含编译/部署 Pages）
-```
-
-## 发版流程
-
-1. 更新 `control` 中的版本号
-2. 更新 tweak 目录下的 `CHANGELOG.md`
-3. 推送 tag，格式为 `<tweak目录名>_<版本号>`（如 `icbcbypass_1.0.0`）
-4. CI 自动完成：构建 → GitHub Release → 更新软件源 → 部署 Pages
 
 ## License
 
