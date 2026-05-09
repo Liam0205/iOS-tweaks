@@ -1,4 +1,5 @@
-/app-binary
-/old-plugin
 /.llmdoc-tmp
-/frida
+/old-plugin
+frida
+app-binary
+tmp
