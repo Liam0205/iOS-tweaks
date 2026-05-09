@@ -1,6 +1,6 @@
 # llmdoc 索引
 
-本目录保存 MYBankBypass 项目的稳定文档，按“启动必读、项目概览、架构、参考、操作指南”组织，便于在后续分析、构建、回归测试和适配新版本时快速定位信息。
+本目录保存 DEV-iOS 项目的稳定文档，按”启动必读、项目概览、架构、参考、操作指南”组织，便于在后续分析、构建、回归测试和适配新版本时快速定位信息。
 
 ## 启动入口
 
@@ -8,7 +8,7 @@
 
 ## overview/
 
-- `llmdoc/overview/project-overview.md`：项目目标、目标环境、当前工作状态，以及已验证适配版本与关键稳定结论。
+- `llmdoc/overview/project-overview.md`：项目目标（多 tweak 仓库）、目标环境、当前工作状态、软件源与 CI/CD 架构。
 
 ## architecture/
 
@@ -20,4 +20,4 @@
 
 ## guides/
 
-- `llmdoc/guides/build-deploy.md`：构建、安装、发版 tag 规则、CI Release workflow 触发条件与回归验证流程。
+- `llmdoc/guides/build-deploy.md`：构建、安装、发版 tag 规则、CI Release workflow 与 gh-pages 部署流程。
