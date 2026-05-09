@@ -56,11 +56,11 @@ jobs:
         run: |
           TWEAK="${{ steps.meta.outputs.tweak }}"
           TAG="${{ steps.meta.outputs.tag }}"
-          PREV_TAG=$(git tag --sort=-creatordate | grep "^${TWEAK}_" | grep -v "^${TAG}$" | head -1)
+          PREV_TAG=$(git tag --sort=-version:refname | grep "^${TWEAK}_" | grep -v "^${TAG}$" | head -1)
           if [ -z "$PREV_TAG" ]; then
-            RANGE="HEAD"
+            RANGE="$TAG"
           else
-            RANGE="${PREV_TAG}..HEAD"
+            RANGE="${PREV_TAG}..${TAG}"
           fi
           NOTES=$(git log "$RANGE" --pretty=format:"- %s" -- "$TWEAK/")
           if [ -z "$NOTES" ]; then
