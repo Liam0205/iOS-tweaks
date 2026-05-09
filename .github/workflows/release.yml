@@ -36,7 +36,7 @@ jobs:
 
       - name: Install Theos
         run: |
-          brew install ldid dpkg
+          brew install ldid dpkg librsvg
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
@@ -207,6 +207,7 @@ jobs:
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>0x01 Tweaks</title>
+            <link rel="icon" type="image/svg+xml" href="icon.svg">
             <style>
               body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
               h1 { font-size: 1.5em; }
@@ -233,6 +234,11 @@ jobs:
           </html>
           INDEXEOF
           sed -i '' 's/^          //' repo/index.html
+
+      - name: Generate icons
+        run: |
+          cp icon.svg repo/icon.svg
+          rsvg-convert -w 512 -h 512 icon.svg -o repo/CydiaIcon.png
 
       - name: Deploy to gh-pages
         run: |
