@@ -12,13 +12,20 @@
 
 ## architecture/
 
-- `llmdoc/architecture/tweak-architecture.md`：绕过 tweak 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
+- `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
+- `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、与 mybankbypass 的关键差异。
 
 ## reference/
 
-- `llmdoc/reference/detection-vectors.md`：目标 App 已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
+- `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
+- `llmdoc/reference/icbc-detection-vectors.md`：工商银行 3.0.80 的 SecureUtilityPlus 检测框架、冻结机制（持续 freeze 循环）、弹窗退出链路与覆盖情况。
 
 ## guides/
 
 - `llmdoc/guides/build-deploy.md`：构建、安装、发版 tag 规则、CI Release workflow 与 gh-pages 部署流程。
 - `llmdoc/guides/reverse-engineering-methodology.md`：逆向分析与反检测对抗的实验方法论、诊断顺序与 analysis.md 记录纪律。
+
+## memory/reflections/
+
+- `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 分析经验反思。
+- `llmdoc/memory/reflections/icbcbypass-v1.0.0-release.md`：icbcbypass v1.0.0 发布反思——嵌套 RunLoop 死锁教训、fishhook 替代 MSHookFunction 约束、semaphore 区分策略。

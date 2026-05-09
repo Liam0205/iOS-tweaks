@@ -252,6 +252,45 @@
 - 使用 `scp` 批量拉取后，在本机使用 `strings`、`otool -L`、`nm`、`class-dump` 等工具分析
 - 只在必须实时交互时（如 kill/launch app、查看进程状态、安装 deb）才 SSH 到设备执行命令
 
+### 进程存活监控
+
+安装 tweak 后需自行观察 app 能否持续运行，不要等用户报告。标准做法：
+
+```bash
+# 启动 app 并持续监控进程（设备上 zsh 注意不要用 [] glob）
+ssh root@<ip> "uiopen --bundleid <bundle-id>"
+# 分开执行检查（避免单条 SSH 命令过于复杂）
+sleep 2 && ssh root@<ip> "ps -ef | grep '<ProcessName>' | grep -v grep"
+sleep 5 && ssh root@<ip> "ps -ef | grep '<ProcessName>' | grep -v grep"
+```
+
+关键注意事项：
+
+- 设备通常没有 `pgrep`，用 `ps -ef | grep ... | grep -v grep` 代替
+- 设备 shell 是 zsh，方括号 `[x]` 会被当作 glob 展开，避免在 grep 模式中使用
+- 启动后至少观察 10 秒再判断存活（有些检测有延迟）
+- 如果进程不存在，立即检查 crash log：`ls -lt /var/mobile/Library/Logs/CrashReporter/ | head -5`
+- 下载 crash log 到本地 `tmp/` 用 python 解析（JSON 格式 .ips 文件）
+
+### Crash log 快速解析
+
+```python
+import json
+with open('crash.ips') as f:
+    lines = f.readlines()
+    body = json.loads(''.join(lines[1:]))  # 第一行是 header JSON
+    print(body['exception'])      # 异常类型
+    print(body['termination'])    # 终止原因
+    ft = body['faultingThread']
+    for fr in body['threads'][ft]['frames'][:10]:
+        print(fr.get('symbol', '?'), fr.get('imageIndex'))
+```
+
+关键判断：
+- `0x8BADF00D` = watchdog 超时（app 启动太慢）
+- `EXC_BAD_ACCESS` + 固定地址 = 可能是 anti-tampering 故意 crash
+- `SIGKILL` 无 crash report = 系统杀进程或 raw syscall 退出
+
 ## 与其他文档的关系
 
 本文档定位为方法论层指导，适用于所有 bypass 子项目。
