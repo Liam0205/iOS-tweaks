@@ -89,6 +89,8 @@ jobs:
           cp -r /tmp/gh-pages repo
           rm -rf repo/.git
           git worktree remove /tmp/gh-pages
+          # Remove stale directories that shouldn't be on gh-pages
+          rm -rf repo/bankcommbypass repo/mybankbypass repo/dist repo/repo
 
       - name: Update Sileo repo
         run: |
