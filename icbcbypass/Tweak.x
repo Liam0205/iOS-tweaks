@@ -14,7 +14,7 @@
 #import <string.h>
 #import "fishhook.h"
 
-#define ICBC_DEBUG_LOG 0
+#define ICBC_DEBUG_LOG 1
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"

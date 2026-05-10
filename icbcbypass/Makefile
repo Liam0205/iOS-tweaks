@@ -12,6 +12,9 @@ TWEAK_NAME = ICBCBypass
 
 ICBCBypass_FILES = Tweak.x fishhook.c
 ICBCBypass_CFLAGS = -fobjc-arc
+ifeq ($(shell uname),Linux)
+ICBCBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
+endif
 ICBCBypass_FRAMEWORKS = Foundation UIKit QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
