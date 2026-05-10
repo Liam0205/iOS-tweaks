@@ -30,7 +30,7 @@ static NSString *const kIdentity = @"SSHTunnel_Identity";
         _serverPort = 22;
         _remotePort = 2222;
         _localPort = 22;
-        _identityFile = [NSHomeDirectory() stringByAppendingPathComponent:@".ssh/id_rsa"];
+        _identityFile = @"/var/mobile/.ssh/id_rsa";
         [self loadSettings];
     }
     return self;
