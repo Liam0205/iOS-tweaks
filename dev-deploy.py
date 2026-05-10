@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from glob import glob
 from pathlib import Path
 
 
@@ -36,8 +35,12 @@ def parse_control(control_path):
 
 
 def find_deb(tweak_dir):
-    debs = glob(str(tweak_dir / "packages" / "*.deb"))
-    return Path(debs[0]) if debs else None
+    debs = sorted(
+        (tweak_dir / "packages").glob("*.deb"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return debs[0] if debs else None
 
 
 def generate_packages(dev_dir, control_fields):

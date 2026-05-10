@@ -8,7 +8,7 @@
 
 ## overview/
 
-- `llmdoc/overview/project-overview.md`：项目目标（多 tweak 仓库）、目标环境、当前工作状态、软件源与 CI/CD 架构。
+- `llmdoc/overview/project-overview.md`：项目目标（多 tweak 仓库 + 设备端开发工具）、目标环境、当前工作状态、软件源与 CI/CD 架构。
 
 ## architecture/
 

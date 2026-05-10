@@ -32,6 +32,8 @@ typedef NS_ENUM(NSInteger, Section) {
     [super viewDidLoad];
     self.title = @"SSH Tunnel";
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 44;
 
     TunnelManager *mgr = [TunnelManager shared];
     __weak typeof(self) weakSelf = self;
@@ -53,7 +55,7 @@ typedef NS_ENUM(NSInteger, Section) {
         case SectionServer:  return 3;
         case SectionTunnel:  return 3;
         case SectionKey:     return 2;
-        case SectionAction:  return 1;
+        case SectionAction:  return 2;
         default: return 0;
     }
 }
@@ -72,34 +74,40 @@ typedef NS_ENUM(NSInteger, Section) {
     TunnelManager *mgr = [TunnelManager shared];
 
     if (ip.section == SectionAction) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        _statusLabel = [[UILabel alloc] init];
-        _statusLabel.font = [UIFont systemFontOfSize:12];
-        _statusLabel.textColor = UIColor.secondaryLabelColor;
-        _statusLabel.numberOfLines = 0;
-        _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-        _connectButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        _connectButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-        [_connectButton addTarget:self action:@selector(toggleConnection) forControlEvents:UIControlEventTouchUpInside];
-        _connectButton.translatesAutoresizingMaskIntoConstraints = NO;
-
-        UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_connectButton, _statusLabel]];
-        stack.axis = UILayoutConstraintAxisVertical;
-        stack.spacing = 6;
-        stack.alignment = UIStackViewAlignmentCenter;
-        stack.translatesAutoresizingMaskIntoConstraints = NO;
-        [cell.contentView addSubview:stack];
-        [NSLayoutConstraint activateConstraints:@[
-            [stack.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
-            [stack.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12],
-            [stack.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
-            [stack.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
-        ]];
-
-        [self updateUIForState:mgr.state message:nil];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        return cell;
+        if (ip.row == 0) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            _connectButton = [UIButton buttonWithType:UIButtonTypeSystem];
+            _connectButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+            [_connectButton addTarget:self action:@selector(toggleConnection) forControlEvents:UIControlEventTouchUpInside];
+            _connectButton.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell.contentView addSubview:_connectButton];
+            [NSLayoutConstraint activateConstraints:@[
+                [_connectButton.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
+                [_connectButton.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12],
+                [_connectButton.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
+            ]];
+            [self updateUIForState:mgr.state message:nil];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            _statusLabel = [[UILabel alloc] init];
+            _statusLabel.font = [UIFont systemFontOfSize:15];
+            _statusLabel.textColor = UIColor.secondaryLabelColor;
+            _statusLabel.numberOfLines = 0;
+            _statusLabel.textAlignment = NSTextAlignmentCenter;
+            _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell.contentView addSubview:_statusLabel];
+            [NSLayoutConstraint activateConstraints:@[
+                [_statusLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:10],
+                [_statusLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-10],
+                [_statusLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+                [_statusLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            ]];
+            [self updateUIForState:mgr.state message:nil];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        }
     }
 
     if (ip.section == SectionKey) {
@@ -195,7 +203,7 @@ typedef NS_ENUM(NSInteger, Section) {
                 break;
             case 2:
                 label.text = @"Identity";
-                tf.placeholder = @"~/.ssh/id_rsa";
+                tf.placeholder = @"/var/jb/var/mobile/.ssh/id_rsa";
                 tf.text = mgr.identityFile;
                 tf.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
                 _identityField = tf;
@@ -226,6 +234,7 @@ typedef NS_ENUM(NSInteger, Section) {
     else if (tf == _remotePortField) mgr.remotePort = tf.text.integerValue;
     else if (tf == _localPortField)  mgr.localPort = tf.text.integerValue;
     else if (tf == _identityField)   mgr.identityFile = tf.text;
+    [mgr saveSettings];
 }
 
 - (void)toggleConnection {
@@ -278,15 +287,15 @@ typedef NS_ENUM(NSInteger, Section) {
         [UIPasteboard generalPasteboard].string = pub;
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"ssh-copy-id to Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self runSSHCopyID];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Exchange Keys with Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self runKeyExchange];
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)runSSHCopyID {
+- (void)runKeyExchange {
     TunnelManager *mgr = [TunnelManager shared];
     if (!mgr.serverHost.length || !mgr.username.length) {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Error"
@@ -302,33 +311,36 @@ typedef NS_ENUM(NSInteger, Section) {
     NSString *target = [NSString stringWithFormat:@"%@@%@", mgr.username, mgr.serverHost];
 
     UIAlertController *prompt = [UIAlertController
-        alertControllerWithTitle:@"ssh-copy-id"
-        message:[NSString stringWithFormat:@"Push public key to %@", target]
+        alertControllerWithTitle:@"Exchange Keys"
+        message:[NSString stringWithFormat:@"Exchange SSH keys with %@\n\n1. Push local public key → server\n2. Pull server public key → device", target]
         preferredStyle:UIAlertControllerStyleAlert];
 
     [prompt addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Password";
+        tf.placeholder = @"Server password";
         tf.secureTextEntry = YES;
     }];
 
     [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [prompt addAction:[UIAlertAction actionWithTitle:@"Push" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Exchange" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSString *password = prompt.textFields.firstObject.text;
         if (!password.length) return;
-        [self pushKeyWithPassword:password];
+        [self exchangeKeysWithPassword:password];
     }]];
 
     [self presentViewController:prompt animated:YES completion:nil];
 }
 
-- (void)pushKeyWithPassword:(NSString *)password {
+- (void)exchangeKeysWithPassword:(NSString *)password {
     TunnelManager *mgr = [TunnelManager shared];
     NSString *pub = [KeyManager publicKeyForPath:mgr.identityFile];
 
     NSString *target = [NSString stringWithFormat:@"%@@%@", mgr.username, mgr.serverHost];
     NSString *port = [NSString stringWithFormat:@"%ld", (long)mgr.serverPort];
+    // Push local key + print server's public keys to stdout
     NSString *remoteCmd = [NSString stringWithFormat:
-        @"mkdir -p ~/.ssh && echo '%@' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
+        @"mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+        @" && echo '%@' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+        @" && cat ~/.ssh/id_*.pub 2>/dev/null || true",
         [pub stringByReplacingOccurrencesOfString:@"'" withString:@""]];
 
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
@@ -337,6 +349,28 @@ typedef NS_ENUM(NSInteger, Section) {
         NSString *sshpassPath = [fm fileExistsAtPath:jbSshpass] ? jbSshpass : @"/usr/bin/sshpass";
         NSString *jbSsh = @"/var/jb/usr/bin/ssh";
         NSString *sshPath = [fm fileExistsAtPath:jbSsh] ? jbSsh : @"/usr/bin/ssh";
+
+        if (![fm fileExistsAtPath:sshpassPath]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"sshpass Not Found"
+                    message:@"Install sshpass from your package manager:\n\napt install sshpass"
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+            });
+            return;
+        }
+
+        int outfds[2], errfds[2];
+        pipe(outfds);
+        pipe(errfds);
+
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, outfds[1], STDOUT_FILENO);
+        posix_spawn_file_actions_addclose(&actions, outfds[0]);
+        posix_spawn_file_actions_adddup2(&actions, errfds[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, errfds[0]);
 
         char *argv[] = {
             (char *)sshpassPath.UTF8String,
@@ -351,21 +385,73 @@ typedef NS_ENUM(NSInteger, Section) {
 
         extern char **environ;
         pid_t pid = 0;
-        int ret = posix_spawn(&pid, sshpassPath.UTF8String, NULL, NULL, argv, environ);
+        int ret = posix_spawn(&pid, sshpassPath.UTF8String, &actions, NULL, argv, environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(outfds[1]);
+        close(errfds[1]);
 
         NSString *msg;
         if (ret != 0) {
+            close(outfds[0]);
+            close(errfds[0]);
             msg = [NSString stringWithFormat:@"spawn failed: %s", strerror(ret)];
         } else {
+            NSMutableData *stdoutData = [NSMutableData data];
+            NSMutableData *stderrData = [NSMutableData data];
+            char buf[256];
+            ssize_t n;
+            while ((n = read(outfds[0], buf, sizeof(buf))) > 0)
+                [stdoutData appendBytes:buf length:n];
+            close(outfds[0]);
+            while ((n = read(errfds[0], buf, sizeof(buf))) > 0)
+                [stderrData appendBytes:buf length:n];
+            close(errfds[0]);
+
             int status = 0;
             waitpid(pid, &status, 0);
             BOOL ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-            msg = ok ? @"Public key pushed successfully!" :
-                [NSString stringWithFormat:@"Failed (exit code %d)", WEXITSTATUS(status)];
+
+            if (!ok) {
+                NSString *detail = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding] ?: @"";
+                msg = [NSString stringWithFormat:@"Failed (exit code %d)\n\n%@", WEXITSTATUS(status), detail];
+            } else {
+                NSMutableArray *results = [NSMutableArray array];
+                [results addObject:@"Local key → server: OK"];
+
+                NSString *serverKeys = [[NSString alloc] initWithData:stdoutData encoding:NSUTF8StringEncoding];
+                if (serverKeys.length) {
+                    NSString *authDir = @"/var/jb/var/mobile/.ssh";
+                    NSString *authFile = [authDir stringByAppendingPathComponent:@"authorized_keys"];
+                    [fm createDirectoryAtPath:authDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+                    NSString *existing = [NSString stringWithContentsOfFile:authFile encoding:NSUTF8StringEncoding error:nil] ?: @"";
+                    NSInteger added = 0;
+                    for (NSString *line in [serverKeys componentsSeparatedByString:@"\n"]) {
+                        NSString *key = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                        if (key.length && [key hasPrefix:@"ssh-"] && ![existing containsString:key]) {
+                            NSString *entry = [key stringByAppendingString:@"\n"];
+                            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:authFile];
+                            if (fh) {
+                                [fh seekToEndOfFile];
+                                [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+                                [fh closeFile];
+                            } else {
+                                [entry writeToFile:authFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                            }
+                            added++;
+                        }
+                    }
+                    [results addObject:[NSString stringWithFormat:@"Server key → device: %ld key(s) added", (long)added]];
+                } else {
+                    [results addObject:@"Server key → device: no public key found on server"];
+                }
+
+                msg = [results componentsJoinedByString:@"\n"];
+            }
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Result"
+            UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Key Exchange Result"
                 message:msg preferredStyle:UIAlertControllerStyleAlert];
             [r addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:r animated:YES completion:nil];
@@ -405,6 +491,9 @@ typedef NS_ENUM(NSInteger, Section) {
     [_connectButton setTitleColor:color forState:UIControlStateNormal];
     _connectButton.enabled = (state != TunnelStateConnecting);
     _statusLabel.text = msg ?: @"";
+
+    [self.tableView beginUpdates];
+    [self.tableView endUpdates];
 
     _hostField.enabled = !connected;
     _portField.enabled = !connected;

@@ -2,7 +2,7 @@
 
 ## 项目是什么
 
-DEV-iOS 是一个基于 Theos 的 iOS 越狱检测绕过 tweak 仓库，包含多个针对不同银行 App 的绕过方案。所有 tweak 面向 rootless 越狱环境（Dopamine / palera1n），通过 Sileo 软件源 `https://tweaks.0x01.page/` 分发。
+DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行 App 的越狱检测绕过 tweak，同时包含设备端开发辅助工具。所有 tweak 面向 rootless 越狱环境（Dopamine / palera1n），通过 Sileo 软件源 `https://tweaks.0x01.page/` 分发。
 
 ## 包含的 Tweaks
 
@@ -13,6 +13,14 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱检测绕过 tweak 仓库，包含�
 | `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
+
+## 开发工具
+
+| 包名 | 类型 | 用途 |
+|------|------|------|
+| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器，从设备建立到构建服务器的反向隧道，用于远程调试和部署 |
+
+sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。依赖设备已安装 `openssh-client`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
 ## 目标环境
 
@@ -62,6 +70,7 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 - `mybankbypass/Tweak.x`：网商银行 Hook 主入口
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
+- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，通过 posix_spawn 启动 ssh 进程）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
 - `.github/workflows/release.yml`：发版与 Pages 部署 workflow

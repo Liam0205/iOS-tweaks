@@ -14,6 +14,7 @@
 - `mybankbypass/` — 网商银行绕过 tweak
 - `bankcommbypass/` — 交通银行绕过 tweak
 - `icbcbypass/` — 工商银行绕过 tweak（fishhook + Logos）
+- `sshtunnel/` — SSH 反向隧道管理应用（Theos Application，非 tweak）
 - `.github/workflows/release.yml` — 自动发版与 Pages 部署
 - `.github/workflows/build.yml` — CI 验证构建
 
@@ -92,6 +93,33 @@ make package FINALPACKAGE=1 \
 ```
 
 `ADDITIONAL_LDFLAGS` 确保系统 clang 使用工具链的 ld64 而非 GNU ld。`libtinfo.so.5` 版本警告可忽略。
+
+## sshtunnel 构建与部署
+
+sshtunnel 是 Theos Application（`APPLICATION_NAME`），不是 tweak。构建和安装步骤与 tweak 相同，但有以下差异：
+
+- Makefile 中已内置 Linux 交叉编译的 `LD_LIBRARY_PATH` 和 `LDFLAGS`，无需额外传递
+- 安装到 `/Applications`（不是 tweak 目录），安装后需 `uicache` 刷新图标
+- 不通过 Sileo 源分发，仅本地开发使用
+- 依赖设备已有 `openssh-client`
+
+```bash
+cd sshtunnel
+make clean && make package FINALPACKAGE=1
+# 部署到设备（需 SSH 可达）
+make install THEOS_DEVICE_IP=<device-ip>
+# 在设备上执行
+uicache -p /Applications/SSHTunnel.app
+```
+
+### 反向隧道开发工作流
+
+当手机在内网、构建服务器在公网时，通过 sshtunnel 建立反向隧道后，服务器可以 SSH 回手机：
+
+1. 构建服务器上编译 tweak：`make package FINALPACKAGE=1`
+2. 在手机上打开 SSHTunnel，配置服务器地址和端口，点击连接
+3. 隧道建立后，从构建服务器通过映射端口 SSH 到手机安装 deb
+4. 在手机上验证 tweak 效果
 
 ## 发版与 Tag 规则
 
