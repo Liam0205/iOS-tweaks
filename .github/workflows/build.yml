@@ -4,23 +4,21 @@ on:
   push:
     branches: [master]
     paths-ignore:
-      - '*.md'
+      - '**/*.md'
       - 'CNAME'
       - '.claude/**'
       - '.gitignore'
-      - 'AGENTS.md'
-      - 'CLAUDE.md'
+      - 'blog/**'
       - 'llmdoc/**'
       - 'icon.svg'
   pull_request:
     types: [opened, synchronize, reopened]
     paths-ignore:
-      - '*.md'
+      - '**/*.md'
       - 'CNAME'
       - '.claude/**'
       - '.gitignore'
-      - 'AGENTS.md'
-      - 'CLAUDE.md'
+      - 'blog/**'
       - 'llmdoc/**'
       - 'icon.svg'
 
