@@ -12,9 +12,10 @@
 #import <pthread.h>
 #import <signal.h>
 #import <string.h>
+#import <sched.h>
 #import "fishhook.h"
 
-#define ICBC_DEBUG_LOG 1
+#define ICBC_DEBUG_LOG 0
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -322,6 +323,8 @@ static int g_fishhook_hit_count = 0;
 static int g_freeze_indicator = 0;
 static char g_log_path[512] = {0};
 static CFAbsoluteTime g_ctor_time = 0;
+static CFAbsoluteTime g_last_remove_anim_time = 0;
+static int g_remove_anim_burst = 0;
 
 static void log_fishhook_hit(const char *func, const char *path) {
     g_fishhook_hit_count++;
@@ -440,6 +443,7 @@ static void *hooked_dispatch_semaphore_wait(dispatch_semaphore_t sema, dispatch_
                     if (f) { fprintf(f, "[BLOCK] semaphore_wait #%d elapsed=%.1f timeout=FOREVER\n",
                                      g_sema_block_count, elapsed); fclose(f); }
                 }
+                sched_yield();
                 return (void *)0;
             }
             if (elapsed < 10.0 && timeout != DISPATCH_TIME_NOW) {
@@ -774,6 +778,7 @@ static int g_app_send_event_count = 0;
 }
 %end
 
+
 %hook ICBCMotionRecognizingWindow
 - (void)sendEvent:(UIEvent *)event {
     g_send_event_count++;
@@ -881,16 +886,32 @@ static int g_app_send_event_count = 0;
 
 %hook CALayer
 - (void)removeAllAnimations {
-    CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - g_ctor_time;
-    if (elapsed > 3.0) {
-        return;
+    if (pthread_main_np()) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - g_ctor_time > 3.0) {
+            CFAbsoluteTime gap = now - g_last_remove_anim_time;
+            g_last_remove_anim_time = now;
+            if (gap < 0.05) {
+                if (++g_remove_anim_burst > 3) return;
+            } else {
+                g_remove_anim_burst = 0;
+            }
+        }
     }
     %orig;
 }
 - (void)removeAnimationForKey:(NSString *)key {
-    CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - g_ctor_time;
-    if (elapsed > 3.0) {
-        return;
+    if (pthread_main_np()) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - g_ctor_time > 3.0) {
+            CFAbsoluteTime gap = now - g_last_remove_anim_time;
+            g_last_remove_anim_time = now;
+            if (gap < 0.05) {
+                if (++g_remove_anim_burst > 3) return;
+            } else {
+                g_remove_anim_burst = 0;
+            }
+        }
     }
     %orig;
 }
@@ -909,7 +930,12 @@ static int g_app_send_event_count = 0;
         strncpy(g_log_path, logPath.UTF8String, sizeof(g_log_path) - 1);
 
         FILE *f = fopen(g_log_path, "w");
-        if (f) { fprintf(f, "[INIT] ICBCBypass v1.0.0 ctor started\n"); fclose(f); }
+        if (f) {
+            NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+            fprintf(f, "[INIT] ICBCBypass v1.1.0 / ICBC %s ctor started\n",
+                    appVer ? appVer.UTF8String : "?");
+            fclose(f);
+        }
 #endif
 
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"kUPWHomePageJailBrokenToastNotAgainKey"];
@@ -1016,6 +1042,23 @@ static int g_app_send_event_count = 0;
                 }
             });
         });
+        int watchdog_times[] = {43, 58, 88};
+        for (int wi = 0; wi < 3; wi++) {
+            int wt = watchdog_times[wi];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wt * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                __block BOOL mainResponded = NO;
+                dispatch_async(dispatch_get_main_queue(), ^{ mainResponded = YES; });
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                    FILE *lf = fopen(g_log_path, "a");
+                    if (lf) {
+                        fprintf(lf, "[WATCHDOG] t=%ds main_responsive=%d sema_blocked=%d freeze_indicator=%d sendEvent=%d appEvent=%d isIgnoring=%d\n",
+                                wt + 2, mainResponded, g_sema_block_count, g_freeze_indicator, g_send_event_count, g_app_send_event_count,
+                                (int)[[UIApplication sharedApplication] isIgnoringInteractionEvents]);
+                        fclose(lf);
+                    }
+                });
+            });
+        }
 #endif
 
         // Periodic unfreezer: re-enable interaction every 2s
@@ -1126,7 +1169,29 @@ static int g_app_send_event_count = 0;
             }
 #endif
 
-            if (unfreezeCount >= 15) dispatch_source_cancel(timer);
+            if (unfreezeCount >= 15) {
+                dispatch_source_set_timer(timer,
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                    5.0 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
+            }
+#if ICBC_DEBUG_LOG
+            if (unfreezeCount > 15 && unfreezeCount % 3 == 0 && g_log_path[0]) {
+                FILE *uf = fopen(g_log_path, "a");
+                if (uf) {
+                    UIApplication *app = [UIApplication sharedApplication];
+                    NSMutableString *wins = [NSMutableString string];
+                    for (UIWindow *win in app.windows) {
+                        if (!win.hidden) {
+                            [wins appendFormat:@" %@(L%.0f,ui=%d)", NSStringFromClass([win class]), win.windowLevel, win.userInteractionEnabled];
+                        }
+                    }
+                    fprintf(uf, "[UNFREEZER] #%d sendEvent=%d appEvent=%d isIgnoring=%d wins=%s\n",
+                            unfreezeCount, g_send_event_count, g_app_send_event_count,
+                            (int)app.isIgnoringInteractionEvents, wins.UTF8String);
+                    fclose(uf);
+                }
+            }
+#endif
         });
         dispatch_resume(timer);
     }

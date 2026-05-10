@@ -82,24 +82,39 @@ APP 的冻结机制是持续运行的循环（30s 内 14,000+ 次调用），不
 #### dispatch_semaphore_wait 拦截（fishhook）
 
 策略（两级区分）：
-- `DISPATCH_TIME_FOREVER` 在主线程：**始终** 直接返回 0（freeze 循环永久使用此模式）
+- `DISPATCH_TIME_FOREVER` 在主线程：**始终** 直接返回 0（freeze 循环永久使用此模式），返回后调用 `sched_yield()` 让出 CPU 时间片，减少忙循环 CPU 消耗
 - 有限长超时 (>2s)：仅在启动前 10s 内拦截（之后放行合法同步操作）
 - `DISPATCH_TIME_NOW` 或短超时：永远放行
 
 #### UI 状态保护（Logos %hook）
 
-所有基于时间门控（elapsed > 3s 后拦截）：
-
+**UIView 层**（时间门控：elapsed > 3s 后拦截）：
 - `[UIView setAnimationsEnabled:NO]` → 直接 return
 - `[UIView setUserInteractionEnabled:NO]` → 直接 return
-- `[CALayer removeAllAnimations]` → 直接 return
-- `[CALayer removeAnimationForKey:]` → 直接 return
 - `[UIApplication beginIgnoringInteractionEvents]` → 直接 return
+
+**CALayer 层**（速率限制：区分冻结循环突发与正常 App 调用）：
+- `[CALayer removeAllAnimations]` → 主线程上追踪调用间隔，连续突发调用（间隔 <50ms，冻结循环模式）被阻断，孤立调用（正常 App 动画清理）被放行
+- `[CALayer removeAnimationForKey:]` → 同上速率限制策略
+
+速率限制策略的设计依据：冻结循环以高频突发模式调用 removeAllAnimations（3.0.90 前 14s 内超过 1000 次/秒），而正常 App 动画清理是孤立的低频调用。以 50ms 间隔阈值可有效区分两者。非主线程调用始终放行。
 
 #### 关键不变式
 
 - **永远不在 hook 内部进入嵌套 RunLoop**。直接返回安全值，让 UIApplicationMain 原生 RunLoop 处理事件。
 - DISPATCH_TIME_FOREVER 的拦截是永久性的——冻结循环也是永久运行的。
+- **CALayer hook 必须区分冻结流量与正常流量**。永久全局阻断 removeAllAnimations 会导致动画对象累积、GPU 压力升高、按钮动画挂起（3.0.90 适配教训）。
+
+### 已知性能考量
+
+**CALayer 动画累积问题**（3.0.90 发现）：当 removeAllAnimations / removeAnimationForKey: 被永久阻断（时间门控策略）时，冻结循环发起的调用和正常 App 动画清理调用被一律阻止。正常 App 的动画完成回调无法清理已结束的 CAAnimation 对象，导致：
+1. 动画对象在 CALayer 上不断累积
+2. Core Animation 渲染管线 GPU 压力持续升高
+3. UIButton 等控件的 highlight 动画因 pending animation 堆积而无法及时完成 → 点击响应延迟
+
+症状：登录后按钮需要 10+ 次点击才能响应。
+
+修复：从时间门控改为速率限制（见上方 UI 状态保护）。
 
 ### 3. 弹窗退出对抗层
 
