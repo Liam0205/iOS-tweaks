@@ -4,3 +4,5 @@
 frida
 app-binary
 tmp
+.theos/
+packages/
