@@ -6,4 +6,4 @@ Description: SSH reverse tunnel manager. Establishes a reverse SSH tunnel from t
 Maintainer: Liam
 Author: Liam
 Section: Utilities
-Depends: openssh-client
+Depends: openssh-client, sshpass

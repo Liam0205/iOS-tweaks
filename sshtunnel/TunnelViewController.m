@@ -1,6 +1,8 @@
 #import "TunnelViewController.h"
 #import "TunnelManager.h"
 #import "KeyManager.h"
+#import <spawn.h>
+#import <sys/wait.h>
 
 typedef NS_ENUM(NSInteger, Section) {
     SectionServer,
@@ -122,7 +124,6 @@ typedef NS_ENUM(NSInteger, Section) {
                 [_pubKeyLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
             ]];
             [self refreshPublicKey];
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
             return cell;
         }
     }
@@ -210,6 +211,8 @@ typedef NS_ENUM(NSInteger, Section) {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.section == SectionKey && ip.row == 0) {
         [self generateKey];
+    } else if (ip.section == SectionKey && ip.row == 1) {
+        [self copyPublicKey];
     }
 }
 
@@ -259,6 +262,115 @@ typedef NS_ENUM(NSInteger, Section) {
     }]];
 
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)copyPublicKey {
+    TunnelManager *mgr = [TunnelManager shared];
+    NSString *pub = [KeyManager publicKeyForPath:mgr.identityFile];
+    if (!pub.length) return;
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Public Key"
+        message:nil
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy to Clipboard" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [UIPasteboard generalPasteboard].string = pub;
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"ssh-copy-id to Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self runSSHCopyID];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)runSSHCopyID {
+    TunnelManager *mgr = [TunnelManager shared];
+    if (!mgr.serverHost.length || !mgr.username.length) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Error"
+            message:@"Fill in server host and username first." preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    NSString *pub = [KeyManager publicKeyForPath:mgr.identityFile];
+    if (!pub.length) return;
+
+    NSString *target = [NSString stringWithFormat:@"%@@%@", mgr.username, mgr.serverHost];
+
+    UIAlertController *prompt = [UIAlertController
+        alertControllerWithTitle:@"ssh-copy-id"
+        message:[NSString stringWithFormat:@"Push public key to %@", target]
+        preferredStyle:UIAlertControllerStyleAlert];
+
+    [prompt addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Password";
+        tf.secureTextEntry = YES;
+    }];
+
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Push" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *password = prompt.textFields.firstObject.text;
+        if (!password.length) return;
+        [self pushKeyWithPassword:password];
+    }]];
+
+    [self presentViewController:prompt animated:YES completion:nil];
+}
+
+- (void)pushKeyWithPassword:(NSString *)password {
+    TunnelManager *mgr = [TunnelManager shared];
+    NSString *pub = [KeyManager publicKeyForPath:mgr.identityFile];
+
+    NSString *target = [NSString stringWithFormat:@"%@@%@", mgr.username, mgr.serverHost];
+    NSString *port = [NSString stringWithFormat:@"%ld", (long)mgr.serverPort];
+    NSString *remoteCmd = [NSString stringWithFormat:
+        @"mkdir -p ~/.ssh && echo '%@' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
+        [pub stringByReplacingOccurrencesOfString:@"'" withString:@""]];
+
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *jbSshpass = @"/var/jb/usr/bin/sshpass";
+        NSString *sshpassPath = [fm fileExistsAtPath:jbSshpass] ? jbSshpass : @"/usr/bin/sshpass";
+        NSString *jbSsh = @"/var/jb/usr/bin/ssh";
+        NSString *sshPath = [fm fileExistsAtPath:jbSsh] ? jbSsh : @"/usr/bin/ssh";
+
+        char *argv[] = {
+            (char *)sshpassPath.UTF8String,
+            "-p", (char *)password.UTF8String,
+            (char *)sshPath.UTF8String,
+            "-p", (char *)port.UTF8String,
+            "-o", "StrictHostKeyChecking=no",
+            (char *)target.UTF8String,
+            (char *)remoteCmd.UTF8String,
+            NULL
+        };
+
+        extern char **environ;
+        pid_t pid = 0;
+        int ret = posix_spawn(&pid, sshpassPath.UTF8String, NULL, NULL, argv, environ);
+
+        NSString *msg;
+        if (ret != 0) {
+            msg = [NSString stringWithFormat:@"spawn failed: %s", strerror(ret)];
+        } else {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            BOOL ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            msg = ok ? @"Public key pushed successfully!" :
+                [NSString stringWithFormat:@"Failed (exit code %d)", WEXITSTATUS(status)];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Result"
+                message:msg preferredStyle:UIAlertControllerStyleAlert];
+            [r addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:r animated:YES completion:nil];
+        });
+    });
 }
 
 - (void)refreshPublicKey {
