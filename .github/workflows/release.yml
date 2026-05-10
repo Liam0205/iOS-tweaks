@@ -241,6 +241,9 @@ jobs:
         run: |
           cp icon.svg repo/icon.svg
           rsvg-convert -w 512 -h 512 icon.svg -o repo/CydiaIcon.png
+          mkdir -p repo/dev
+          cp dev-icon.svg repo/dev/icon.svg
+          rsvg-convert -w 512 -h 512 dev-icon.svg -o repo/dev/CydiaIcon.png
 
       - name: Deploy to gh-pages
         run: |

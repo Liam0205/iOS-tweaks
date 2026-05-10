@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#34C759"/>
+  <!-- Tunnel: concentric rounded rects creating depth -->
+  <rect x="96" y="136" width="320" height="240" rx="40" fill="none" stroke="#ffffff" stroke-width="16" opacity="0.9"/>
+  <rect x="146" y="172" width="220" height="168" rx="28" fill="none" stroke="#ffffff" stroke-width="12" opacity="0.6"/>
+  <rect x="186" y="202" width="140" height="108" rx="18" fill="none" stroke="#ffffff" stroke-width="8" opacity="0.35"/>
+  <!-- Arrow pointing into tunnel -->
+  <path d="M236 256 L290 256 M270 236 L290 256 L270 276" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
