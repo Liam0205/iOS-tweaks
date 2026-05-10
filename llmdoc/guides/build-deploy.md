@@ -38,6 +38,61 @@ make install
 
 需要设备可通过 SSH 访问（Makefile 中配置了 `THEOS_DEVICE_IP` 和 `THEOS_DEVICE_PORT`）。
 
+## Linux 交叉编译
+
+在 Linux x86_64 环境中构建 iOS tweak（无需 macOS）。
+
+### 前置依赖
+
+通过 Homebrew (linuxbrew) 安装（无需 sudo）：
+
+```bash
+brew install ldid xz ncurses
+# libtinfo.so.5 兼容 symlink
+ln -s /home/linuxbrew/.linuxbrew/lib/libtinfo.so /home/linuxbrew/.linuxbrew/lib/libtinfo.so.5
+```
+
+系统需已有：`dpkg`、`fakeroot`、`make`、`git`。
+
+### 安装 Theos + SDK + 工具链
+
+```bash
+# Theos
+git clone --recursive https://github.com/theos/theos.git ~/theos
+
+# iOS SDK
+curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar xz --strip-components=1 -C ~/theos/sdks/
+
+# 交叉编译工具链（提供 ld64 链接器）
+curl -sL https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma \
+  | xz -d | tar xf - -C ~/theos/toolchain
+mv ~/theos/toolchain/ios-arm64e-clang-toolchain ~/theos/toolchain/linux/iphone
+```
+
+### 替换工具链 clang
+
+工具链自带的 clang-10 无法处理 iOS 16.5 SDK 的 module 系统，需用系统 clang 替代：
+
+```bash
+mv ~/theos/toolchain/linux/iphone/bin/clang ~/theos/toolchain/linux/iphone/bin/clang.orig
+mv ~/theos/toolchain/linux/iphone/bin/clang++ ~/theos/toolchain/linux/iphone/bin/clang++.orig
+ln -s $(which clang) ~/theos/toolchain/linux/iphone/bin/clang
+ln -s $(which clang++) ~/theos/toolchain/linux/iphone/bin/clang++
+```
+
+### 构建命令
+
+```bash
+export THEOS=~/theos
+export LD_LIBRARY_PATH=/home/linuxbrew/.linuxbrew/lib:$LD_LIBRARY_PATH
+cd <tweak目录>
+make clean
+make package FINALPACKAGE=1 \
+  ADDITIONAL_LDFLAGS="-B$THEOS/toolchain/linux/iphone/bin -fuse-ld=$THEOS/toolchain/linux/iphone/bin/ld"
+```
+
+`ADDITIONAL_LDFLAGS` 确保系统 clang 使用工具链的 ld64 而非 GNU ld。`libtinfo.so.5` 版本警告可忽略。
+
 ## 发版与 Tag 规则
 
 Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号>`

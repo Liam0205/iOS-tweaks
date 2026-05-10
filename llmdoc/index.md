@@ -29,5 +29,5 @@
 
 - `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 分析经验反思。
 - `llmdoc/memory/reflections/icbcbypass-v1.0.0-release.md`：icbcbypass v1.0.0 发布反思——嵌套 RunLoop 死锁教训、fishhook 替代 MSHookFunction 约束、semaphore 区分策略。
-- `llmdoc/memory/reflections/anti-detection-deep-analysis.md`：反检测深层分析——MSHookFunctionChecker 可绕过性、inline SVC 不可拦截性与对抗哲学、防御方 UX-安全性结构性弱点、workflow 配置修复。
 - `llmdoc/memory/reflections/anti-detection-deep-analysis.md`：MSHookFunction 风险决策、inline SVC 对抗哲学、fishhook 被禁极端场景分析、发版配置教训。
+- `llmdoc/memory/reflections/linux-cross-compile-setup.md`：Linux 无 sudo 环境搭建 Theos 交叉编译的完整踩坑记录。
