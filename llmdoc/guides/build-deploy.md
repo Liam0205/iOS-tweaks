@@ -128,7 +128,7 @@ Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号
 示例：
 - `bankcommbypass_0.2.0`
 - `mybankbypass_1.2.0`
-- `icbcbypass_1.0.0`
+- `icbcbypass_1.1.0`
 
 发版流程（全自动）：
 1. 安装 Theos 并编译目标 tweak

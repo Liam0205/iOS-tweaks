@@ -104,6 +104,7 @@ APP 的冻结机制是持续运行的循环（30s 内 14,000+ 次调用），不
 - **永远不在 hook 内部进入嵌套 RunLoop**。直接返回安全值，让 UIApplicationMain 原生 RunLoop 处理事件。
 - DISPATCH_TIME_FOREVER 的拦截是永久性的——冻结循环也是永久运行的。
 - **CALayer hook 必须区分冻结流量与正常流量**。永久全局阻断 removeAllAnimations 会导致动画对象累积、GPU 压力升高、按钮动画挂起（3.0.90 适配教训）。
+- **解冻定时器必须永久运行**。冻结循环是永久的，定时器停止会导致 UI 重新冻结。30s 后降频至 5s 间隔以平衡 CPU 开销。
 
 ### 已知性能考量
 
@@ -134,12 +135,33 @@ APP 的冻结机制是持续运行的循环（30s 内 14,000+ 次调用），不
 1. "安全提示" — "您的设备环境存在隐私信息泄露..." (action: "确定" style=Cancel, handler 调 exit)
 2. "风险提示" — "您的系统可能已经越狱..." (action: "确认" style=Default)
 
+### 4. 解冻定时器（Unfreezer Timer）
+
+`%ctor` 末尾创建一个 GCD timer，周期性恢复 UI 状态。此定时器**永久运行**（冻结循环也是永久的），但在 30s 后降频：
+
+- 启动后 3s 开始，间隔 2s 触发（前 15 次）
+- 第 15 次触发后降频至 5s 间隔（降低长期 CPU 开销）
+
+每次触发执行：
+- `endIgnoringInteractionEvents` 循环清除
+- 所有 window 恢复 `userInteractionEnabled`
+- 高层级覆盖窗口（非 ICBCMotionRecognizingWindow）隐藏
+- `layer.speed = 1.0` 恢复动画速度
+- `setAnimationsEnabled:YES`
+
+#### 关键设计决策
+
+定时器永久运行而非在某个时间点停止，因为冻结循环本身是永久运行的。如果定时器停止，冻结循环后续的 setAnimationsEnabled:NO / beginIgnoringInteractionEvents 调用会逐步重新冻结 UI。降频而非停止是在"持续对抗"与"CPU 开销"之间的平衡。
+
 ## 调试能力
 
 通过编译开关 `#define ICBC_DEBUG_LOG 0` 控制：
 
 - 关闭（0）：release 模式，无日志写入
 - 开启（1）：写详细日志到 Documents/icbc_fishhook.log，包含 fishhook 命中、semaphore 拦截、watchdog、alert 拦截等信息
+- debug 模式下 `%ctor` 初始化时记录 ICBC app 版本号（`CFBundleShortVersionString`），便于日志中确认目标 App 版本
+
+注意：调试用 UIControl sendAction hook 已移除，因 Logos 预处理器与 `#if ICBC_DEBUG_LOG` 条件编译不兼容（Logos 的 `%hook` 不支持被 `#if` 包裹）。
 
 ## 依赖与边界
 

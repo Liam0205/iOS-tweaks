@@ -10,7 +10,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 |------|----------|-----------|----------|
 | `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 |
 | `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 |
-| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 |
+| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
 
@@ -35,7 +35,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 
 - mybankbypass 当前版本：`1.2.0`，已确认绕过网商银行 4.6.4 与 4.7.36 的越狱检测
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
-- icbcbypass 当前版本：`1.0.0`，已完全绕过工商银行 3.0.80 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常
+- icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
 
 ## 软件源与 CI/CD 架构
 
