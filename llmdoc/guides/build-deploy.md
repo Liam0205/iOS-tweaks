@@ -112,14 +112,30 @@ make install THEOS_DEVICE_IP=<device-ip>
 uicache -p /Applications/SSHTunnel.app
 ```
 
+**自举问题警告**：不要通过 SSHTunnel 自身维护的反向隧道来部署 SSHTunnel 新版本。dpkg 安装过程中 SSHTunnel 进程被替换，隧道立即断开，后续命令（如 uicache）将失败。部署 SSHTunnel 应使用其他连接方式（USB 直连 iproxy 或 Wi-Fi 局域网 SSH）。
+
 ### 反向隧道开发工作流
 
-当手机在内网、构建服务器在公网时，通过 sshtunnel 建立反向隧道后，服务器可以 SSH 回手机：
+当手机在内网、构建服务器在公网时，通过 SSHTunnel 建立反向隧道后，服务器可通过 `localhost:2222` SSH 回手机。
+
+**连接约束**：rootless 越狱（Dopamine）环境下，SSH 用户必须使用 `mobile`，不要用 `root`（root 的 SSH 认证配置不同，会导致 `Too many authentication failures`）。
+
+操作步骤：
 
 1. 构建服务器上编译 tweak：`make package FINALPACKAGE=1`
 2. 在手机上打开 SSHTunnel，配置服务器地址和端口，点击连接
-3. 隧道建立后，从构建服务器通过映射端口 SSH 到手机安装 deb
-4. 在手机上验证 tweak 效果
+3. 隧道建立后，传输并安装 deb：
+
+```bash
+# 传输 deb 到设备
+scp -P 2222 packages/<name>.deb mobile@localhost:/tmp/
+# 远程安装
+ssh -p 2222 mobile@localhost "sudo dpkg -i /tmp/<name>.deb"
+```
+
+4. 验证部署结果：
+   - **tweak**：重启目标 App，确认 tweak 生效
+   - **sshtunnel**：不适用此工作流（见上方自举问题警告）
 
 ## 发版与 Tag 规则
 

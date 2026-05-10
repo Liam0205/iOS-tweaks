@@ -32,3 +32,4 @@
 - `llmdoc/memory/reflections/icbc-3090-adaptation.md`：ICBC 3.0.90 适配反思——全局阻断框架方法的隐性退化、速率限制优于时间门控、sched_yield 缓解忙循环。
 - `llmdoc/memory/reflections/anti-detection-deep-analysis.md`：MSHookFunction 风险决策、inline SVC 对抗哲学、fishhook 被禁极端场景分析、发版配置教训。
 - `llmdoc/memory/reflections/linux-cross-compile-setup.md`：Linux 无 sudo 环境搭建 Theos 交叉编译的完整踩坑记录。
+- `llmdoc/memory/reflections/deploy-via-reverse-tunnel.md`：反向隧道部署踩坑——端口号/用户名缺失导致试错、root vs mobile 约束、SSHTunnel 自举问题。
