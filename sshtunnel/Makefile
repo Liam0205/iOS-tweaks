@@ -1,5 +1,5 @@
 IPHONE_ARCHS = arm64 arm64e
-TARGET = iphone:16.5:14.0
+TARGET := iphone:clang:latest:14.0
 THEOS_PACKAGE_SCHEME = rootless
 
 ifeq ($(shell uname),Linux)

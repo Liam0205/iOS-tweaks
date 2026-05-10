@@ -898,3 +898,113 @@ ICBC APP 的越狱检测+冻结机制分为三层：
 1. **不要在 hook 内部进入嵌套 RunLoop** — 会导致调用者栈上的锁永远不释放 → 死锁
 2. **DISPATCH_TIME_FOREVER vs 有限超时区分对待** — 前者是 freeze 专用，后者可能是合法操作
 3. **弹窗 handler 可能包含 exit()** — 不能盲目调用被拦截弹窗的 action handler
+
+---
+
+## ICBC 3.0.90 版本适配 (2026-05-10)
+
+### 环境
+
+- ICBCBypass: v1.0.0（发布版）
+- ICBC App: 3.0.90（从 3.0.80 升级）
+- 用户反馈：登录界面 FaceID 自动触发（正常），登录后各按钮卡顿，需点击 10+ 次才能响应
+
+### 诊断日志分析
+
+**检测向量**：与 3.0.80 完全一致，未观察到新增检测路径
+- TweakInject plist 枚举（46 条 access 命中）
+- Dopamine preboot 路径检测（stat/opendir/syscall_access 三件套，28 条路径）
+- 标准越狱路径双查（rootless 真实路径 + 传统路径各一遍）
+- 所有路径均被 fishhook 成功拦截
+
+**弹窗**：与 3.0.80 一致
+1. "安全提示" — "您的设备环境存在隐私信息泄露..." (action: "确定" style=Cancel) → 已静默
+2. "风险提示" — "您的系统可能已经越狱..." (action: "确认" style=Default) → 已静默（登录后触发）
+
+**冻结机制对比**：
+
+| 指标 | 3.0.80 v64 (30s) | 3.0.90 v1.0.0 (30s) | 变化 |
+|------|-------------------|----------------------|------|
+| sema_blocked | 14,083 | 14,935 | +6% |
+| freeze_indicator | 4,977 | 4,272 | -14% |
+| sendEvent | 69 | 141 | +104% |
+| main_responsive | 全程 1 | 全程 1 | 不变 |
+| isIgnoring | 0 | 0 | 不变 |
+
+**冻结时序模式变化**：
+
+3.0.80 的 semaphore 阻塞**匀速分布**：
+- t=3~14s: 10,216 次 (~929/s)
+- t=14~30s: +3,867 次 (~242/s)
+
+3.0.90 的 semaphore 阻塞**前置集中**：
+- t=3~14s: 14,058 次 (~1,278/s) — 初始爆发强度 +37%
+- t=14~20s: +14 次 (~2.3/s) — 近乎停止
+- t=20~30s: +863 次 (~86/s) — 小规模第二波
+
+### 性能问题根因分析
+
+主线程全程响应（main_responsive=1），sendEvent 正常传递（141 次），触摸事件到达 app。问题不在事件传递链，而在 **hook 副作用导致的 UI 渲染/响应延迟**。
+
+#### 问题 1: CALayer 动画清理被永久阻断
+
+```objc
+// Tweak.x:882-897 — 当前实现
+- (void)removeAllAnimations {
+    CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - g_ctor_time;
+    if (elapsed > 3.0) { return; } // ← 3 秒后 ALL 动画移除被永久阻断
+    %orig;
+}
+```
+
+这个 hook 在 ctor 后 3 秒起永久阻断 **所有** CALayer 的 `removeAllAnimations` 和 `removeAnimationForKey:` 调用——不区分是 freeze 循环的恶意调用还是 app 正常 UI 的合法调用。
+
+后果：
+- 已完成的动画永远不被清理 → CALayer 树中动画对象堆积
+- 按钮按下/抬起的过渡动画挂起 → 视觉上按钮「没反应」
+- GPU 渲染压力随时间线性增长
+- 在 3.0.90 中影响更明显（可能因为 app 新增了 UI 动画/效果）
+
+#### 问题 2: semaphore 忙循环消耗 CPU
+
+freeze 循环中 `dispatch_semaphore_wait(FOREVER)` 被直接返回 0，将原本的阻塞等待变为忙循环：
+- 前 14 秒以 ~1,278 次/秒的速度空转
+- 每次调用包含 `pthread_main_np()` + `CFAbsoluteTimeGetCurrent()` + 条件判断
+- 忙循环占据主线程 CPU 时间片，挤压 UI 事件处理窗口
+
+3.0.90 的初始爆发强度比 3.0.80 高 37%（1,278 vs 929/s），恰好覆盖了登录和 FaceID 触发的关键窗口。
+
+#### 问题 3: setUserInteractionEnabled:NO 全局阻断
+
+```objc
+// Tweak.x:871-879
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    if (!enabled) {
+        if (elapsed > 3.0) { return; }
+    }
+    %orig;
+}
+```
+
+阻断了所有 `setUserInteractionEnabled:NO` 调用。正常 app 逻辑中，按钮在网络请求期间会被 disable 后 enable——阻断 disable 但不阻断 enable 可能导致状态不一致。
+
+### 待修复项
+
+1. **CALayer hook 策略优化**：不应永久阻断，应改为：
+   - 仅在 freeze 活跃期（前 10-15s）阻断
+   - 或计数阻断（前 N 次后放行）
+   - 或仅阻断 freeze 循环线程的调用（识别调用栈特征）
+
+2. **semaphore 忙循环缓解**：在直接返回 0 时插入 `usleep()` 降低空转频率，释放 CPU 给 UI 处理
+
+3. **setUserInteractionEnabled hook 收窄**：仅在 freeze 窗口期内阻断，之后放行
+
+4. **添加 ICBC 版本号日志**：在 `[INIT]` 日志中记录 `CFBundleShortVersionString`，方便用户反馈版本信息
+
+### 版本信息缺失
+
+用户反馈无法确认 ICBC APP 版本。当前 `[INIT]` 仅记录 tweak 版本。需在 ctor 中添加：
+```objc
+NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+fprintf(f, "[INIT] ICBCBypass v1.0.0 / ICBC %s ctor started\n", appVer.UTF8String);
+```
