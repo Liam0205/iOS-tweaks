@@ -1,5 +1,6 @@
 IPHONE_ARCHS = arm64 arm64e
 TARGET = iphone:16.5:14.0
+THEOS_PACKAGE_SCHEME = rootless
 
 export LD_LIBRARY_PATH := /home/linuxbrew/.linuxbrew/lib:$(LD_LIBRARY_PATH)
 
