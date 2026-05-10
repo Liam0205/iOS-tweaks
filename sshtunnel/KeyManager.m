@@ -31,8 +31,11 @@
             [fm removeItemAtPath:pubPath error:nil];
         }
 
+        NSString *jbPath = @"/var/jb/usr/bin/ssh-keygen";
+        NSString *keygenPath = [fm fileExistsAtPath:jbPath] ? jbPath : @"/usr/bin/ssh-keygen";
+
         char *argv[] = {
-            "/usr/bin/ssh-keygen",
+            (char *)keygenPath.UTF8String,
             "-t", "ed25519",
             "-f", (char *)path.UTF8String,
             "-N", "",
@@ -42,7 +45,7 @@
 
         extern char **environ;
         pid_t pid = 0;
-        int ret = posix_spawn(&pid, "/usr/bin/ssh-keygen", NULL, NULL, argv, environ);
+        int ret = posix_spawn(&pid, keygenPath.UTF8String, NULL, NULL, argv, environ);
         if (ret != 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO, [NSString stringWithFormat:@"spawn failed: %s", strerror(ret)]);

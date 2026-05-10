@@ -30,7 +30,7 @@ static NSString *const kIdentity = @"SSHTunnel_Identity";
         _serverPort = 22;
         _remotePort = 2222;
         _localPort = 22;
-        _identityFile = @"/var/mobile/.ssh/id_rsa";
+        _identityFile = [NSHomeDirectory() stringByAppendingPathComponent:@".ssh/id_rsa"];
         [self loadSettings];
     }
     return self;
@@ -87,14 +87,22 @@ static NSString *const kIdentity = @"SSHTunnel_Identity";
     });
 }
 
+static NSString *findBinary(NSString *name) {
+    NSString *jb = [@"/var/jb/usr/bin" stringByAppendingPathComponent:name];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:jb]) return jb;
+    return [@"/usr/bin" stringByAppendingPathComponent:name];
+}
+
 - (void)spawnSSH {
     NSString *tunnel = [NSString stringWithFormat:@"%ld:localhost:%ld",
                         (long)_remotePort, (long)_localPort];
     NSString *port = [NSString stringWithFormat:@"%ld", (long)_serverPort];
     NSString *target = [NSString stringWithFormat:@"%@@%@", _username, _serverHost];
 
+    NSString *sshPath = findBinary(@"ssh");
+
     NSMutableArray<NSString *> *args = [NSMutableArray arrayWithArray:@[
-        @"/usr/bin/ssh",
+        sshPath,
         @"-N",
         @"-R", tunnel,
         @"-p", port,
@@ -124,7 +132,7 @@ static NSString *const kIdentity = @"SSHTunnel_Identity";
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
 
-    int ret = posix_spawn(&pid, "/usr/bin/ssh", NULL, &attr, argv, environ);
+    int ret = posix_spawn(&pid, sshPath.UTF8String, NULL, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
 
     for (int i = 0; i < argc; i++) free(argv[i]);

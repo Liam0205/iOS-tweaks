@@ -194,7 +194,7 @@ typedef NS_ENUM(NSInteger, Section) {
                 break;
             case 2:
                 label.text = @"Identity";
-                tf.placeholder = @"/var/mobile/.ssh/id_rsa";
+                tf.placeholder = @"~/.ssh/id_rsa";
                 tf.text = mgr.identityFile;
                 tf.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
                 _identityField = tf;
@@ -237,7 +237,7 @@ typedef NS_ENUM(NSInteger, Section) {
 
 - (void)generateKey {
     TunnelManager *mgr = [TunnelManager shared];
-    NSString *path = mgr.identityFile.length ? mgr.identityFile : @"/var/mobile/.ssh/id_rsa";
+    NSString *path = mgr.identityFile;
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Generate SSH Key"
@@ -263,7 +263,7 @@ typedef NS_ENUM(NSInteger, Section) {
 
 - (void)refreshPublicKey {
     TunnelManager *mgr = [TunnelManager shared];
-    NSString *path = mgr.identityFile.length ? mgr.identityFile : @"/var/mobile/.ssh/id_rsa";
+    NSString *path = mgr.identityFile;
     NSString *pub = [KeyManager publicKeyForPath:path];
     _pubKeyLabel.text = pub.length ? pub : @"No public key found. Tap \"Generate New Key\" above.";
     _pubKeyLabel.textColor = pub.length ? UIColor.labelColor : UIColor.tertiaryLabelColor;
