@@ -178,7 +178,6 @@ static NSString *findBinary(NSString *name) {
     NSString *needle = [NSString stringWithFormat:@"-R %ld:localhost:%ld",
                         (long)_remotePort, (long)_localPort];
 
-    NSString *pgrepPath = findBinary(@"pgrep");
     int fds[2];
     if (pipe(fds) != 0) return 0;
 
@@ -187,16 +186,20 @@ static NSString *findBinary(NSString *name) {
     posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
     posix_spawn_file_actions_addclose(&actions, fds[0]);
 
+    NSString *shPath = @"/bin/sh";
+    NSString *cmd = [NSString stringWithFormat:
+        @"ps -eo pid,args 2>/dev/null | grep '%@' | grep -v grep | awk '{print $1}'",
+        needle];
     char *argv[] = {
-        (char *)pgrepPath.UTF8String,
-        "-f",
-        (char *)needle.UTF8String,
+        (char *)shPath.UTF8String,
+        "-c",
+        (char *)cmd.UTF8String,
         NULL
     };
 
     extern char **environ;
     pid_t child = 0;
-    int ret = posix_spawn(&child, pgrepPath.UTF8String, &actions, NULL, argv, environ);
+    int ret = posix_spawn(&child, shPath.UTF8String, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(fds[1]);
 
