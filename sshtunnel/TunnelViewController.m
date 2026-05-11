@@ -41,7 +41,7 @@ typedef NS_ENUM(NSInteger, Section) {
         [weakSelf updateUIForState:state message:msg];
     };
 
-    [self updateUIForState:mgr.state message:nil];
+    [self updateUIForState:mgr.state message:mgr.lastMessage];
 }
 
 #pragma mark - UITableView
@@ -86,7 +86,7 @@ typedef NS_ENUM(NSInteger, Section) {
                 [_connectButton.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12],
                 [_connectButton.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
             ]];
-            [self updateUIForState:mgr.state message:nil];
+            [self updateUIForState:mgr.state message:mgr.lastMessage];
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             return cell;
         } else {
@@ -104,7 +104,7 @@ typedef NS_ENUM(NSInteger, Section) {
                 [_statusLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
                 [_statusLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
             ]];
-            [self updateUIForState:mgr.state message:nil];
+            [self updateUIForState:mgr.state message:mgr.lastMessage];
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             return cell;
         }

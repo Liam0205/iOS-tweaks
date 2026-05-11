@@ -22,7 +22,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSInteger localPort;
 @property (nonatomic, copy) NSString *identityFile;
 
+@property (nonatomic, copy, nullable) NSString *lastMessage;
+@property (nonatomic, readonly) BOOL usingAutossh;
+
 + (instancetype)shared;
+- (void)probe;
 - (void)connect;
 - (void)disconnect;
 - (void)saveSettings;

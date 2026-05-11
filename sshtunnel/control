@@ -1,9 +1,10 @@
 Package: page.0x01.sshtunnel
 Name: SSHTunnel
-Version: 1.1.1
+Version: 1.2.0
 Architecture: iphoneos-arm64
-Description: SSH reverse tunnel manager. Establishes a reverse SSH tunnel from this device to a remote server, enabling remote access to the device.
+Description: SSH reverse tunnel manager. Establishes a reverse SSH tunnel from this device to a remote server, enabling remote access to the device. Supports autossh for automatic reconnection.
 Maintainer: Liam
 Author: Liam
 Section: Utilities
 Depends: openssh-client, sshpass
+Recommends: autossh
