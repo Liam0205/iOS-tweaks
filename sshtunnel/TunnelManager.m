@@ -245,6 +245,7 @@ static NSString *findBinary(NSString *name) {
 
     if (hasAutossh) {
         setenv("AUTOSSH_GATETIME", "0", 1);
+        setenv("AUTOSSH_PATH", sshPath.UTF8String, 1);
     }
 
     extern char **environ;

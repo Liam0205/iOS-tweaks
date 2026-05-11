@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1
+
+- 修复 autossh 在 rootless 越狱上找不到 ssh 的问题（设置 AUTOSSH_PATH 指向 /var/jb/usr/bin/ssh）
+
 ## 1.2.0
 
 - 支持 autossh 自动重连（安装 autossh 后自动启用，未安装则回退到 ssh）
