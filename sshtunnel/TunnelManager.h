@@ -4,6 +4,7 @@ typedef NS_ENUM(NSInteger, TunnelState) {
     TunnelStateDisconnected,
     TunnelStateConnecting,
     TunnelStateConnected,
+    TunnelStateReconnecting,
 };
 
 typedef void (^TunnelStateCallback)(TunnelState state, NSString * _Nullable message);
@@ -22,6 +23,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSInteger localPort;
 @property (nonatomic, copy) NSString *identityFile;
 
+@property (nonatomic, assign) BOOL autoReconnect;
+@property (nonatomic, assign) BOOL autoStartOnBoot;
+@property (nonatomic, readonly) NSInteger healthCheckFailures;
+
 @property (nonatomic, copy, nullable) NSString *lastMessage;
 @property (nonatomic, readonly) BOOL usingAutossh;
 
@@ -31,6 +36,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)disconnect;
 - (void)saveSettings;
 - (void)loadSettings;
+- (void)writeBootCmd;
+- (void)removeBootCmd;
 
 @end
 

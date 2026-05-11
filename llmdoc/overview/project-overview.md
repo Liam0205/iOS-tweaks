@@ -19,9 +19,9 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 
 | 包名 | 类型 | 用途 |
 |------|------|------|
-| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.2.1），基于 autossh 实现持久化隧道，ssh 作为 fallback |
+| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.3.0），自愈隧道：TCP 健康检查 + 指数退避自动重连 + 开机持久化 |
 
-sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.2.1 使用 autossh 维护持久隧道（PID 文件状态管理、启动时探活），设备未安装 autossh 时自动降级为普通 ssh。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
+sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.3.0 核心能力：(1) autossh 持久隧道（PID 文件状态管理），设备未安装 autossh 时降级为 ssh；(2) TCP 健康检查（30s 间隔，3 次连续失败触发重连）；(3) 指数退避自动重连（3-60s）；(4) LaunchDaemon 开机持久化（PathState 激活）。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
 ## 目标环境
 
@@ -70,7 +70,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
 - `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（9 轮迭代，v1-v81）
-- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，通过 posix_spawn 启动 autossh/ssh 进程，使用 POSIX_SPAWN_SETPGROUP 隔离子进程组，PID 文件持久化状态）
+- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + TCP 健康检查 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
 - `.github/workflows/release.yml`：发版与 Pages 部署 workflow

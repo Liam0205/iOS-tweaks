@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>page.0x01.sshtunnel</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>/var/jb/var/mobile/.sshtunnel/boot-cmd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/var/jb/var/mobile/.sshtunnel/boot-cmd</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>UserName</key>
+	<string>mobile</string>
+	<key>StandardErrorPath</key>
+	<string>/var/jb/var/mobile/.sshtunnel/daemon-stderr.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

@@ -2,6 +2,11 @@
 #import <spawn.h>
 #import <signal.h>
 #import <sys/wait.h>
+#import <sys/socket.h>
+#import <sys/stat.h>
+#import <sys/sysctl.h>
+#import <netdb.h>
+#import <arpa/inet.h>
 #import <fcntl.h>
 
 static NSString *const kHost = @"SSHTunnel_Host";
@@ -10,16 +15,29 @@ static NSString *const kUser = @"SSHTunnel_User";
 static NSString *const kRemotePort = @"SSHTunnel_RemotePort";
 static NSString *const kLocalPort = @"SSHTunnel_LocalPort";
 static NSString *const kIdentity = @"SSHTunnel_Identity";
+static NSString *const kAutoReconnect = @"SSHTunnel_AutoReconnect";
+static NSString *const kAutoStart = @"SSHTunnel_AutoStart";
 
 static NSString *const kStateDir = @"/var/jb/var/mobile/.sshtunnel";
+static NSString *const kBootCmdPath = @"/var/jb/var/mobile/.sshtunnel/boot-cmd";
+static NSString *const kDaemonPlistPath = @"/var/jb/Library/LaunchDaemons/page.0x01.sshtunnel.plist";
+static NSString *const kDaemonLabel = @"page.0x01.sshtunnel";
 
 static NSString *statePath(NSString *name) {
     return [kStateDir stringByAppendingPathComponent:name];
 }
 
+static NSString *findBinary(NSString *name) {
+    NSString *jb = [@"/var/jb/usr/bin" stringByAppendingPathComponent:name];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:jb]) return jb;
+    return [@"/usr/bin" stringByAppendingPathComponent:name];
+}
+
 @implementation TunnelManager {
     pid_t _pid;
     dispatch_source_t _monitor;
+    dispatch_source_t _healthTimer;
+    int _reconnectBackoff;
 }
 
 + (instancetype)shared {
@@ -38,6 +56,10 @@ static NSString *statePath(NSString *name) {
         _remotePort = 2222;
         _localPort = 22;
         _identityFile = @"/var/jb/var/mobile/.ssh/id_rsa";
+        _autoReconnect = YES;
+        _autoStartOnBoot = NO;
+        _reconnectBackoff = 0;
+        _healthCheckFailures = 0;
         [self loadSettings];
         [self probe];
     }
@@ -54,6 +76,8 @@ static NSString *statePath(NSString *name) {
     [d setInteger:_remotePort forKey:kRemotePort];
     [d setInteger:_localPort forKey:kLocalPort];
     if (_identityFile) [d setObject:_identityFile forKey:kIdentity];
+    [d setBool:_autoReconnect forKey:kAutoReconnect];
+    [d setBool:_autoStartOnBoot forKey:kAutoStart];
     [d synchronize];
 }
 
@@ -71,6 +95,14 @@ static NSString *statePath(NSString *name) {
     if (lp > 0) _localPort = lp;
     NSString *id_ = [d stringForKey:kIdentity];
     if (id_) _identityFile = id_;
+
+    // autoReconnect defaults to YES if never set
+    if ([d objectForKey:kAutoReconnect]) {
+        _autoReconnect = [d boolForKey:kAutoReconnect];
+    } else {
+        _autoReconnect = YES;
+    }
+    _autoStartOnBoot = [d boolForKey:kAutoStart];
 }
 
 #pragma mark - State
@@ -138,11 +170,261 @@ static NSString *statePath(NSString *name) {
     [fm removeItemAtPath:statePath(@"tunnel.json") error:nil];
 }
 
+#pragma mark - Orphan Process Detection
+
+- (pid_t)findOrphanTunnelPid {
+    if (!_serverHost.length || _remotePort <= 0 || _localPort <= 0) return 0;
+
+    NSString *needle = [NSString stringWithFormat:@"-R %ld:localhost:%ld",
+                        (long)_remotePort, (long)_localPort];
+
+    NSString *pgrepPath = findBinary(@"pgrep");
+    int fds[2];
+    if (pipe(fds) != 0) return 0;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, fds[0]);
+
+    char *argv[] = {
+        (char *)pgrepPath.UTF8String,
+        "-f",
+        (char *)needle.UTF8String,
+        NULL
+    };
+
+    extern char **environ;
+    pid_t child = 0;
+    int ret = posix_spawn(&child, pgrepPath.UTF8String, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(fds[1]);
+
+    if (ret != 0) {
+        close(fds[0]);
+        return 0;
+    }
+
+    char buf[128];
+    ssize_t n = read(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+
+    int status;
+    waitpid(child, &status, 0);
+
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    pid_t found = (pid_t)atoi(buf);
+    if (found > 0 && kill(found, 0) == 0) return found;
+    return 0;
+}
+
+- (void)killOrphanTunnel {
+    pid_t orphan = [self findOrphanTunnelPid];
+    if (orphan <= 0) return;
+    kill(orphan, SIGTERM);
+    usleep(300000);
+    if (kill(orphan, 0) == 0) kill(orphan, SIGKILL);
+    usleep(200000);
+}
+
+#pragma mark - TCP Health Check
+
+- (BOOL)tcpConnectTestWithTimeout:(NSTimeInterval)timeout {
+    if (!_serverHost.length) return NO;
+
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    NSString *portStr = [NSString stringWithFormat:@"%ld", (long)_serverPort];
+    int err = getaddrinfo(_serverHost.UTF8String, portStr.UTF8String, &hints, &res);
+    if (err != 0 || !res) return NO;
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return NO;
+    }
+
+    // Set non-blocking
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int ret = connect(sock, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+
+    BOOL success = NO;
+    if (ret == 0) {
+        success = YES;
+    } else if (errno == EINPROGRESS) {
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(sock, &writefds);
+
+        struct timeval tv;
+        tv.tv_sec = (long)timeout;
+        tv.tv_usec = (long)((timeout - (long)timeout) * 1000000);
+
+        int sel = select(sock + 1, NULL, &writefds, NULL, &tv);
+        if (sel > 0) {
+            int optval = 0;
+            socklen_t optlen = sizeof(optval);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &optval, &optlen);
+            success = (optval == 0);
+        }
+    }
+
+    close(sock);
+    return success;
+}
+
+#pragma mark - Health Check Timer
+
+- (void)startHealthCheck {
+    [self stopHealthCheck];
+
+    _healthTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                          dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    dispatch_source_set_timer(_healthTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC),
+                              30 * NSEC_PER_SEC, 5 * NSEC_PER_SEC);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_healthTimer, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        [self performHealthCheck];
+    });
+    dispatch_resume(_healthTimer);
+}
+
+- (void)stopHealthCheck {
+    if (_healthTimer) {
+        dispatch_source_cancel(_healthTimer);
+        _healthTimer = nil;
+    }
+}
+
+- (void)performHealthCheck {
+    if (_state != TunnelStateConnected) return;
+
+    pid_t pid = _pid;
+    if (pid <= 0 || kill(pid, 0) != 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self handleTunnelDeath:@"Process exited unexpectedly"];
+        });
+        return;
+    }
+
+    if ([self tcpConnectTestWithTimeout:5]) {
+        _healthCheckFailures = 0;
+    } else {
+        _healthCheckFailures++;
+        if (_healthCheckFailures >= 3) {
+            kill(pid, SIGTERM);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self handleTunnelDeath:@"Health check failed (3 consecutive TCP failures)"];
+            });
+        }
+    }
+}
+
+#pragma mark - Auto-Reconnect
+
+- (void)handleTunnelDeath:(NSString *)reason {
+    pid_t pid = _pid;
+    _pid = 0;
+    if (_monitor) {
+        dispatch_source_cancel(_monitor);
+        _monitor = nil;
+    }
+    [self stopHealthCheck];
+    [self cleanupStateFiles];
+
+    if (pid > 0) {
+        waitpid(pid, NULL, WNOHANG);
+    }
+
+    if (_autoReconnect && _serverHost.length && _username.length) {
+        [self setState:TunnelStateReconnecting message:reason];
+        int delay = 3 * (1 << (_reconnectBackoff < 4 ? _reconnectBackoff : 4));
+        if (delay > 60) delay = 60;
+        _reconnectBackoff++;
+
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            if (self->_state == TunnelStateReconnecting) {
+                [self setState:TunnelStateConnecting message:@"Reconnecting..."];
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    [self spawnTunnel];
+                });
+            }
+        });
+    } else {
+        _reconnectBackoff = 0;
+        [self setState:TunnelStateDisconnected message:reason];
+    }
+}
+
+#pragma mark - Connection Verification
+
+- (void)verifyConnection:(pid_t)pid attempt:(int)attempt {
+    if (_pid != pid || _state != TunnelStateConnecting) return;
+
+    if (kill(pid, 0) != 0) {
+        [self handleTunnelDeath:@"Process died during connection"];
+        return;
+    }
+
+    // Run TCP test on background queue to avoid blocking main thread
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        BOOL tcpOK = [self tcpConnectTestWithTimeout:3];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_pid != pid || self->_state != TunnelStateConnecting) return;
+
+            if (tcpOK) {
+                self->_reconnectBackoff = 0;
+                self->_healthCheckFailures = 0;
+                NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld%@",
+                                 pid, self->_username, self->_serverHost,
+                                 (long)self->_remotePort, (long)self->_localPort,
+                                 self->_usingAutossh ? @" (autossh)" : @""];
+                [self setState:TunnelStateConnected message:msg];
+                [self startHealthCheck];
+                if (self->_autoStartOnBoot) {
+                    [self writeBootCmd];
+                }
+                return;
+            }
+
+            if (attempt < 8) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                               dispatch_get_main_queue(), ^{
+                    [self verifyConnection:pid attempt:attempt + 1];
+                });
+            } else {
+                kill(pid, SIGTERM);
+                [self handleTunnelDeath:@"Connection verification timed out"];
+            }
+        });
+    });
+}
+
 #pragma mark - Probe
 
 - (void)probe {
     pid_t pid = [self readPidFile];
-    if (pid <= 0) return;
+
+    if (pid <= 0) {
+        pid = [self findOrphanTunnelPid];
+        if (pid <= 0) return;
+    }
 
     if (kill(pid, 0) != 0) {
         NSString *log = [self readLogTail];
@@ -157,15 +439,31 @@ static NSString *statePath(NSString *name) {
     _pid = pid;
     _usingAutossh = [config[@"autossh"] boolValue];
 
-    NSString *host = config[@"host"] ?: @"?";
-    NSString *user = config[@"user"] ?: @"?";
-    NSInteger rp = [config[@"remotePort"] integerValue];
-    NSInteger lp = [config[@"localPort"] integerValue];
-
-    _lastMessage = [NSString stringWithFormat:@"PID %d — tunnel %@@%@:%ld → localhost:%ld",
-                    pid, user, host, (long)rp, (long)lp];
-    _state = TunnelStateConnected;
+    [self writePidFile:pid];
+    [self writeConfigFile];
     [self attachMonitor:pid];
+
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        BOOL tcpOK = [self tcpConnectTestWithTimeout:5];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_pid != pid) return;
+
+            if (tcpOK) {
+                NSString *host = config[@"host"] ?: self->_serverHost ?: @"?";
+                NSString *user = config[@"user"] ?: self->_username ?: @"?";
+                NSInteger rp = config[@"remotePort"] ? [config[@"remotePort"] integerValue] : self->_remotePort;
+                NSInteger lp = config[@"localPort"] ? [config[@"localPort"] integerValue] : self->_localPort;
+                NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld",
+                                 pid, user, host, (long)rp, (long)lp];
+                [self setState:TunnelStateConnected message:msg];
+                [self startHealthCheck];
+            } else {
+                NSString *msg = [NSString stringWithFormat:@"PID %d — server unreachable, waiting for health check", pid];
+                [self setState:TunnelStateConnected message:msg];
+                [self startHealthCheck];
+            }
+        });
+    });
 }
 
 #pragma mark - Connect / Disconnect
@@ -181,14 +479,9 @@ static NSString *statePath(NSString *name) {
     [self saveSettings];
 
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        [self killOrphanTunnel];
         [self spawnTunnel];
     });
-}
-
-static NSString *findBinary(NSString *name) {
-    NSString *jb = [@"/var/jb/usr/bin" stringByAppendingPathComponent:name];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:jb]) return jb;
-    return [@"/usr/bin" stringByAppendingPathComponent:name];
 }
 
 - (void)spawnTunnel {
@@ -264,27 +557,22 @@ static NSString *findBinary(NSString *name) {
     free(argv);
 
     if (ret != 0) {
-        [self setState:TunnelStateDisconnected
-               message:[NSString stringWithFormat:@"spawn failed: %s", strerror(ret)]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setState:TunnelStateDisconnected
+                   message:[NSString stringWithFormat:@"spawn failed: %s", strerror(ret)]];
+        });
         return;
     }
 
     _pid = pid;
     [self writePidFile:pid];
     [self writeConfigFile];
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (self->_pid == pid && self->_state == TunnelStateConnecting) {
-            NSString *msg = [NSString stringWithFormat:@"PID %d — tunnel %@@%@:%ld → localhost:%ld%@",
-                             pid, self->_username, self->_serverHost,
-                             (long)self->_remotePort, (long)self->_localPort,
-                             hasAutossh ? @" (autossh)" : @""];
-            [self setState:TunnelStateConnected message:msg];
-        }
-    });
-
     [self attachMonitor:pid];
+
+    // Verify connection via TCP polling instead of blind 3s wait
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self verifyConnection:pid attempt:0];
+    });
 }
 
 - (void)attachMonitor:(pid_t)pid {
@@ -295,21 +583,22 @@ static NSString *findBinary(NSString *name) {
 
     _monitor = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, pid,
                                       DISPATCH_PROC_EXIT, dispatch_get_main_queue());
+    __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_monitor, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+
         int status = 0;
         pid_t wp = waitpid(pid, &status, WNOHANG);
-        self->_pid = 0;
-        self->_monitor = nil;
 
         NSString *log = [self readLogTail];
-        [self cleanupStateFiles];
 
         NSString *reason;
         if (wp > 0) {
             if (WIFEXITED(status)) {
                 int code = WEXITSTATUS(status);
                 if (code == 0) {
-                    reason = @"Disconnected";
+                    reason = @"Disconnected normally";
                 } else {
                     reason = log.length
                         ? [NSString stringWithFormat:@"Exited %d:\n%@", code, log]
@@ -325,21 +614,72 @@ static NSString *findBinary(NSString *name) {
                 ? [NSString stringWithFormat:@"Tunnel ended:\n%@", log]
                 : @"Tunnel process ended";
         }
-        [self setState:TunnelStateDisconnected message:reason];
+
+        [self handleTunnelDeath:reason];
     });
     dispatch_resume(_monitor);
 }
 
 - (void)disconnect {
-    if (_pid > 0) {
-        kill(_pid, SIGTERM);
+    [self stopHealthCheck];
+    if (_autoStartOnBoot) [self removeBootCmd];
+
+    pid_t pid = _pid;
+    _pid = 0;
+    if (_monitor) {
+        dispatch_source_cancel(_monitor);
+        _monitor = nil;
+    }
+    [self cleanupStateFiles];
+    _reconnectBackoff = 0;
+    [self setState:TunnelStateDisconnected message:@"Disconnected"];
+
+    if (pid > 0) {
+        kill(pid, SIGTERM);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_global_queue(0, 0), ^{
-            if (self->_pid > 0) {
-                kill(self->_pid, SIGKILL);
-            }
+            kill(pid, SIGKILL);
         });
     }
+}
+
+#pragma mark - Boot Persistence
+
+- (void)writeBootCmd {
+    [self ensureStateDir];
+
+    NSString *sshPath = findBinary(@"ssh");
+    NSString *autosshPath = findBinary(@"autossh");
+    BOOL hasAutossh = [[NSFileManager defaultManager] fileExistsAtPath:autosshPath];
+
+    NSMutableString *script = [NSMutableString string];
+    [script appendString:@"#!/bin/sh\n"];
+    [script appendString:@"export HOME=/var/mobile\n"];
+    [script appendString:@"export AUTOSSH_GATETIME=0\n"];
+
+    if (hasAutossh) {
+        [script appendFormat:@"export AUTOSSH_PATH=%@\n", sshPath];
+    }
+
+    [script appendFormat:@"echo $$ > %@\n", statePath(@"autossh.pid")];
+
+    NSString *binary = hasAutossh ? autosshPath : sshPath;
+    NSMutableString *cmd = [NSMutableString stringWithFormat:@"exec %@", binary];
+    if (hasAutossh) [cmd appendString:@" -M 0"];
+    [cmd appendFormat:@" -N -R %ld:localhost:%ld -p %ld",
+     (long)_remotePort, (long)_localPort, (long)_serverPort];
+    [cmd appendString:@" -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=3"];
+    [cmd appendString:@" -o ExitOnForwardFailure=yes -o BatchMode=yes"];
+    if (_identityFile.length) [cmd appendFormat:@" -i %@", _identityFile];
+    [cmd appendFormat:@" %@@%@\n", _username, _serverHost];
+    [script appendString:cmd];
+
+    [script writeToFile:kBootCmdPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    chmod(kBootCmdPath.UTF8String, 0755);
+}
+
+- (void)removeBootCmd {
+    [[NSFileManager defaultManager] removeItemAtPath:kBootCmdPath error:nil];
 }
 
 #pragma mark - Helpers

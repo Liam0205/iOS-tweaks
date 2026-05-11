@@ -7,6 +7,7 @@
 typedef NS_ENUM(NSInteger, Section) {
     SectionServer,
     SectionTunnel,
+    SectionOptions,
     SectionKey,
     SectionAction,
     SectionCount
@@ -20,8 +21,12 @@ typedef NS_ENUM(NSInteger, Section) {
     UITextField *_localPortField;
     UITextField *_identityField;
     UILabel *_statusLabel;
+    UILabel *_stateLabel;
     UILabel *_pubKeyLabel;
     UIButton *_connectButton;
+    UISwitch *_autoReconnectSwitch;
+    UISwitch *_autoStartSwitch;
+    TunnelState _previousState;
 }
 
 - (instancetype)init {
@@ -54,6 +59,7 @@ typedef NS_ENUM(NSInteger, Section) {
     switch (section) {
         case SectionServer:  return 3;
         case SectionTunnel:  return 3;
+        case SectionOptions: return 2;
         case SectionKey:     return 2;
         case SectionAction:  return 2;
         default: return 0;
@@ -64,6 +70,7 @@ typedef NS_ENUM(NSInteger, Section) {
     switch (section) {
         case SectionServer:  return @"Server";
         case SectionTunnel:  return @"Tunnel";
+        case SectionOptions: return @"Options";
         case SectionKey:     return @"SSH Key";
         case SectionAction:  return nil;
         default: return nil;
@@ -73,6 +80,29 @@ typedef NS_ENUM(NSInteger, Section) {
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     TunnelManager *mgr = [TunnelManager shared];
 
+    if (ip.section == SectionOptions) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UISwitch *sw = [[UISwitch alloc] init];
+        [sw addTarget:self action:@selector(optionSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+
+        if (ip.row == 0) {
+            cell.textLabel.text = @"Auto Reconnect";
+            sw.on = mgr.autoReconnect;
+            sw.tag = 100;
+            _autoReconnectSwitch = sw;
+        } else {
+            cell.textLabel.text = @"Start on Boot";
+            sw.on = mgr.autoStartOnBoot;
+            sw.tag = 101;
+            _autoStartSwitch = sw;
+        }
+
+        cell.accessoryView = sw;
+        return cell;
+    }
+
     if (ip.section == SectionAction) {
         if (ip.row == 0) {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -81,10 +111,19 @@ typedef NS_ENUM(NSInteger, Section) {
             [_connectButton addTarget:self action:@selector(toggleConnection) forControlEvents:UIControlEventTouchUpInside];
             _connectButton.translatesAutoresizingMaskIntoConstraints = NO;
             [cell.contentView addSubview:_connectButton];
+
+            _stateLabel = [[UILabel alloc] init];
+            _stateLabel.font = [UIFont systemFontOfSize:13];
+            _stateLabel.textAlignment = NSTextAlignmentCenter;
+            _stateLabel.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell.contentView addSubview:_stateLabel];
+
             [NSLayoutConstraint activateConstraints:@[
                 [_connectButton.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
-                [_connectButton.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12],
                 [_connectButton.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
+                [_stateLabel.topAnchor constraintEqualToAnchor:_connectButton.bottomAnchor constant:6],
+                [_stateLabel.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
+                [_stateLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-10],
             ]];
             [self updateUIForState:mgr.state message:mgr.lastMessage];
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -237,11 +276,39 @@ typedef NS_ENUM(NSInteger, Section) {
     [mgr saveSettings];
 }
 
+- (void)optionSwitchChanged:(UISwitch *)sw {
+    TunnelManager *mgr = [TunnelManager shared];
+    if (sw.tag == 100) {
+        mgr.autoReconnect = sw.isOn;
+    } else if (sw.tag == 101) {
+        mgr.autoStartOnBoot = sw.isOn;
+        if (!sw.isOn) {
+            [mgr removeBootCmd];
+        } else if (mgr.state == TunnelStateConnected) {
+            [mgr writeBootCmd];
+        }
+    }
+    [mgr saveSettings];
+}
+
 - (void)toggleConnection {
+    UIImpactFeedbackGenerator *impact = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [impact impactOccurred];
+
+    [UIView animateWithDuration:0.08 animations:^{
+        self->_connectButton.transform = CGAffineTransformMakeScale(0.92, 0.92);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.08 animations:^{
+            self->_connectButton.transform = CGAffineTransformIdentity;
+        }];
+    }];
+
     TunnelManager *mgr = [TunnelManager shared];
     if (mgr.state == TunnelStateDisconnected) {
         [self.view endEditing:YES];
         [mgr connect];
+    } else if (mgr.state == TunnelStateReconnecting) {
+        [mgr disconnect];
     } else {
         [mgr disconnect];
     }
@@ -471,26 +538,53 @@ typedef NS_ENUM(NSInteger, Section) {
     BOOL connected = (state != TunnelStateDisconnected);
     NSString *title;
     UIColor *color;
+    NSString *stateText;
+    UIColor *stateColor;
 
     switch (state) {
         case TunnelStateDisconnected:
             title = @"Connect";
             color = self.view.tintColor;
+            stateText = @"● Disconnected ●";
+            stateColor = UIColor.secondaryLabelColor;
             break;
         case TunnelStateConnecting:
             title = @"Connecting...";
             color = UIColor.systemOrangeColor;
+            stateText = @"● Connecting ●";
+            stateColor = UIColor.systemOrangeColor;
             break;
         case TunnelStateConnected:
             title = @"Disconnect";
             color = UIColor.systemRedColor;
+            stateText = @"● Connected ●";
+            stateColor = UIColor.systemGreenColor;
+            break;
+        case TunnelStateReconnecting:
+            title = @"Cancel";
+            color = UIColor.systemOrangeColor;
+            stateText = @"● Reconnecting ●";
+            stateColor = UIColor.systemOrangeColor;
             break;
     }
 
     [_connectButton setTitle:title forState:UIControlStateNormal];
     [_connectButton setTitleColor:color forState:UIControlStateNormal];
     _connectButton.enabled = (state != TunnelStateConnecting);
+    _stateLabel.text = stateText;
+    _stateLabel.textColor = stateColor;
     _statusLabel.text = msg ?: @"";
+
+    if (state != _previousState) {
+        if (state == TunnelStateConnected) {
+            UINotificationFeedbackGenerator *gen = [[UINotificationFeedbackGenerator alloc] init];
+            [gen notificationOccurred:UINotificationFeedbackTypeSuccess];
+        } else if (state == TunnelStateDisconnected && _previousState == TunnelStateConnected) {
+            UINotificationFeedbackGenerator *gen = [[UINotificationFeedbackGenerator alloc] init];
+            [gen notificationOccurred:UINotificationFeedbackTypeError];
+        }
+        _previousState = state;
+    }
 
     [self.tableView beginUpdates];
     [self.tableView endUpdates];

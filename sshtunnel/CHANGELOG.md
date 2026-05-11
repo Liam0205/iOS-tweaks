@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0
+
+- TCP 健康检查：每 30 秒通过非阻塞 socket 检测服务器连通性，连续 3 次失败自动杀掉隧道并重连
+- 自动重连与指数退避：隧道意外断开后自动重连（3s → 6s → 12s → 24s → 48s → 60s 上限），可通过开关关闭
+- 连接验证改进：TCP 轮询替代原来的 3 秒盲等待，每 2 秒检测一次，最多 8 次
+- LaunchDaemon 开机自启：通过 PathState 条件触发，boot-cmd 文件存在时自动建立隧道
+- 孤儿进程检测：启动时通过 pgrep 扫描匹配的 SSH 进程，PID 文件丢失也能恢复连接
+- probe 不再误杀隧道：TCP 测试失败时不杀进程，改由健康检查判断
+- Connect 前自动清理占用端口的旧进程
+- UI：新增 Options 区（Auto Reconnect / Start on Boot 开关）
+- UI：按钮点击触觉反馈 + 缩放动画
+- UI：按钮下方显示彩色连接状态指示器（● Connected ●）
+- UI：连接/断开时触觉通知（成功/错误）
+
 ## 1.2.1
 
 - 修复 autossh 在 rootless 越狱上找不到 ssh 的问题（设置 AUTOSSH_PATH 指向 /var/jb/usr/bin/ssh）

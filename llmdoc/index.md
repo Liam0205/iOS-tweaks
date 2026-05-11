@@ -15,6 +15,7 @@
 - `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
 - `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——ctor 两阶段加载、MSHookFunction + fishhook 混合策略、ARM64 栈切换退出生存机制、CFRunLoop 重定向绕过损坏的 dispatch queue、巡逻定时器线程管理、与 icbcbypass 的关键差异。
+- `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.0 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、TCP 健康检查、指数退避自动重连、LaunchDaemon 开机持久化、进程 spawn 约束与 zombie tunnel 检测。
 
 ## reference/
 
