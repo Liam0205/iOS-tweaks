@@ -356,6 +356,8 @@ extern SInt32 CFRunLoopRunSpecific(CFRunLoopRef rl, CFStringRef modeName, CFTime
 
 static volatile int g_exit_blocked = 0;
 static volatile int g_crash_count = 0;
+static volatile int g_trampoline_count = 0;
+static volatile int g_exit_call_count = 0;
 static uintptr_t g_cf_base = 0, g_cf_end = 0;
 static uintptr_t g_dispatch_base = 0, g_dispatch_end = 0;
 static uintptr_t g_libc_base = 0, g_libc_end = 0;
@@ -385,12 +387,81 @@ static void manual_drain_timer_cb(CFRunLoopTimerRef timer, void *info) {
         abc_log("drain timer #%d returned", g_drain_count);
 }
 
+static int is_safe_thread(const char *name) {
+    if (!name || name[0] == '\0') return 0;
+    return (strstr(name, "com.apple.") != NULL ||
+            strcmp(name, "APFileLog") == 0 ||
+            strcmp(name, "PowerGetThread") == 0 ||
+            strcmp(name, "longLinkThread") == 0 ||
+            strcmp(name, "MASS_Net") == 0);
+}
+
+static void suspend_and_log_threads(int log_detail) {
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+    task_threads(mach_task_self(), &threads, &count);
+    mach_port_t main_thread = mach_thread_self();
+    int suspended = 0, resumed = 0;
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        if (threads[i] == main_thread) {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+            continue;
+        }
+        char name[64] = {0};
+        pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt) pthread_getname_np(pt, name, sizeof(name));
+
+        if (is_safe_thread(name)) {
+            thread_resume(threads[i]);
+            resumed++;
+            if (log_detail)
+                abc_log("  kept thread '%s'", name);
+        } else {
+            thread_suspend(threads[i]);
+            suspended++;
+            if (log_detail && suspended <= 20)
+                abc_log("  suspended '%s'", name[0] ? name : "(unnamed)");
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+    if (log_detail)
+        abc_log("TRAMPOLINE: suspended %d, kept %d (of %d threads)", suspended, resumed, count);
+    mach_port_deallocate(mach_task_self(), main_thread);
+}
+
+static void thread_patrol_timer_cb(CFRunLoopTimerRef timer, void *info) {
+    suspend_and_log_threads(0);
+}
+
 static void abort_recovery_trampoline(void) {
+    g_trampoline_count++;
+    abc_log("TRAMPOLINE entry #%d", g_trampoline_count);
+
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+
     if (g_force_unlock_fn) {
         for (unsigned i = 0; i < g_saved_zone_count; i++)
             g_force_unlock_fn(g_saved_zones[i]);
     }
     install_crash_recovery();
+
+    // Suspend all non-safe threads, resume safe ones.
+    suspend_and_log_threads(1);
+
+    // Install patrol timer to catch newly created detection threads.
+    {
+        CFRunLoopTimerContext ctx = {0};
+        CFRunLoopTimerRef patrol = CFRunLoopTimerCreate(
+            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 2.0, 2.0, 0, 0,
+            thread_patrol_timer_cb, &ctx);
+        CFRunLoopAddTimer(CFRunLoopGetMain(), patrol, kCFRunLoopCommonModes);
+        CFRelease(patrol);
+        abc_log("TRAMPOLINE: thread patrol timer installed (2s)");
+    }
+
     install_ui_recovery_timer();
     dispatch_queue_t mq = dispatch_get_main_queue();
     uint64_t *qptr = (uint64_t *)(__bridge void *)mq;
@@ -403,8 +474,7 @@ static void abort_recovery_trampoline(void) {
         }
     }
 
-    // Manually drain dispatch main queue via timer (bypass broken source)
-    if (g_dispatch_drain_fn) {
+    if (g_trampoline_count == 1 && g_dispatch_drain_fn) {
         CFRunLoopTimerContext ctx = {0};
         CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
             kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.016, 0.016, 0, 0,
@@ -412,19 +482,15 @@ static void abort_recovery_trampoline(void) {
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
         CFRelease(timer);
         abc_log("TRAMPOLINE: manual drain timer installed (16ms)");
-    } else {
-        abc_log("TRAMPOLINE: _dispatch_main_queue_callback_4CF not found, dispatch will freeze");
     }
 
-    abc_log("TRAMPOLINE: %u zones unlocked, entering CFRunLoopRun", g_saved_zone_count);
-    CFRunLoopRef rl = CFRunLoopGetMain();
-    CFRunLoopWakeUp(rl);
-    int loop_count = 0;
+    abc_log("TRAMPOLINE: entering CFRunLoopRun (entry #%d)", g_trampoline_count);
+    int hb = 0;
     while (1) {
-        CFRunLoopRun();
-        loop_count++;
-        if (loop_count <= 3)
-            abc_log("TRAMPOLINE: CFRunLoopRun returned (#%d)", loop_count);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+        hb++;
+        if (hb <= 10 || hb % 30 == 0)
+            abc_log("TRAMPOLINE: heartbeat #%d", hb);
     }
 }
 
@@ -471,12 +537,14 @@ static void crash_recovery_handler(int sig, siginfo_t *info, void *uap) {
 
     if (sig == SIGABRT) {
         g_sigabrt_count++;
-        abc_log("SIGABRT #%d: PC=%p FP=%p → trampoline", g_sigabrt_count,
+        abc_log("=== SIGABRT HANDLER #%d: PC=%p FP=%p SP=%p ===", g_sigabrt_count,
                 (void *)uc->uc_mcontext->__ss.__pc,
-                (void *)uc->uc_mcontext->__ss.__fp);
+                (void *)uc->uc_mcontext->__ss.__fp,
+                (void *)uc->uc_mcontext->__ss.__sp);
         // Always use trampoline for SIGABRT. Skipping to existing frames fails
         // because __stack_chk_fail → __abort resets handler to SIG_DFL before raise.
         if (g_main_stack_top) {
+            install_crash_recovery();
             uc->uc_mcontext->__ss.__pc = (uint64_t)abort_recovery_trampoline;
             uc->uc_mcontext->__ss.__sp = g_main_stack_top - 256;
             uc->uc_mcontext->__ss.__fp = 0;
@@ -584,7 +652,9 @@ static void install_ui_recovery_timer(void) {
 
 static void (*orig_exit)(int);
 static void hooked_exit(int code) {
-    abc_log("EXIT blocked: exit(%d) thread=%s", code, pthread_main_np() ? "main" : "bg");
+    g_exit_call_count++;
+    abc_log("EXIT blocked: exit(%d) thread=%s call#%d", code,
+            pthread_main_np() ? "main" : "bg", g_exit_call_count);
     g_exit_blocked = 1;
     install_crash_recovery();
     if (g_force_unlock_fn) {
@@ -594,12 +664,6 @@ static void hooked_exit(int code) {
     }
 
     if (pthread_main_np()) {
-        // Don't return! Returning triggers __stack_chk_fail → SIGSEGV cascade
-        // which corrupts the dispatch queue's internal linked list.
-        // Instead, jump directly to trampoline on a clean stack.
-        // The dispatch queue state stays intact (only the drain lock is held,
-        // which the trampoline clears). The current detection block's continuation
-        // leaks (~64 bytes) but the queue remains functional.
         abc_log("  jumping to trampoline (avoiding cascade)");
 #if defined(__arm64__) || defined(__aarch64__)
         uint64_t tramp = (uint64_t)abort_recovery_trampoline;
@@ -849,7 +913,7 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
 }
 - (void)_terminateWithStatus:(int)status {
     double elapsed = CFAbsoluteTimeGetCurrent() - g_start;
-    if (elapsed < 120.0) {
+    if (elapsed < 30.0) {
         abc_log("_terminateWithStatus:%d blocked (%.1fs after launch, likely detection)", status, elapsed);
         g_exit_blocked = 1;
         install_crash_recovery();
@@ -916,7 +980,7 @@ static const char kABCSuppressedKey;
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-61 / ABC %s ctor started\n",
+        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-66 / ABC %s ctor started\n",
                 appVer ? appVer.UTF8String : "?");
         fclose(f);
     }

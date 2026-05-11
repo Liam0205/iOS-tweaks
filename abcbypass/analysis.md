@@ -517,3 +517,60 @@ _UIApplicationMainPreparations → _loadInitializationContext →
   3. **考虑不调用 `_dispatch_main_queue_callback_4CF`**: 如果 drain timer 触发了二次检测，禁用它可避免 canary 破坏，但 UI 仍冻结
   4. **混合方案**: 栈切换入 trampoline 后，用 `dispatch_async` 从后台线程向 main queue 提交新的 UI recovery block，同时手动 re-arm dispatch source（写入 mach port）
   5. **v33 方案在设备 A 的重新评估**: v33 在设备 B 上工作数分钟，在设备 A 上也值得重试——之前在设备 A 的测试可能因其他因素干扰
+
+### Round 7: 后台线程 syscall exit 发现 + 线程挂起方案（设备 A，v62–v66）
+
+**目标**: 理解 v61 trampoline 中进程静默死亡的原因，找到并阻止杀进程的机制。
+
+**v62: 增加诊断日志 + 信号掩码恢复 → 静默死亡**:
+- 改进: trampoline 增加信号掩码恢复（`sigprocmask` 清零），SIGABRT handler 增加 SP 日志，hooked_exit 增加调用计数
+- 结果: 与 v61 相同——trampoline 正常运行，drain timer 触发，CFRunLoopRun 返回 3 次，然后**进程静默死亡，无 crash report，无 SIGABRT handler 日志**
+- 关键发现: **静默死亡（无 crash report）只可能是直接 `svc #0x80` syscall 调用 `_exit()` 或 `kill(SIGKILL)`**。用户态 signal handler 和 fishhook 均不可拦截
+
+**v63: 挂起所有后台线程 → 进程无限存活（确认后台线程是杀手）**:
+- 策略: exit hook 跳转 trampoline 后，用 Mach API `task_threads()` + `thread_suspend()` 挂起所有非主线程
+- 结果: **进程无限存活**（heartbeat 持续到 48+ 秒，用户手动杀死才停止）
+- 挂起了 29/30 线程
+- UI 完全冻结（动画仍在播放因为 Core Animation 在独立系统进程中运行）
+- **这是决定性实验**: 证实了 v62 的静默死亡是由后台线程通过 `svc #0x80` 直接 syscall 杀死进程
+
+**v64: 选择性线程挂起 → 部分 UI 交互恢复**:
+- 策略: 只挂起未命名线程和 SmAntiFraud 已知线程（`ant_bifrost.anr`、`LagMonitor*`），保留有名的系统线程
+- 线程分类:
+  - 挂起（19/28）: 所有未命名线程 + `ant_bifrost.anr`
+  - 保留（9/28）: `com.apple.uikit.xpc-service`, `APFileLog`, `com.apple.uikit.eventfetch-thread`, `PowerGetThread`, `longLinkThread`, `MASS_Net`, `com.apple.NSURLConnectionLoader`, `com.apple.CFSocket.private`, 1个未命名
+- 结果: **进程存活 55 秒，底部 tab 可以切换！** 这是首次在 exit 拦截后实现用户交互
+- 死因: `0x8BADF00D` watchdog kill——用户将 APP 切到后台，`_terminateWithStatus` hook 拦截了优雅退出，5秒后 FRONTBOARD 发 SIGKILL
+- **关键**: 进程不是被检测杀死的，而是被 iOS 生命周期管理杀死的
+
+**v65: 修复 _terminateWithStatus 阈值 → 静默死亡（新线程逃逸）**:
+- 改进: `_terminateWithStatus` 阈值从 120s 降到 30s（检测在 ~16s 触发，30s 后允许 iOS 生命周期退出）
+- 结果: 进程存活约 25 秒后**静默死亡（无 crash report）**——与 v62 相同的死因
+- 根因: 线程挂起是一次性的。检测代码在被挂起后**创建了新线程**（如 `LagMonitorThread` 在 v64 crash report 中出现但不在初始线程列表中），新线程未被挂起，可以调用 `svc #0x80 _exit()`
+- 底 tab 这次无法切换——可能因为某些需要的 dispatch worker 线程被误挂起
+
+**v66（已编码，未部署）: 持续线程巡逻**:
+- 策略: 改为「挂起所有 → 恢复已知安全线程」模式（反转 v64 的逻辑），并安装 2 秒间隔的 patrol timer 持续扫描和挂起新创建的线程
+- 安全线程白名单: `com.apple.*`, `APFileLog`, `PowerGetThread`, `longLinkThread`, `MASS_Net`
+- 每次 patrol: `task_threads()` 枚举所有线程，挂起不在白名单中的，resume 白名单中的
+- 状态: 代码已完成，待部署测试
+
+**关键发现汇总（v62–v66）**:
+
+1. **后台线程通过 `svc #0x80` 直接 syscall 杀死进程**: v63 的全量挂起 → 无限存活 vs v62 的不挂起 → 静默死亡，决定性证明
+2. **SmAntiFraud 动态创建线程**: 线程挂起必须是持续的（patrol 模式），一次性挂起不够——检测代码会创建新线程绕过
+3. **选择性挂起可恢复部分 UI**: v64 证明只要保留 `eventfetch-thread` 和 `uikit.xpc-service`，底 tab 可以切换。完整 UI 还需要解决 dispatch queue drain 问题
+4. **`0x8BADF00D` watchdog kill 必须处理**: `_terminateWithStatus` 阈值 120s 太长，APP 切后台时被 FRONTBOARD 杀死。改为 30s 后放行
+5. **Mach 线程 API 可用**: `task_threads()` + `thread_suspend()` + `thread_resume()` + `pthread_from_mach_thread_np()` + `pthread_getname_np()` 组合可以精确控制线程生命周期
+
+**推论**:
+- 进程存活问题已解决: 栈切换 + 持续线程挂起 = 无限存活
+- UI 部分可用: tab 切换已实现，完整 UI 需要 dispatch queue recovery
+- 核心矛盾从「进程存活」转向「dispatch queue 恢复」:
+  - 栈切换放弃了正在进行的 dispatch drain
+  - drain lock 可清除但 CFRunLoopSource 未 re-arm
+  - 手动调用 `_dispatch_main_queue_callback_4CF` 返回但不处理 block（queue 内部状态不一致）
+- 下一步方向:
+  1. 部署 v66 验证持续 patrol 是否能保持进程无限存活
+  2. 研究 dispatch main queue 的 CFRunLoopSource re-arm 方法（`_dispatch_get_main_queue_port_4CF` 获取 mach port → `mach_msg` 发送唤醒消息）
+  3. 或者: 不修复 dispatch queue，而是用 `CFRunLoopPerformBlock` / `performSelector:onThread:` / `NSRunLoop` 调度替代 dispatch_async，重新驱动 UI 更新
