@@ -14,11 +14,13 @@
 
 - `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
+- `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——ctor 两阶段加载、MSHookFunction + fishhook 混合策略、ARM64 栈切换退出生存机制、CFRunLoop 重定向绕过损坏的 dispatch queue、巡逻定时器线程管理、与 icbcbypass 的关键差异。
 
 ## reference/
 
 - `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 - `llmdoc/reference/icbc-detection-vectors.md`：工商银行检测框架（SecureUtilityPlus）、冻结机制（持续 freeze 循环及版本间时序差异）、弹窗退出链路、版本适配记录（3.0.80、3.0.90）与覆盖情况。
+- `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、svc #0x80 不可拦截 syscall、内存完整性扫描、多路径退出机制与当前覆盖状态。
 
 ## guides/
 
@@ -34,3 +36,4 @@
 - `llmdoc/memory/reflections/linux-cross-compile-setup.md`：Linux 无 sudo 环境搭建 Theos 交叉编译的完整踩坑记录。
 - `llmdoc/memory/reflections/deploy-via-reverse-tunnel.md`：反向隧道部署踩坑——端口号/用户名缺失导致试错、root vs mobile 约束、SSHTunnel 自举问题。
 - `llmdoc/memory/reflections/sshtunnel-autossh-development.md`：SSHTunnel 1.1.1-1.2.1 开发周期——autossh 集成的两个关键 bug（PATH 不传播、process group 继承杀死子进程）、iOS posix_spawn 约束总结。
+- `llmdoc/memory/reflections/abcbypass-round1-9.md`：ABCBypass v1-v81（9 轮迭代）——MSHookFunction 内存扫描触发、inline SVC 不可拦截、_Noreturn 栈切换、dispatch queue 损坏绕过、巡逻定时器策略演进。

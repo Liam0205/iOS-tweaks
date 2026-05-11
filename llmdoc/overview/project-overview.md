@@ -11,7 +11,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 | `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 | 已发布 |
 | `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 | 已发布 |
 | `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
-| `page.0x01.abcbypass` | 农业银行 | — | — | 开发中 |
+| `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-81) |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
 
@@ -69,6 +69,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `mybankbypass/Tweak.x`：网商银行 Hook 主入口
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
+- `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（9 轮迭代，v1-v81）
 - `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，通过 posix_spawn 启动 autossh/ssh 进程，使用 POSIX_SPAWN_SETPGROUP 隔离子进程组，PID 文件持久化状态）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
