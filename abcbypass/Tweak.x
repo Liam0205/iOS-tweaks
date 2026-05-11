@@ -12,6 +12,8 @@
 #import <dirent.h>
 #import <malloc/malloc.h>
 #import <mach/mach.h>
+#import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
 #import "fishhook.h"
 
 #define ABC_DEBUG_LOG 1
@@ -367,6 +369,23 @@ static uintptr_t g_kernel_base = 0, g_kernel_end = 0;
 static uintptr_t g_main_stack_top = 0;
 static mach_port_t g_main_thread_id = 0;
 
+static int is_system_thread_pc(thread_act_t thread) {
+#if defined(__arm64__) || defined(__aarch64__)
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(thread, ARM_THREAD_STATE64,
+                                         (thread_state_t)&state, &count);
+    if (kr != KERN_SUCCESS) return 0;
+    uintptr_t pc = (uintptr_t)(state.__pc & 0x0000007FFFFFFFFFULL);
+    Dl_info info;
+    if (dladdr((void *)pc, &info) && info.dli_fname) {
+        return (strncmp(info.dli_fname, "/usr/lib/", 9) == 0 ||
+                strncmp(info.dli_fname, "/System/", 8) == 0);
+    }
+#endif
+    return 0;
+}
+
 static void (*g_force_unlock_fn)(malloc_zone_t *) = NULL;
 static malloc_zone_t *g_saved_zones[32];
 static unsigned g_saved_zone_count = 0;
@@ -430,8 +449,47 @@ static void suspend_and_log_threads(int log_detail) {
     mach_port_deallocate(mach_task_self(), main_thread);
 }
 
+static volatile int g_patrol_run = 0;
 static void thread_patrol_timer_cb(CFRunLoopTimerRef timer, void *info) {
-    suspend_and_log_threads(0);
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+    task_threads(mach_task_self(), &threads, &count);
+    mach_port_t self = mach_thread_self();
+    int suspended = 0, skipped_safe = 0, skipped_sys = 0, skipped_already = 0;
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        if (threads[i] == self) {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+            continue;
+        }
+        thread_basic_info_data_t tinfo;
+        mach_msg_type_number_t tcount = THREAD_BASIC_INFO_COUNT;
+        thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&tinfo, &tcount);
+        if (tinfo.suspend_count > 0) {
+            skipped_already++;
+            mach_port_deallocate(mach_task_self(), threads[i]);
+            continue;
+        }
+        char name[64] = {0};
+        pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt) pthread_getname_np(pt, name, sizeof(name));
+        if (is_safe_thread(name)) {
+            skipped_safe++;
+        } else if (is_system_thread_pc(threads[i])) {
+            skipped_sys++;
+        } else {
+            thread_suspend(threads[i]);
+            suspended++;
+            g_patrol_run++;
+            if (g_patrol_run <= 10)
+                abc_log("PATROL: suspended '%s' (non-system PC)", name[0] ? name : "(unnamed)");
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+    mach_port_deallocate(mach_task_self(), self);
+    if (suspended > 0 && g_patrol_run <= 10)
+        abc_log("PATROL: +%d suspended, %d already, %d safe, %d sys-pc (of %d)",
+                suspended, skipped_already, skipped_safe, skipped_sys, count);
 }
 
 static void abort_recovery_trampoline(void) {
@@ -448,40 +506,97 @@ static void abort_recovery_trampoline(void) {
     }
     install_crash_recovery();
 
-    // Suspend all non-safe threads, resume safe ones.
+    // Phase 1: Aggressive suspend — catch ALL unnamed threads (including GCD workers)
     suspend_and_log_threads(1);
 
-    // Install patrol timer to catch newly created detection threads.
+    // Phase 2: Smart resume — resume suspended threads whose PC is in system libraries.
+    // This restores GCD workers, CA render threads etc while keeping SmAntiFraud frozen.
+    {
+        thread_act_array_t threads;
+        mach_msg_type_number_t count;
+        task_threads(mach_task_self(), &threads, &count);
+        mach_port_t self = mach_thread_self();
+        int resumed = 0;
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            if (threads[i] == self) {
+                mach_port_deallocate(mach_task_self(), threads[i]);
+                continue;
+            }
+            thread_basic_info_data_t tinfo;
+            mach_msg_type_number_t tcount = THREAD_BASIC_INFO_COUNT;
+            thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&tinfo, &tcount);
+            if (tinfo.suspend_count > 0 && is_system_thread_pc(threads[i])) {
+                thread_resume(threads[i]);
+                resumed++;
+                if (resumed <= 10) {
+                    char name[64] = {0};
+                    pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+                    if (pt) pthread_getname_np(pt, name, sizeof(name));
+                    abc_log("  RESUMED system thread '%s'", name[0] ? name : "(unnamed)");
+                }
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+        mach_port_deallocate(mach_task_self(), self);
+        abc_log("TRAMPOLINE: smart resume: %d system threads restored", resumed);
+    }
+
+    // Smart patrol: catch new non-system threads, skip already-suspended & system-PC
     {
         CFRunLoopTimerContext ctx = {0};
         CFRunLoopTimerRef patrol = CFRunLoopTimerCreate(
-            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 2.0, 2.0, 0, 0,
+            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.2, 0.2, 0, 0,
             thread_patrol_timer_cb, &ctx);
         CFRunLoopAddTimer(CFRunLoopGetMain(), patrol, kCFRunLoopCommonModes);
         CFRelease(patrol);
-        abc_log("TRAMPOLINE: thread patrol timer installed (2s)");
+        abc_log("TRAMPOLINE: smart patrol timer installed (0.2s)");
     }
 
     install_ui_recovery_timer();
     dispatch_queue_t mq = dispatch_get_main_queue();
     uint64_t *qptr = (uint64_t *)(__bridge void *)mq;
     uint32_t tid = (uint32_t)g_main_thread_id;
+
+    // Dump queue state for diagnostics
+    for (int i = 0; i < 16; i++)
+        abc_log("  mq[%d] (+%d) = 0x%llx", i, i * 8, qptr[i]);
+
+    // Clear drain lock
     for (int i = 0; i < 20; i++) {
         uint64_t val = qptr[i];
         if (tid && ((uint32_t)(val & 0xFFFFFFFC) == (tid & 0xFFFFFFFC))) {
             qptr[i] = val & 0xFFFFFFFF00000000ULL;
-            abc_log("TRAMPOLINE: drain lock at +%d cleared", i * 8);
+            abc_log("TRAMPOLINE: drain lock at +%d cleared (was 0x%llx)", i * 8, val);
         }
     }
 
-    if (g_trampoline_count == 1 && g_dispatch_drain_fn) {
-        CFRunLoopTimerContext ctx = {0};
-        CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
-            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.016, 0.016, 0, 0,
-            manual_drain_timer_cb, &ctx);
-        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
-        CFRelease(timer);
-        abc_log("TRAMPOLINE: manual drain timer installed (16ms)");
+    // Also clear dq_state bits that indicate "draining in progress"
+    // On ARM64 iOS 15, dq_state is typically at offset +0 or +8 of dispatch_queue_s
+    // Try to find and clear DISPATCH_QUEUE_DRAIN_OWNER bits
+    uint64_t state_before = qptr[0];
+    abc_log("  dq_state[0] before: 0x%llx", state_before);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        abc_log("DISPATCH RECOVERED: first post-exit block executed on main queue");
+    });
+
+    // Direct wakeup: bypass internal "is draining?" check
+    typedef mach_port_t (*get_handle_fn)(void);
+    get_handle_fn get_handle = (get_handle_fn)dlsym(RTLD_DEFAULT, "_dispatch_get_main_queue_handle_4CF");
+    if (get_handle) {
+        mach_port_t port = get_handle();
+        abc_log("TRAMPOLINE: dispatch main queue port = 0x%x", port);
+        mach_msg_header_t msg = {0};
+        msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        msg.msgh_size = sizeof(msg);
+        msg.msgh_remote_port = port;
+        msg.msgh_local_port = MACH_PORT_NULL;
+        kern_return_t kr = mach_msg(&msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     sizeof(msg), 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+        abc_log("TRAMPOLINE: mach_msg wakeup sent (kr=%d)", kr);
+    } else {
+        abc_log("TRAMPOLINE: _dispatch_get_main_queue_handle_4CF not found");
     }
 
     abc_log("TRAMPOLINE: entering CFRunLoopRun (entry #%d)", g_trampoline_count);
@@ -655,6 +770,7 @@ static void hooked_exit(int code) {
     g_exit_call_count++;
     abc_log("EXIT blocked: exit(%d) thread=%s call#%d", code,
             pthread_main_np() ? "main" : "bg", g_exit_call_count);
+    if (g_exit_blocked) return;
     g_exit_blocked = 1;
     install_crash_recovery();
     if (g_force_unlock_fn) {
@@ -664,7 +780,7 @@ static void hooked_exit(int code) {
     }
 
     if (pthread_main_np()) {
-        abc_log("  jumping to trampoline (avoiding cascade)");
+        abc_log("  jumping to trampoline (stack switch)");
 #if defined(__arm64__) || defined(__aarch64__)
         uint64_t tramp = (uint64_t)abort_recovery_trampoline;
         uint64_t new_sp = g_main_stack_top - 256;
@@ -678,7 +794,6 @@ static void hooked_exit(int code) {
         );
 #endif
     }
-    // Background thread: just return
 }
 
 static void (*orig__exit)(int);
@@ -689,6 +804,18 @@ static void hooked__exit(int code) {
 static void (*orig_abort)(void);
 static void hooked_abort(void) {
     abc_log("EXIT blocked: abort() — returning");
+}
+
+static int (*orig_pthread_create)(pthread_t *, const pthread_attr_t *,
+                                   void *(*)(void *), void *);
+static int hooked_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                                  void *(*start_routine)(void *), void *arg) {
+    if (g_exit_blocked) {
+        abc_log("pthread_create BLOCKED (post-exit)");
+        if (thread) *thread = pthread_self();
+        return 0;
+    }
+    return orig_pthread_create(thread, attr, start_routine, arg);
 }
 
 static int (*orig_kill)(pid_t, int);
@@ -980,7 +1107,7 @@ static const char kABCSuppressedKey;
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-66 / ABC %s ctor started\n",
+        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-75 / ABC %s ctor started\n",
                 appVer ? appVer.UTF8String : "?");
         fclose(f);
     }
@@ -1088,7 +1215,8 @@ static const char kABCSuppressedKey;
             {"objc_exception_throw", (void *)hooked_objc_exception_throw, (void **)&orig_objc_exception_throw},
             {"posix_spawn", (void *)hooked_posix_spawn, (void **)&orig_posix_spawn},
             {"sigaction", (void *)hooked_sigaction_fn, (void **)&orig_sigaction_fn},
-        }, 10);
+            {"pthread_create", (void *)hooked_pthread_create, (void **)&orig_pthread_create},
+        }, 11);
         abc_log("exit/abort fishhooks armed");
 
         hookIOSSecuritySuite();

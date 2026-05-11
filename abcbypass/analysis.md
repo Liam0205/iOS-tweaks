@@ -574,3 +574,106 @@ _UIApplicationMainPreparations → _loadInitializationContext →
   1. 部署 v66 验证持续 patrol 是否能保持进程无限存活
   2. 研究 dispatch main queue 的 CFRunLoopSource re-arm 方法（`_dispatch_get_main_queue_port_4CF` 获取 mach port → `mach_msg` 发送唤醒消息）
   3. 或者: 不修复 dispatch queue，而是用 `CFRunLoopPerformBlock` / `performSelector:onThread:` / `NSRunLoop` 调度替代 dispatch_async，重新驱动 UI 更新
+
+---
+
+### Round 8: 线程管理精细化 + Dispatch Queue 恢复攻坚（v67–v75）
+
+**测试设备**: Device B (2215→2213, iPhone 13 Pro, iOS 15.4.1)
+
+**v67: patrol timer 0.5s + 全量挂起模式**:
+- 策略: 延续 v66 的 patrol 模式，间隔从 2s 缩短到 0.5s
+- 结果: 进程在 trampoline 中存活约 17 秒后静默死亡（无 crash report = svc #0x80 新线程逃逸）
+- 新线程创建速度超过 0.5s 的 patrol 间隔
+
+**v68: 新增 pthread_create hook + patrol timer 0.5s**:
+- 新增: `hooked_pthread_create` 函数 + fishhook 绑定。`g_exit_blocked` 后阻止所有 PLT 层面的 pthread_create 调用
+- 结果: **进程存活 71+ 秒**（heartbeat #60），但 **UI 逐渐冻结**
+- 0 个 `pthread_create BLOCKED` 日志——检测线程在 pthread_create 之前就被初始挂起冻住了
+- **UI 表现**: 一开始 tab 切换和部分滑动正常工作，逐渐变卡（"有明显的逐渐变卡的过程"），最终完全冻结；顶部搜索框轮播动画始终正常
+- **分析**: patrol timer 每 0.5s 挂起所有 unnamed 线程。GCD worker 线程（libdispatch 按需创建）和 CA 渲染线程都是 unnamed 的。随着系统创建新 worker → 被 patrol 挂起 → 系统再创建 → 再被挂起……逐步耗尽并发处理能力
+
+**v69: 移除 patrol timer，仅保留 pthread_create hook**:
+- 策略: 验证 pthread_create hook 单独是否足以保护进程
+- 结果: **CFRunLoop 完全阻塞**——进入 CFRunLoopRunInMode 后无 heartbeat 输出
+- 原因: drain timer 的 `_dispatch_main_queue_callback_4CF(NULL)` 调用阻塞在 dispatch 内部锁上
+- 进程活着（ps 可见）但 CFRunLoop 被 drain timer 回调卡死
+
+**v70: 移除 patrol timer + 移除 drain timer**:
+- 策略: 去掉所有可能导致阻塞的 timer，只保留 pthread_create hook
+- 结果: heartbeat 恢复正常！但 **进程在 ~18 秒死亡**（同 v67）
+- **关键结论**: pthread_create hook **不足以阻止进程被杀**。SmAntiFraud 的线程创建绕过了 PLT hook（通过共享缓存内部调用或直接 syscall 创建线程）
+- patrol timer 是进程存活的必要条件
+
+**v71: 智能 patrol（PC 判断）+ pthread_create hook**:
+- 新增: `is_system_thread_pc()` 函数——用 `thread_get_state(ARM_THREAD_STATE64)` 读取线程 PC 寄存器，`dladdr()` 判断所在库
+- patrol 改进:
+  - 跳过 suspend_count > 0 的线程（已挂起）
+  - 跳过 named safe 线程
+  - 未挂起的 unnamed 线程: PC 在系统库 → 跳过（系统线程），PC 在非系统库 → 挂起（检测线程）
+- patrol 间隔: 0.2s
+- 结果: 进程存活 80+ 秒，heartbeat 正常。**0 个 PATROL 日志**（smart patrol 没挂起任何新线程）
+- **UI 仍冻结**，但表现不同: "逐渐变卡的过程变得不明显，像是突变"
+- 分析: 不是 patrol 误杀线程导致的。系统线程被保护了，但 dispatch queue 本身的损坏（stack switch 导致）才是 UI 冻结根因
+
+**v72: 不做 stack switch，直接 return**:
+- 策略: 从 hooked_exit 直接 return，不做栈切换，保留 dispatch drain 完整性
+- 结果: return 后触发 `__stack_chk_fail`（exit 是 `_Noreturn`，编译器不生成返回路径有效代码） → 10 次 SIGSEGV 级联 → FP=0x0 → crash recovery 进入 trampoline
+- **结论**: 编译器在 `_Noreturn` 调用后不生成有效代码，直接 return 不可行
+- 用户反馈: "部分操作可响应（底 tab 切换），部分不行（上下滑列表），但部分场景又可以"——首次精确描述了部分 UI 可用/不可用的边界
+
+**v73: stack switch + dispatch_async 恢复尝试**:
+- 策略: 恢复 stack switch。清除 drain lock 后 `dispatch_async(main_queue, ^{})` 一个空 block 尝试 re-arm CFRunLoopSource
+- 结果: 进程存活 70+ 秒，但 `DISPATCH RECOVERED` block **从未执行**
+- 分析: dispatch_async 内部检查 queue 状态，发现"正在 drain"则跳过 source signal（因为正常情况下 drain 循环会处理新 block）。但 drain 已被放弃，无人处理
+
+**v74: Phase 1 全量挂起 + Phase 2 智能恢复**:
+- 新策略:
+  1. Phase 1: 激进挂起所有 unnamed 线程（确保捕获检测线程）
+  2. Phase 2: 立即扫描被挂起线程，恢复 PC 在系统库的（GCD workers、CA 渲染等）
+- 结果: **21 挂起 → 19 恢复**，仅 2 线程保持挂起
+- `DISPATCH RECOVERED` 仍未执行——恢复 GCD workers 并不能修复 dispatch queue 内部状态
+- 进程被 `_terminateWithStatus` 在 41.71s 正常终止（>30s 阈值，用户切后台）
+- **重要发现**: SmAntiFraud 线程在 PC 检查时大多在系统 syscall 中（sleep/nanosleep），被误判为系统线程并恢复。PC 判断对检测线程有假阳性
+- 仅 2 个线程保持挂起，但进程在 41s 内未被 svc #0x80 杀死——要么这 2 个是关键检测线程，要么检测线程被恢复但未来得及执行
+
+**v75: 诊断版 + mach_msg 直接唤醒**:
+- 新增: dump main dispatch queue 结构（16 * 8 bytes）
+- 发现:
+  - `mq[4] (+32) = 0x2a07` — mach port handle
+  - `mq[7] (+56) = 0x1ffe9e00000100` — drain lock（低 32 位 0x100，与 main thread TID 0x103 通过 `& 0xFFFFFFFC` 匹配）
+  - `mq[10] (+80) = 0x6ff00140001` — 可能是 dq_atomic_flags（含 draining 状态位）
+- 尝试: `_dispatch_get_main_queue_handle_4CF` 获取 port → `mach_msg` 发送唤醒
+- 结果: `mach_msg` 返回 `MACH_SEND_TIMED_OUT` (0x10000004)——port 消息队列已满（dispatch_async 已发过唤醒但未被消费）
+- `DISPATCH RECOVERED` 仍未执行
+
+**关键发现汇总（v67–v75）**:
+
+1. **进程存活 vs UI 可用是两个独立问题**:
+   - 存活: patrol timer + pthread_create hook 组合可保证进程不被 svc #0x80 杀死
+   - UI: dispatch queue 在 stack switch 后损坏，是独立于线程管理的问题
+
+2. **Patrol timer 对 UI 的影响**:
+   - 全量 patrol（v68）: UI 渐进冻结——误杀 GCD workers
+   - 智能 patrol（v71）: UI 突然冻结——不误杀，但 dispatch queue 仍损坏
+   - 无 patrol（v70）: 进程在 ~18s 死亡——patrol 是存活必需的
+
+3. **Dispatch queue 损坏的根因**: stack switch 放弃了 dispatch drain 的执行上下文。以下修复尝试均失败:
+   - 清除 drain lock at +56 ✗
+   - dispatch_async 新 block ✗（内部"正在 drain"状态阻止 source signal）
+   - mach_msg 直接唤醒 port ✗（port 已满，且 drain callback 执行后不处理 block）
+   - 直接 return 避免 stack switch ✗（_Noreturn 函数无有效返回代码）
+
+4. **Smart resume 的局限**: PC 判断对 SmAntiFraud 线程有假阳性——检测线程大部分时间在 syscall（系统库 PC），被误判为系统线程。21 挂起 → 19 恢复，几乎全部放行
+
+5. **Main dispatch queue 结构**（iOS 15.4.1, ARM64）:
+   - +32: mach port handle（与 `_dispatch_get_main_queue_handle_4CF` 一致）
+   - +56: drain owner TID（低 32 位，按 `& 0xFFFFFFFC` 对齐）
+   - +80: atomic flags（含 draining 状态位，`0x6ff00140001`）
+
+**推论与下一步方向**:
+- Stack switch 不可避免（return 不可行），dispatch queue 损坏不可避免
+- 需要绕过损坏的 dispatch queue 而非修复它
+- **最有前景的方向**: Hook `dispatch_async`，当 `g_exit_blocked` 且目标为 main queue 时，通过 `CFRunLoopPerformBlock` 重定向到 CFRunLoop 执行。这只能截获 PLT 级别的调用（app 代码），系统库内部调用仍走损坏的 dispatch queue
+- 另一方向: 研究 `mq[10] (+80)` 的 flags 含义，尝试清除 "draining" 状态位使 dispatch 自然恢复
+
