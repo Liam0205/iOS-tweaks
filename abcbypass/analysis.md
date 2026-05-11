@@ -2,9 +2,9 @@
 
 ## 环境信息
 
-### 设备 A（Round 1、Round 5 使用）
+### 设备 A（Round 1、Round 5–9 使用）
 - iPhone 14 Pro Max, iOS 16.3.1, Dopamine (rootless)
-- SSH 端口: 2216
+- SSH 端口: 2214（原 2216）
 - App: 农业银行 v11.1.0 (build 11.1.3)
 - Bundle ID: `com.bankabc.iphonerelease`
 - Executable: `MbapMPaaS`
@@ -12,8 +12,9 @@
 - 安装路径: `/private/var/containers/Bundle/Application/772F8B77-480D-4711-A6F5-AEE1D1CE964A/MbapMPaaS.app`
 - 数据容器: `/var/mobile/Containers/Data/Application/9A9D3109-D1E4-4F57-8EFA-1C265EC41095`
 
-### 设备 B（Round 2–4 使用）
+### 设备 B（Round 2–4、Round 8 使用）
 - iPhone 13 Pro, iOS 15.4.1, Dopamine 1.x (rootless)
+- SSH 端口: 2213（原 2215）
 - App: 农业银行 v11.1.0
 - 安装路径: `/private/var/containers/Bundle/Application/FFE425EC-7B8F-4C7C-8F31-F3B6E9A88767/MbapMPaaS.app`
 - 数据容器: `/private/var/mobile/Containers/Data/Application/D98B4BC7-39A9-426B-98C9-3CD16E622CA8`
@@ -676,4 +677,83 @@ _UIApplicationMainPreparations → _loadInitializationContext →
 - 需要绕过损坏的 dispatch queue 而非修复它
 - **最有前景的方向**: Hook `dispatch_async`，当 `g_exit_blocked` 且目标为 main queue 时，通过 `CFRunLoopPerformBlock` 重定向到 CFRunLoop 执行。这只能截获 PLT 级别的调用（app 代码），系统库内部调用仍走损坏的 dispatch queue
 - 另一方向: 研究 `mq[10] (+80)` 的 flags 含义，尝试清除 "draining" 状态位使 dispatch 自然恢复
+
+### Round 9: MSHookFunction 与 SDK 内存扫描冲突 + dispatch_async 重定向（设备 A，v76–v81）
+
+**测试设备**: Device A (2214, iPhone 14 Pro Max, iOS 16.3.1)
+
+**目标**: 实现 Round 8 确定的最有前景方向——MSHookFunction inline hook `dispatch_async` 重定向到 CFRunLoop + MSHookFunction `pthread_create` 替代 patrol timer。
+
+**v76: ARC bridging error + CFRunLoop 阻塞**:
+- 新增: `hooked_dispatch_async` 和 `hooked_dispatch_async_f`，MSHookFunction inline hook
+- Bug 1: `Block_copy(block)` 在 ARC 下报错 `cast of block pointer type 'dispatch_block_t' to C pointer type 'const void *' requires a bridged cast`
+- 修复: 移除 Block_copy/Block_release，ARC 自动管理 block 的 copy
+- Bug 2: v75 的 mach_msg 诊断代码仍在 trampoline 中，导致主线程阻塞
+- 结果: "卡住了，动画效果也卡住了"——连 Core Animation 都不动了
+
+**v77: 移除 mach_msg 诊断 → fishhook 只捕获 5 次 redirect**:
+- 修改: 移除 trampoline 中所有 mach_msg 和 queue dump 诊断代码
+- 结果: 仍然卡死
+- 关键日志: `dispatch_async REDIRECT #1~#5 to CFRunLoop`，之后无新 redirect
+- **分析**: fishhook 只 hook PLT/GOT 调用。APP 内部通过 GOT 调用 dispatch_async 的只有 5 次。系统库（UIKit、CF 等）的 dispatch_async 调用走共享缓存内部直接分支，不经过 GOT。5 次 redirect 不足以恢复 UI
+
+**v78: 改用 MSHookFunction inline hook dispatch_async**:
+- 策略: 从 fishhook 改为 MSHookFunction（修改函数入口字节的 inline hook），可捕获所有调用者（包括共享缓存内部调用）
+- 结果: hook 成功安装（日志确认 `MSHookFunction armed`），但仍卡死
+- 分析: MSHookFunction 安装成功但 redirect 效果与 v77 类似——v78 可能有其他问题
+
+**v79: MSHookFunction dispatch + pthread_create（线程名过滤）**:
+- 新增: MSHookFunction hook `pthread_create`，post-exit 后阻止所有新线程创建
+- 结果: **部分 UI 恢复！** "没有完全卡死，可以切换底 tab，部分可以上下滑。但多数无法点击。"
+- 后续: "完全卡死了，有一个明显的渐进的过程" → 最终被 watchdog 重启
+- 分析: pthread_create 全量阻止过于激进——阻止了 GCD worker 线程和 CA 渲染线程的创建，导致并发能力逐渐耗尽
+
+**v80（构建失败 → 修复后 4/4 闪退）: pthread_create dladdr 过滤 + 无 patrol**:
+- 改进: `hooked_pthread_create` 使用 `dladdr(start_routine)` 判断线程所属库——允许系统库线程（GCD workers、CA 等），阻止 APP/SDK 线程（SmAntiFraud）
+- 构建问题: forward declaration 的 counter 变量与后续 `static volatile int` 定义冲突，修复为只保留 forward decl
+- **测试结果: 4 次启动均在 ~6.7 秒闪退（SIGSEGV）**
+- crash report:
+  - Thread 4 `com.apple.uikit.xpc-service` 崩溃
+  - `memmem` 读取无效地址 `0x1ddd73040`（共享缓存中 32MB 未映射区域）
+  - 调用栈: `memmem → app code (offset ~76M) × 4 → _dispatch_call_block_and_release`
+  - ellekit exception handler 线程循环 5 次
+
+**关键二分实验: 定位 MSHookFunction 崩溃源**:
+
+| 测试 | MSHookFunction 目标 | pthread_create | 结果 |
+|------|---------------------|----------------|------|
+| bisect-1 | 全部禁用 | fishhook | **存活** — exit 在 15.74s 拦截，trampoline heartbeat 正常 |
+| bisect-2 | dispatch_async + dispatch_async_f | fishhook | **存活** — 560+ redirect，heartbeat 正常 |
+| (推断) | pthread_create | — | **闪退** |
+
+**结论: MSHookFunction 对 `pthread_create` 导致 SDK 内存完整性扫描崩溃**
+
+- SDK 的 `com.apple.uikit.xpc-service` 线程使用 `memmem` 扫描内存区域检测代码篡改
+- MSHookFunction 修改 `pthread_create`（libpthread）的函数入口字节 → SDK 扫描到修改后的字节 → 跟踪跳转到 hook island → 扫描附近内存 → 命中未映射区域 → SIGSEGV
+- MSHookFunction 对 `dispatch_async`（libdispatch）不触发此问题——可能是 SDK 只扫描特定系统库
+
+**v81（当前版本）: MSHookFunction dispatch + fishhook pthread + patrol timer**:
+- 最终策略:
+  1. `dispatch_async` / `dispatch_async_f` → **MSHookFunction**（inline hook，捕获所有调用者，560+ redirect）
+  2. `pthread_create` → **fishhook**（仅 PLT/GOT，避免触发 SDK 扫描崩溃）
+  3. **patrol timer 0.3s** → 持续扫描并挂起新检测线程（弥补 fishhook 无法捕获内部调用的不足）
+- bisect 测试确认: MSHookFunction dispatch_async 不导致崩溃，560 次 redirect 工作正常
+- 状态: 已构建部署，待用户测试 UI 表现
+
+**关键发现汇总（v76–v81）**:
+
+1. **MSHookFunction 对 libpthread 不安全**: SDK 的内存完整性扫描检测到 `pthread_create` 入口被修改，扫描过程中命中未映射区域导致 SIGSEGV。100% 复现
+2. **MSHookFunction 对 libdispatch 安全**: `dispatch_async` 的 inline hook 不触发 SDK 扫描崩溃。可能是 SDK 只扫描特定关键库（libpthread、libsystem_kernel 等）
+3. **MSHookFunction vs fishhook 效果对比**:
+   - `dispatch_async` fishhook: 5 次 redirect（仅 PLT/GOT 调用）
+   - `dispatch_async` MSHookFunction: 560+ 次 redirect（所有调用者包括共享缓存内部）
+   - 效果提升 100 倍以上
+4. **fishhook 的 pthread_create 无法捕获 post-exit 线程创建**: bisect 测试中 `pt_block=0, pt_allow=0`——检测线程在 exit 前已创建，或使用内部直接调用绕过 PLT
+5. **Patrol timer 仍然是线程管理的必要组件**: fishhook pthread_create 不足以阻止 svc #0x80 杀进程线程，patrol timer 负责持续挂起新出现的检测线程
+
+**推论**:
+- dispatch 重定向问题已解决: MSHookFunction 捕获 560+ 次 dispatch_async，全部重定向到 CFRunLoopPerformBlock
+- 线程管理采用双层方案: fishhook pthread_create（安全但不完整）+ patrol timer 0.3s（补充扫描挂起）
+- 待验证: v81 的 UI 表现——MSHookFunction dispatch redirect + patrol timer 组合能否实现稳定交互
+- 已知风险: patrol timer 可能误挂 GCD workers（v68 问题）。v81 的 `suspend_and_log_threads` 使用 `is_system_thread_pc()` 判断，对检测线程有假阳性（Round 8 发现）。可能需要进一步优化 patrol 逻辑
 

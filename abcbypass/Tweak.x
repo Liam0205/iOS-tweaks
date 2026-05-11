@@ -350,6 +350,11 @@ static void hooked_objc_exception_throw(id exception) {
     // Swallow: do NOT call orig — this prevents std::terminate → abort
 }
 
+// ========== Forward declarations for counters used in trampoline heartbeat ==========
+static volatile int g_dispatch_redirect_count;
+static volatile int g_pthread_blocked;
+static volatile int g_pthread_allowed;
+
 // ========== Crash recovery ==========
 
 #include <sys/ucontext.h>
@@ -451,45 +456,7 @@ static void suspend_and_log_threads(int log_detail) {
 
 static volatile int g_patrol_run = 0;
 static void thread_patrol_timer_cb(CFRunLoopTimerRef timer, void *info) {
-    thread_act_array_t threads;
-    mach_msg_type_number_t count;
-    task_threads(mach_task_self(), &threads, &count);
-    mach_port_t self = mach_thread_self();
-    int suspended = 0, skipped_safe = 0, skipped_sys = 0, skipped_already = 0;
-    for (mach_msg_type_number_t i = 0; i < count; i++) {
-        if (threads[i] == self) {
-            mach_port_deallocate(mach_task_self(), threads[i]);
-            continue;
-        }
-        thread_basic_info_data_t tinfo;
-        mach_msg_type_number_t tcount = THREAD_BASIC_INFO_COUNT;
-        thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&tinfo, &tcount);
-        if (tinfo.suspend_count > 0) {
-            skipped_already++;
-            mach_port_deallocate(mach_task_self(), threads[i]);
-            continue;
-        }
-        char name[64] = {0};
-        pthread_t pt = pthread_from_mach_thread_np(threads[i]);
-        if (pt) pthread_getname_np(pt, name, sizeof(name));
-        if (is_safe_thread(name)) {
-            skipped_safe++;
-        } else if (is_system_thread_pc(threads[i])) {
-            skipped_sys++;
-        } else {
-            thread_suspend(threads[i]);
-            suspended++;
-            g_patrol_run++;
-            if (g_patrol_run <= 10)
-                abc_log("PATROL: suspended '%s' (non-system PC)", name[0] ? name : "(unnamed)");
-        }
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
-    mach_port_deallocate(mach_task_self(), self);
-    if (suspended > 0 && g_patrol_run <= 10)
-        abc_log("PATROL: +%d suspended, %d already, %d safe, %d sys-pc (of %d)",
-                suspended, skipped_already, skipped_safe, skipped_sys, count);
+    suspend_and_log_threads(0);
 }
 
 static void abort_recovery_trampoline(void) {
@@ -506,98 +473,21 @@ static void abort_recovery_trampoline(void) {
     }
     install_crash_recovery();
 
-    // Phase 1: Aggressive suspend — catch ALL unnamed threads (including GCD workers)
     suspend_and_log_threads(1);
 
-    // Phase 2: Smart resume — resume suspended threads whose PC is in system libraries.
-    // This restores GCD workers, CA render threads etc while keeping SmAntiFraud frozen.
-    {
-        thread_act_array_t threads;
-        mach_msg_type_number_t count;
-        task_threads(mach_task_self(), &threads, &count);
-        mach_port_t self = mach_thread_self();
-        int resumed = 0;
-        for (mach_msg_type_number_t i = 0; i < count; i++) {
-            if (threads[i] == self) {
-                mach_port_deallocate(mach_task_self(), threads[i]);
-                continue;
-            }
-            thread_basic_info_data_t tinfo;
-            mach_msg_type_number_t tcount = THREAD_BASIC_INFO_COUNT;
-            thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&tinfo, &tcount);
-            if (tinfo.suspend_count > 0 && is_system_thread_pc(threads[i])) {
-                thread_resume(threads[i]);
-                resumed++;
-                if (resumed <= 10) {
-                    char name[64] = {0};
-                    pthread_t pt = pthread_from_mach_thread_np(threads[i]);
-                    if (pt) pthread_getname_np(pt, name, sizeof(name));
-                    abc_log("  RESUMED system thread '%s'", name[0] ? name : "(unnamed)");
-                }
-            }
-            mach_port_deallocate(mach_task_self(), threads[i]);
-        }
-        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
-        mach_port_deallocate(mach_task_self(), self);
-        abc_log("TRAMPOLINE: smart resume: %d system threads restored", resumed);
-    }
-
-    // Smart patrol: catch new non-system threads, skip already-suspended & system-PC
+    // Patrol timer: catch new detection threads spawned via direct pthread_create calls
+    // (fishhook only catches PLT/GOT; SDK may use internal branches)
     {
         CFRunLoopTimerContext ctx = {0};
         CFRunLoopTimerRef patrol = CFRunLoopTimerCreate(
-            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.2, 0.2, 0, 0,
+            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.3, 0.3, 0, 0,
             thread_patrol_timer_cb, &ctx);
         CFRunLoopAddTimer(CFRunLoopGetMain(), patrol, kCFRunLoopCommonModes);
         CFRelease(patrol);
-        abc_log("TRAMPOLINE: smart patrol timer installed (0.2s)");
+        abc_log("TRAMPOLINE: patrol timer installed (0.3s)");
     }
 
     install_ui_recovery_timer();
-    dispatch_queue_t mq = dispatch_get_main_queue();
-    uint64_t *qptr = (uint64_t *)(__bridge void *)mq;
-    uint32_t tid = (uint32_t)g_main_thread_id;
-
-    // Dump queue state for diagnostics
-    for (int i = 0; i < 16; i++)
-        abc_log("  mq[%d] (+%d) = 0x%llx", i, i * 8, qptr[i]);
-
-    // Clear drain lock
-    for (int i = 0; i < 20; i++) {
-        uint64_t val = qptr[i];
-        if (tid && ((uint32_t)(val & 0xFFFFFFFC) == (tid & 0xFFFFFFFC))) {
-            qptr[i] = val & 0xFFFFFFFF00000000ULL;
-            abc_log("TRAMPOLINE: drain lock at +%d cleared (was 0x%llx)", i * 8, val);
-        }
-    }
-
-    // Also clear dq_state bits that indicate "draining in progress"
-    // On ARM64 iOS 15, dq_state is typically at offset +0 or +8 of dispatch_queue_s
-    // Try to find and clear DISPATCH_QUEUE_DRAIN_OWNER bits
-    uint64_t state_before = qptr[0];
-    abc_log("  dq_state[0] before: 0x%llx", state_before);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        abc_log("DISPATCH RECOVERED: first post-exit block executed on main queue");
-    });
-
-    // Direct wakeup: bypass internal "is draining?" check
-    typedef mach_port_t (*get_handle_fn)(void);
-    get_handle_fn get_handle = (get_handle_fn)dlsym(RTLD_DEFAULT, "_dispatch_get_main_queue_handle_4CF");
-    if (get_handle) {
-        mach_port_t port = get_handle();
-        abc_log("TRAMPOLINE: dispatch main queue port = 0x%x", port);
-        mach_msg_header_t msg = {0};
-        msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-        msg.msgh_size = sizeof(msg);
-        msg.msgh_remote_port = port;
-        msg.msgh_local_port = MACH_PORT_NULL;
-        kern_return_t kr = mach_msg(&msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-                                     sizeof(msg), 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
-        abc_log("TRAMPOLINE: mach_msg wakeup sent (kr=%d)", kr);
-    } else {
-        abc_log("TRAMPOLINE: _dispatch_get_main_queue_handle_4CF not found");
-    }
 
     abc_log("TRAMPOLINE: entering CFRunLoopRun (entry #%d)", g_trampoline_count);
     int hb = 0;
@@ -605,7 +495,8 @@ static void abort_recovery_trampoline(void) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
         hb++;
         if (hb <= 10 || hb % 30 == 0)
-            abc_log("TRAMPOLINE: heartbeat #%d", hb);
+            abc_log("TRAMPOLINE: heartbeat #%d (redir=%d, pt_block=%d, pt_allow=%d)",
+                    hb, g_dispatch_redirect_count, g_pthread_blocked, g_pthread_allowed);
     }
 }
 
@@ -808,14 +699,60 @@ static void hooked_abort(void) {
 
 static int (*orig_pthread_create)(pthread_t *, const pthread_attr_t *,
                                    void *(*)(void *), void *);
+// counters declared above (forward decl for trampoline heartbeat)
 static int hooked_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                                   void *(*start_routine)(void *), void *arg) {
     if (g_exit_blocked) {
-        abc_log("pthread_create BLOCKED (post-exit)");
+        Dl_info info = {0};
+        int is_system = 0;
+        if (dladdr((void *)start_routine, &info) && info.dli_fname) {
+            is_system = (strncmp(info.dli_fname, "/usr/lib/", 9) == 0 ||
+                         strncmp(info.dli_fname, "/System/", 8) == 0);
+        }
+        if (is_system) {
+            g_pthread_allowed++;
+            if (g_pthread_allowed <= 5)
+                abc_log("pthread_create ALLOWED (system: %s)", info.dli_fname ?: "?");
+            return orig_pthread_create(thread, attr, start_routine, arg);
+        }
+        g_pthread_blocked++;
+        if (g_pthread_blocked <= 5)
+            abc_log("pthread_create BLOCKED (app: %s fn=%p)", info.dli_fname ?: "?", start_routine);
         if (thread) *thread = pthread_self();
         return 0;
     }
     return orig_pthread_create(thread, attr, start_routine, arg);
+}
+
+// g_dispatch_redirect_count declared above (forward decl for trampoline heartbeat)
+static void (*orig_dispatch_async)(dispatch_queue_t, dispatch_block_t);
+static void hooked_dispatch_async(dispatch_queue_t queue, dispatch_block_t block) {
+    if (g_exit_blocked && queue == dispatch_get_main_queue()) {
+        g_dispatch_redirect_count++;
+        if (g_dispatch_redirect_count <= 5)
+            abc_log("dispatch_async REDIRECT #%d to CFRunLoop", g_dispatch_redirect_count);
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, block);
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+        return;
+    }
+    orig_dispatch_async(queue, block);
+}
+
+static void (*orig_dispatch_async_f)(dispatch_queue_t, void *, void (*)(void *));
+static void hooked_dispatch_async_f(dispatch_queue_t queue, void *context, void (*work)(void *)) {
+    if (g_exit_blocked && queue == dispatch_get_main_queue()) {
+        g_dispatch_redirect_count++;
+        if (g_dispatch_redirect_count <= 5)
+            abc_log("dispatch_async_f REDIRECT #%d to CFRunLoop", g_dispatch_redirect_count);
+        void *ctx_copy = context;
+        void (*work_copy)(void *) = work;
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+            work_copy(ctx_copy);
+        });
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+        return;
+    }
+    orig_dispatch_async_f(queue, context, work);
 }
 
 static int (*orig_kill)(pid_t, int);
@@ -1107,7 +1044,7 @@ static const char kABCSuppressedKey;
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-75 / ABC %s ctor started\n",
+        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-81 / ABC %s ctor started\n",
                 appVer ? appVer.UTF8String : "?");
         fclose(f);
     }
@@ -1218,6 +1155,12 @@ static const char kABCSuppressedKey;
             {"pthread_create", (void *)hooked_pthread_create, (void **)&orig_pthread_create},
         }, 11);
         abc_log("exit/abort fishhooks armed");
+
+        // dispatch_async: MSHookFunction (inline hook catches internal shared-cache calls)
+        // pthread_create: fishhook only (MSHookFunction triggers SDK memory integrity scanner crash)
+        MSHookFunction((void *)dispatch_async, (void *)hooked_dispatch_async, (void **)&orig_dispatch_async);
+        MSHookFunction((void *)dispatch_async_f, (void *)hooked_dispatch_async_f, (void **)&orig_dispatch_async_f);
+        abc_log("MSHookFunction armed: dispatch_async, dispatch_async_f; pthread_create via fishhook");
 
         hookIOSSecuritySuite();
         hookABCJailbreakMethods();
