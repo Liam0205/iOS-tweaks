@@ -352,6 +352,9 @@ static void hooked_objc_exception_throw(id exception) {
 
 // ========== Forward declarations for counters used in trampoline heartbeat ==========
 static volatile int g_dispatch_redirect_count;
+static volatile int g_dispatch_sync_inline;
+static volatile int g_dispatch_sync_dropped;
+static volatile int g_dispatch_async_dropped;
 static volatile int g_pthread_blocked;
 static volatile int g_pthread_allowed;
 
@@ -495,8 +498,8 @@ static void abort_recovery_trampoline(void) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
         hb++;
         if (hb <= 10 || hb % 30 == 0)
-            abc_log("TRAMPOLINE: heartbeat #%d (redir=%d, pt_block=%d, pt_allow=%d)",
-                    hb, g_dispatch_redirect_count, g_pthread_blocked, g_pthread_allowed);
+            abc_log("TRAMPOLINE: heartbeat #%d (redir=%d, async_drop=%d, sync_inline=%d, sync_drop=%d, pt_block=%d)",
+                    hb, g_dispatch_redirect_count, g_dispatch_async_dropped, g_dispatch_sync_inline, g_dispatch_sync_dropped, g_pthread_blocked);
     }
 }
 
@@ -725,9 +728,15 @@ static int hooked_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 }
 
 // g_dispatch_redirect_count declared above (forward decl for trampoline heartbeat)
+static int block_invoke_in_shared_cache(dispatch_block_t block);
+
 static void (*orig_dispatch_async)(dispatch_queue_t, dispatch_block_t);
 static void hooked_dispatch_async(dispatch_queue_t queue, dispatch_block_t block) {
     if (g_exit_blocked && queue == dispatch_get_main_queue()) {
+        if (!block_invoke_in_shared_cache(block)) {
+            g_dispatch_async_dropped++;
+            return;
+        }
         g_dispatch_redirect_count++;
         if (g_dispatch_redirect_count <= 5)
             abc_log("dispatch_async REDIRECT #%d to CFRunLoop", g_dispatch_redirect_count);
@@ -741,6 +750,11 @@ static void hooked_dispatch_async(dispatch_queue_t queue, dispatch_block_t block
 static void (*orig_dispatch_async_f)(dispatch_queue_t, void *, void (*)(void *));
 static void hooked_dispatch_async_f(dispatch_queue_t queue, void *context, void (*work)(void *)) {
     if (g_exit_blocked && queue == dispatch_get_main_queue()) {
+        uintptr_t fn = PAC_STRIP((uintptr_t)work);
+        if (fn < 0x180000000ULL) {
+            g_dispatch_async_dropped++;
+            return;
+        }
         g_dispatch_redirect_count++;
         if (g_dispatch_redirect_count <= 5)
             abc_log("dispatch_async_f REDIRECT #%d to CFRunLoop", g_dispatch_redirect_count);
@@ -753,6 +767,43 @@ static void hooked_dispatch_async_f(dispatch_queue_t queue, void *context, void 
         return;
     }
     orig_dispatch_async_f(queue, context, work);
+}
+
+static volatile int g_dispatch_sync_inline = 0;
+static volatile int g_dispatch_sync_dropped = 0;
+
+static int block_invoke_in_shared_cache(dispatch_block_t block) {
+    uintptr_t fn = PAC_STRIP(*(uintptr_t *)((uint8_t *)(__bridge void *)block + 16));
+    return fn >= 0x180000000ULL;
+}
+
+static void (*orig_dispatch_sync)(dispatch_queue_t, dispatch_block_t);
+static void hooked_dispatch_sync(dispatch_queue_t queue, dispatch_block_t block) {
+    if (g_exit_blocked && pthread_main_np() && queue != dispatch_get_main_queue()) {
+        if (block_invoke_in_shared_cache(block)) {
+            g_dispatch_sync_inline++;
+            block();
+        } else {
+            g_dispatch_sync_dropped++;
+        }
+        return;
+    }
+    orig_dispatch_sync(queue, block);
+}
+
+static void (*orig_dispatch_sync_f)(dispatch_queue_t, void *, void (*)(void *));
+static void hooked_dispatch_sync_f(dispatch_queue_t queue, void *context, void (*work)(void *)) {
+    if (g_exit_blocked && pthread_main_np() && queue != dispatch_get_main_queue()) {
+        uintptr_t fn = PAC_STRIP((uintptr_t)work);
+        if (fn >= 0x180000000ULL) {
+            g_dispatch_sync_inline++;
+            work(context);
+        } else {
+            g_dispatch_sync_dropped++;
+        }
+        return;
+    }
+    orig_dispatch_sync_f(queue, context, work);
 }
 
 static int (*orig_kill)(pid_t, int);
@@ -1044,7 +1095,7 @@ static const char kABCSuppressedKey;
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-81 / ABC %s ctor started\n",
+        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-85 / ABC %s ctor started\n",
                 appVer ? appVer.UTF8String : "?");
         fclose(f);
     }
@@ -1160,7 +1211,9 @@ static const char kABCSuppressedKey;
         // pthread_create: fishhook only (MSHookFunction triggers SDK memory integrity scanner crash)
         MSHookFunction((void *)dispatch_async, (void *)hooked_dispatch_async, (void **)&orig_dispatch_async);
         MSHookFunction((void *)dispatch_async_f, (void *)hooked_dispatch_async_f, (void **)&orig_dispatch_async_f);
-        abc_log("MSHookFunction armed: dispatch_async, dispatch_async_f; pthread_create via fishhook");
+        MSHookFunction((void *)dispatch_sync, (void *)hooked_dispatch_sync, (void **)&orig_dispatch_sync);
+        MSHookFunction((void *)dispatch_sync_f, (void *)hooked_dispatch_sync_f, (void **)&orig_dispatch_sync_f);
+        abc_log("MSHookFunction armed: dispatch_async/sync, dispatch_async_f/sync_f; pthread_create via fishhook");
 
         hookIOSSecuritySuite();
         hookABCJailbreakMethods();

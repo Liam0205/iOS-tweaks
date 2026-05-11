@@ -757,3 +757,76 @@ _UIApplicationMainPreparations → _loadInitializationContext →
 - 待验证: v81 的 UI 表现——MSHookFunction dispatch redirect + patrol timer 组合能否实现稳定交互
 - 已知风险: patrol timer 可能误挂 GCD workers（v68 问题）。v81 的 `suspend_and_log_threads` 使用 `is_system_thread_pc()` 判断，对检测线程有假阳性（Round 8 发现）。可能需要进一步优化 patrol 逻辑
 
+---
+
+## Round 10: 主线程死锁与 svc exit 对策（v82–v85）
+
+**测试环境**: Device A (iPhone 14 Pro Max, iOS 16.3.1, Dopamine 2.x), 端口 2216
+
+### 问题发现
+
+v81 部署后，APP 启动 ~10 秒后 UI 冻结（heartbeat 停在 #10，26.53s）。进程最终被 watchdog 杀死。
+
+**根因分析: CFRunLoopRunInMode 死锁**
+
+1. trampoline 挂起 19 个线程（防止 svc exit），保留 8 个系统线程
+2. dispatch_async 重定向到 CFRunLoopPerformBlock（保持 UI 响应）
+3. 其中某个 block 内部调用 `dispatch_sync(someBackgroundQueue, ...)`
+4. 该 queue 的 worker 线程已被挂起 → 永远等不到 → RunLoop 死锁
+5. 日志特征: heartbeat 计数停止，无崩溃日志
+
+### v82: hook dispatch_sync 内联执行
+
+**策略**: hook `dispatch_sync`/`dispatch_sync_f`（MSHookFunction），当主线程处于 exit-blocked 状态且目标不是 main queue 时，直接在主线程内联执行 block。
+
+**结果**: heartbeat 持续 2.68s（比 v81 的 9.88s 更短），66 次 sync inline。进程无崩溃日志直接退出。
+
+**分析**: dispatch_sync 内联执行解决了死锁，但同时执行了 SDK 的 svc #0x80 exit 代码。SDK 将 exit 调用包装在 dispatch_sync block 中投递到 background queue，内联执行等于在主线程运行了杀进程代码。
+
+### v83: shared cache 地址过滤 dispatch_sync
+
+**策略**: 区分系统框架 block 和 SDK block。Block 的 invoke 函数指针在 shared cache（≥0x180000000）则内联执行，否则丢弃。
+
+**结果**: heartbeat 持续 6.9s。sync_inline=16（系统 block），sync_drop=8（SDK block 丢弃）。进程仍死亡。
+
+**分析**: 进步明显，sync_drop=8 说明拦截了 8 个 SDK sync block。但杀手不是 dispatch_sync——redir 计数在死亡前已停止增长，说明进程被 CFRunLoop timer 回调或其他非 dispatch 机制杀死。
+
+### v84: 扩展过滤到 dispatch_async
+
+**策略**: 同样的 shared cache 地址过滤应用到 dispatch_async/dispatch_async_f 重定向。SDK async block 直接丢弃。
+
+**结果**: heartbeat 持续 8.34s。redir=350（vs v83 的 644），async_drop=4，sync_drop=8。进程仍死亡，无崩溃日志。
+
+**分析**: async_drop=4 说明拦截了 4 个 SDK async block。redir 减少到 350。但进程仍在 ~25s 后死亡。redir 在 heartbeat #9 和 #10 之间没有变化——杀手不是 dispatch block，而是 **CFRunLoop 定时器回调**。SDK 在 exit 之前（启动阶段 16s 内）注册了定时器到主 RunLoop，该定时器在 ~25s 触发，执行 svc #0x80。
+
+### v85: svc 二进制补丁（失败）
+
+**策略**: 扫描 APP/SDK 的 `__TEXT,__text` 段，找到 `mov x16, #1; svc #0x80`（exit syscall）模式，用 NOP 替换。使用 `vm_protect(VM_PROT_COPY)` 修改代码页。
+
+**结果**: 找到并补丁了 1 条指令。但 APP 启动后立即闪退（0.82s）。
+
+**分析**: 两种可能原因:
+1. SDK 有代码完整性校验（tamper detection），检测到自身指令被修改后触发保护机制
+2. rootless 越狱（Dopamine）的代码签名验证仍对主二进制有效，修改 __TEXT 页触发 CS 验证失败
+
+**结论**: 二进制补丁方案在当前环境不可行。已回退。
+
+### 当前稳定代码: v85（回退 svc patch，保留 dispatch 过滤）
+
+保留的改进:
+- dispatch_sync/sync_f: hook + shared cache 过滤（inline 系统 block，drop SDK block）
+- dispatch_async/async_f: shared cache 过滤（redirect 系统 block，drop SDK block）
+- heartbeat 日志包含 redir / async_drop / sync_inline / sync_drop 计数
+
+### 待解决: CFRunLoop 定时器退出炸弹
+
+已确认杀手是 SDK 在启动阶段注册的 CFRunLoop 定时器/NSTimer，在 ~25s 后触发 svc #0x80。
+
+**候选方案**:
+1. **hook CFRunLoopAddTimer**: 记录所有添加到主 RunLoop 的定时器，trampoline 时 invalidate 所有 pre-exit 定时器
+2. **hook NSTimer scheduledTimer...**: 拦截并阻止 SDK 的 NSTimer 创建
+3. **独立 patrol 线程 + watchdog**: 将 patrol 从 CFRunLoop timer 移到独立线程，增加 watchdog 检测主线程死亡并恢复
+4. **自定义 RunLoop mode**: 只运行我们注册的 timer/source，不执行 SDK 的
+
+**推荐**: 方案 1（hook CFRunLoopAddTimer），最精准且对 UIKit 影响最小
+
