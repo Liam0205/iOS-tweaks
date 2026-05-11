@@ -116,8 +116,9 @@ def main():
     work = Path(tempfile.mkdtemp())
     try:
         os.chdir(repo_root)
-        run(["git", "fetch", "origin", "gh-pages:gh-pages"],
-            stderr=subprocess.DEVNULL, check=False)
+        run(["git", "fetch", "origin", "gh-pages"], stderr=subprocess.DEVNULL, check=False)
+        run(["git", "branch", "-D", "gh-pages"], stderr=subprocess.DEVNULL, check=False)
+        run(["git", "branch", "gh-pages", "origin/gh-pages"])
         run(["git", "worktree", "add", str(work / "gh-pages"), "gh-pages"])
 
         dev_dir = work / "gh-pages" / "dev"
