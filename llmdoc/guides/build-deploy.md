@@ -7,7 +7,7 @@
 - macOS 开发机
 - Theos 安装在 `~/theos`
 - 目标设备为 rootless 越狱环境
-- 当前已验证设备：iPhone 14 Pro Max / iOS 16.3.1 / Dopamine / Sileo
+- 当前已验证设备：iPhone 14 Pro Max / iOS 16.3.1 / Dopamine 2.x；iPhone 13 Pro / iOS 15.4.1 / Dopamine 1.x
 
 ## 相关文件
 
@@ -101,7 +101,7 @@ sshtunnel 是 Theos Application（`APPLICATION_NAME`），不是 tweak。构建�
 - Makefile 中已内置 Linux 交叉编译的 `LD_LIBRARY_PATH` 和 `LDFLAGS`，无需额外传递
 - 安装到 `/Applications`（不是 tweak 目录），安装后需 `uicache` 刷新图标
 - 不通过 Sileo 源分发，仅本地开发使用
-- 依赖设备已有 `openssh-client`
+- 依赖设备已有 `openssh-client`、`sshpass`；推荐安装 `autossh`（持久化隧道）
 
 ```bash
 cd sshtunnel
@@ -116,7 +116,17 @@ uicache -p /Applications/SSHTunnel.app
 
 ### 反向隧道开发工作流
 
-当手机在内网、构建服务器在公网时，通过 SSHTunnel 建立反向隧道后，服务器可通过 `localhost:2222` SSH 回手机。
+当手机在内网、构建服务器在公网时，通过 SSHTunnel 建立反向隧道后，服务器可通过 localhost SSH 回手机。
+
+**端口约定**：`22xx`，其中 `xx` 为 iOS 主版本号。
+- iOS 15 设备：`localhost:2215`
+- iOS 16 设备：`localhost:2216`
+
+**多设备支持**：当前环境有两台设备可用，通过端口区分：
+- iPhone 14 Pro Max / iOS 16.3.1 → 端口 2216
+- iPhone 13 Pro / iOS 15.4.1 → 端口 2215
+
+**隧道持久化**：SSHTunnel v1.2.1 使用 autossh 维持隧道持久连接，App 退出后隧道进程继续存活（通过 PID 文件管理）。下次打开 App 时自动探活，已有活跃连接则直接显示状态。设备未安装 autossh 时降级为普通 ssh（App 退出即断开）。
 
 **连接约束**：rootless 越狱（Dopamine）环境下，SSH 用户必须使用 `mobile`，不要用 `root`（root 的 SSH 认证配置不同，会导致 `Too many authentication failures`）。
 
@@ -127,10 +137,10 @@ uicache -p /Applications/SSHTunnel.app
 3. 隧道建立后，传输并安装 deb：
 
 ```bash
-# 传输 deb 到设备
-scp -P 2222 packages/<name>.deb mobile@localhost:/tmp/
+# 传输 deb 到设备（端口按设备选择 2215 或 2216）
+scp -P 22xx packages/<name>.deb mobile@localhost:/tmp/
 # 远程安装
-ssh -p 2222 mobile@localhost "sudo dpkg -i /tmp/<name>.deb"
+ssh -p 22xx mobile@localhost "sudo dpkg -i /tmp/<name>.deb"
 ```
 
 4. 验证部署结果：

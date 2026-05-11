@@ -33,3 +33,4 @@
 - `llmdoc/memory/reflections/anti-detection-deep-analysis.md`：MSHookFunction 风险决策、inline SVC 对抗哲学、fishhook 被禁极端场景分析、发版配置教训。
 - `llmdoc/memory/reflections/linux-cross-compile-setup.md`：Linux 无 sudo 环境搭建 Theos 交叉编译的完整踩坑记录。
 - `llmdoc/memory/reflections/deploy-via-reverse-tunnel.md`：反向隧道部署踩坑——端口号/用户名缺失导致试错、root vs mobile 约束、SSHTunnel 自举问题。
+- `llmdoc/memory/reflections/sshtunnel-autossh-development.md`：SSHTunnel 1.1.1-1.2.1 开发周期——autossh 集成的两个关键 bug（PATH 不传播、process group 继承杀死子进程）、iOS posix_spawn 约束总结。

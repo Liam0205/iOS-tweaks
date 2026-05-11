@@ -6,11 +6,12 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 
 ## 包含的 Tweaks
 
-| 包名 | 目标 App | Bundle ID | 支持版本 |
-|------|----------|-----------|----------|
-| `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 |
-| `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 |
-| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 |
+| 包名 | 目标 App | Bundle ID | 支持版本 | 状态 |
+|------|----------|-----------|----------|------|
+| `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 | 已发布 |
+| `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 | 已发布 |
+| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
+| `page.0x01.abcbypass` | 农业银行 | — | — | 开发中 |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
 
@@ -18,17 +19,15 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 
 | 包名 | 类型 | 用途 |
 |------|------|------|
-| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器，从设备建立到构建服务器的反向隧道，用于远程调试和部署 |
+| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.2.1），基于 autossh 实现持久化隧道，ssh 作为 fallback |
 
-sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。依赖设备已安装 `openssh-client`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
+sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.2.1 使用 autossh 维护持久隧道（PID 文件状态管理、启动时探活），设备未安装 autossh 时自动降级为普通 ssh。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
 ## 目标环境
 
-- 测试设备：iPhone 14 Pro Max
-- 系统版本：iOS `16.3.1`
-- 越狱环境：Dopamine（rootless）
+- 测试设备 1：iPhone 14 Pro Max / iOS `16.3.1` / Dopamine 2.x（rootless）
+- 测试设备 2：iPhone 13 Pro / iOS `15.4.1` / Dopamine 1.x（rootless，用于 ABCBypass 开发）
 - 包管理器：Sileo
-- 设备 SSH：`root@192.168.1.253`
 - 构建体系：Theos（`~/theos`），`rootless` 打包方案，`arm64`
 
 ## 当前状态
@@ -70,7 +69,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `mybankbypass/Tweak.x`：网商银行 Hook 主入口
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
-- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，通过 posix_spawn 启动 ssh 进程）
+- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，通过 posix_spawn 启动 autossh/ssh 进程，使用 POSIX_SPAWN_SETPGROUP 隔离子进程组，PID 文件持久化状态）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
 - `.github/workflows/release.yml`：发版与 Pages 部署 workflow
