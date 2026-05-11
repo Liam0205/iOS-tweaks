@@ -3,6 +3,7 @@
 ## 1.2.1
 
 - 修复 autossh 在 rootless 越狱上找不到 ssh 的问题（设置 AUTOSSH_PATH 指向 /var/jb/usr/bin/ssh）
+- 修复杀掉 APP 后隧道一并断开的问题（POSIX_SPAWN_SETPGROUP 让 autossh 在独立进程组运行）
 
 ## 1.2.0
 

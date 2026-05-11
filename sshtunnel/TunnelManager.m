@@ -251,6 +251,8 @@ static NSString *findBinary(NSString *name) {
     extern char **environ;
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
 
     pid_t pid = 0;
     int ret = posix_spawn(&pid, binary.UTF8String, &actions, &attr, argv, environ);
