@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.2
+
+- 孤儿隧道检测：用 sysctl(KERN_PROCARGS2) 替代 /bin/sh + ps|grep，修复 rootless 越狱上 /bin/sh 不存在的问题
+- 连接验证：用进程存活检查替代 TCP 探测（iOS 沙盒阻止 APP 出站 TCP；ExitOnForwardFailure=yes 保证绑定失败时 ssh 立刻退出，进程存活 5s 即确认隧道建立）
+- 健康检查：简化为仅检测进程存活，依赖 SSH 自身的 ServerAliveInterval/ServerAliveCountMax 检测死连接
+- 探测已有隧道：直接接管，不再做 TCP 验证
+- 移除死代码 tcpConnectTestWithTimeout
+- 移除 grep 运行时依赖
+
 ## 1.3.1
 
 - 修复孤儿隧道检测：设备上无 pgrep，改用 ps + grep 管道查找残留 SSH 进程

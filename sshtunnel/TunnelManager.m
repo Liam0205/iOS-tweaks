@@ -239,58 +239,6 @@ static NSString *findBinary(NSString *name) {
     usleep(200000);
 }
 
-#pragma mark - TCP Health Check
-
-- (BOOL)tcpConnectTestWithTimeout:(NSTimeInterval)timeout {
-    if (!_serverHost.length) return NO;
-
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    NSString *portStr = [NSString stringWithFormat:@"%ld", (long)_serverPort];
-    int err = getaddrinfo(_serverHost.UTF8String, portStr.UTF8String, &hints, &res);
-    if (err != 0 || !res) return NO;
-
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) {
-        freeaddrinfo(res);
-        return NO;
-    }
-
-    // Set non-blocking
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    int ret = connect(sock, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
-    BOOL success = NO;
-    if (ret == 0) {
-        success = YES;
-    } else if (errno == EINPROGRESS) {
-        fd_set writefds;
-        FD_ZERO(&writefds);
-        FD_SET(sock, &writefds);
-
-        struct timeval tv;
-        tv.tv_sec = (long)timeout;
-        tv.tv_usec = (long)((timeout - (long)timeout) * 1000000);
-
-        int sel = select(sock + 1, NULL, &writefds, NULL, &tv);
-        if (sel > 0) {
-            int optval = 0;
-            socklen_t optlen = sizeof(optval);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &optval, &optlen);
-            success = (optval == 0);
-        }
-    }
-
-    close(sock);
-    return success;
-}
-
 #pragma mark - Health Check Timer
 
 - (void)startHealthCheck {
