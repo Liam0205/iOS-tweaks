@@ -25,7 +25,7 @@ static void registerScreenshotCommand(void) {
             path = args[0];
             useDefaultDir = NO;
         } else {
-            NSString *name = [NSString stringWithFormat:@"screen_%lld.png", (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+            NSString *name = [NSString stringWithFormat:@"screen_%lld.jpg", (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
             path = [DEFAULT_SCREENSHOT_DIR stringByAppendingPathComponent:name];
             useDefaultDir = YES;
         }

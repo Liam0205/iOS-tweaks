@@ -1,54 +1,59 @@
 #import "ScreenCapture.h"
 #import <UIKit/UIKit.h>
 #import <IOSurface/IOSurfaceRef.h>
-#import <CoreImage/CoreImage.h>
 #import <sys/stat.h>
 
 #define LOG(fmt, ...) NSLog(@"[SimTouch] " fmt, ##__VA_ARGS__)
 
-extern void CARenderServerRenderDisplay(kern_return_t
-, CFStringRef, IOSurfaceRef, int, int);
+extern UIImage *_UICreateScreenUIImage(void) __attribute__((weak_import));
 
 @implementation STScreenCapture
 
 + (NSString *)captureToPath:(NSString *)path {
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    CGFloat scale = [UIScreen mainScreen].scale;
-    int width = (int)(screenSize.width * scale);
-    int height = (int)(screenSize.height * scale);
+    UIImage *image = nil;
 
-    NSDictionary *props = @{
-        (__bridge NSString *)kIOSurfaceWidth: @(width),
-        (__bridge NSString *)kIOSurfaceHeight: @(height),
-        (__bridge NSString *)kIOSurfaceBytesPerRow: @(width * 4),
-        (__bridge NSString *)kIOSurfaceBytesPerElement: @(4),
-        (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241), // BGRA
-    };
+    if (_UICreateScreenUIImage) {
+        image = _UICreateScreenUIImage();
+    }
 
-    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    if (!surface) return @"ERR IOSurfaceCreate failed";
+    if (!image) {
+        UIScreen *screen = [UIScreen mainScreen];
+        UIGraphicsBeginImageContextWithOptions(screen.bounds.size, YES, screen.scale);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+#pragma clang diagnostic pop
+            [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
+        }
+        image = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+    }
 
-    IOSurfaceLock(surface, 0, NULL);
-    CARenderServerRenderDisplay(0, CFSTR("LCD"), surface, 0, 0);
-    IOSurfaceUnlock(surface, 0, NULL);
+    if (!image) return @"ERR capture failed";
 
-    CIImage *ciImage = [CIImage imageWithIOSurface:surface];
-    CFRelease(surface);
+    int width = (int)(image.size.width * image.scale);
+    int height = (int)(image.size.height * image.scale);
 
-    if (!ciImage) return @"ERR CIImage creation failed";
-
-    CIContext *ctx = [CIContext context];
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    NSData *pngData = [ctx PNGRepresentationOfImage:ciImage format:kCIFormatBGRA8 colorSpace:cs options:@{}];
-    CGColorSpaceRelease(cs);
-
-    if (!pngData || pngData.length == 0) return @"ERR PNG encoding failed";
+    NSData *imgData;
+    BOOL usePNG = [[path.pathExtension lowercaseString] isEqualToString:@"png"];
+    if (usePNG) {
+        imgData = UIImagePNGRepresentation(image);
+    } else {
+        // _UICreateScreenUIImage may return CIImage-backed UIImage without CGImage;
+        // UIImageJPEGRepresentation needs CGImage, so redraw into bitmap context first
+        UIGraphicsBeginImageContextWithOptions(image.size, YES, image.scale);
+        [image drawAtPoint:CGPointZero];
+        UIImage *bitmapImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        imgData = UIImageJPEGRepresentation(bitmapImage, 0.8);
+    }
+    if (!imgData || imgData.length == 0) return @"ERR image encoding failed";
 
     NSString *dir = [path stringByDeletingLastPathComponent];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
 
     NSError *writeErr = nil;
-    if (![pngData writeToFile:path options:NSDataWritingAtomic error:&writeErr]) {
+    if (![imgData writeToFile:path options:NSDataWritingAtomic error:&writeErr]) {
         return [NSString stringWithFormat:@"ERR write failed: %@", writeErr.localizedDescription];
     }
 

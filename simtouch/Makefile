@@ -9,7 +9,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = SimTouch
 SimTouch_FILES = Tweak.x SocketServer.m ScreenCapture.m
 SimTouch_CFLAGS = -fobjc-arc
-SimTouch_FRAMEWORKS = Foundation UIKit IOSurface CoreGraphics CoreImage
+SimTouch_FRAMEWORKS = Foundation UIKit
 SimTouch_LIBRARIES = substrate
 ifeq ($(shell uname),Linux)
 SimTouch_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
