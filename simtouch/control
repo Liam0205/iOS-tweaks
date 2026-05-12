@@ -1,0 +1,9 @@
+Package: page.0x01.simtouch
+Name: SimTouch
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: Remote touch simulation and screenshot capture for jailbroken iOS
+Maintainer: 0x01
+Author: 0x01
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
