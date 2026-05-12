@@ -7,21 +7,31 @@
 ## 架构
 
 ```
-[Linux 构建机]                          [iOS 设备 SpringBoard 进程]
-     |                                        |
-  simtouch CLI ──── Unix Socket ────► SimTouch.dylib (tweak)
-  (ssh -p 22xx)    /var/jb/tmp/              |
-                   simtouch.sock        ├── TouchInjector (IOHIDEvent)
-                                        ├── ScreenCapture (IOSurface)
-                                        └── SocketServer (dispatch_source)
+[Linux 构建机]
+     |
+  simtouch CLI ── Unix Socket ──► SpringBoard (SimTouch.dylib)
+  (ssh -p 22xx)  /var/jb/tmp/         │
+                 simtouch.sock    ├── SocketServer (命令分发)
+                                  ├── ScreenCapture (截图)
+                                  ├── TouchInjector (IPC 中继)
+                                  │      │
+                                  │      │ 文件写入 /var/jb/tmp/simtouch-cmd
+                                  │      │ + Darwin notification
+                                  │      ▼
+                                  │   backboardd (SimTouch.dylib)
+                                  │      ├── _BKHandleIOHIDEventFromSender hook
+                                  │      ├── 事件捕获 + 克隆注入
+                                  │      └── 录制/回放引擎
+                                  └── Tweak.x (ctor + 命令注册)
 ```
 
-两个构建产物：
+构建产物：
 
-| 产物 | 类型 | 安装路径 | 注入目标 |
-|------|------|----------|----------|
-| `SimTouch.dylib` | Theos Tweak | `/var/jb/Library/MobileSubstrate/DynamicLibraries/` | `com.apple.springboard` |
-| `simtouch` | C CLI 工具 | `/var/jb/usr/local/bin/` | N/A（独立进程） |
+| 产物 | 类型 | 注入目标 |
+|------|------|----------|
+| `SimTouch.dylib` | Theos Tweak | SpringBoard + backboardd |
+| `simtouch` | C CLI 工具 | N/A（独立进程） |
+| `SimTouchPrefs.bundle` | PreferenceBundle | Settings.app |
 
 ## 模块设计
 
@@ -43,75 +53,138 @@
 
 ```
 # 命令格式
-tap <x> <y>                        # 点按（屏幕坐标，像素）
+tap <x> <y>                        # 点按（屏幕像素坐标）
 swipe <x1> <y1> <x2> <y2> [ms]    # 滑动（默认 300ms）
-longpress <x> <y> [ms]            # 长按 / HapticTouch（默认 500ms）
+longpress <x> <y> [ms]            # 长按（默认 500ms）
 screenshot [path]                   # 截图（默认 /var/jb/tmp/simtouch/screen_<ts>.jpg）
-keyinput <text>                     # 文本输入（未来）
-info                                # 返回屏幕尺寸、scale、senderID 状态
+info                                # 屏幕尺寸、scale、backboardd 连接状态
+bbstatus                            # ping backboardd 并返回 hook 状态
+diag                                # 列出可用的 IOHIDEvent API 和 UIKit 内部类
+record <start|stop|dump>            # 录制/停止/导出 backboardd 侧触摸事件
+replay                              # 回放上次录制的事件序列
 enable                              # 运行时启用（CLI 直接写偏好 + Darwin 通知）
 disable                             # 运行时禁用（CLI 直接写偏好 + Darwin 通知）
 
 # 响应格式
-OK                                  # tap/swipe/longpress/enable/disable 成功
-OK /var/jb/tmp/simtouch/screen.jpg 1170x2532  # screenshot 成功
-OK 390x844 @3x senderID=ready      # info 响应
-ERR no senderID                     # senderID 未捕获
+OK                                  # 成功
+OK 390x844 @3x conn=connected hook=captured  # info 响应
+OK stopped, 42 events, 1234ms       # record stop 响应
+OK replaying 42 events over 1234ms  # replay 响应
+ERR no senderID                     # backboardd 未捕获事件
 ERR invalid command                 # 解析失败
 ```
 
-### 2. TouchInjector（触摸注入层）
+### 2. BackboardHook（触摸注入核心）
 
-**职责**：构造并注入 IOHIDEvent 触摸事件。
+**职责**：在 backboardd 进程中 hook HID 事件管道，捕获真实触摸事件并注入合成事件。
 
-**核心 API**（IOKit 私有，需自行声明头文件）：
+**Hook 目标**：`_BKHandleIOHIDEventFromSender(IOHIDEventRef event, void *sender, void *, void *)`
+- backboardd 的 HID 事件入口函数，所有触摸/按键事件经此进入 iOS 事件系统
+- 通过 `MSHookFunction` 安装 hook
 
-```c
-// 系统客户端（tweak 生命周期内持有）
-IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef);
-void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef, IOHIDEventRef);
+**事件捕获**：
+- 首次收到 digitizer 类型（type=11）事件时，捕获 `sender` 指针和 `senderID`
+- 首次收到有 touch 属性的事件时，通过 `IOHIDEventCreateCopy` 克隆并保存为模板
+- 后续注入都基于此模板克隆，确保保留 BKS 内部属性
 
-// 事件构造
-IOHIDEventRef IOHIDEventCreateDigitizerEvent(allocator, timestamp,
-    transducerType, index, identity, eventMask, buttonMask,
-    x, y, z, tipPressure, barrelPressure, range, touch, options);
-IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(allocator, timestamp,
-    index, identity, eventMask,
-    x, y, z, tipPressure, barrelPressure, range, touch, options);
-void IOHIDEventAppendEvent(parent, child);
-void IOHIDEventSetSenderID(event, senderID);
+**注入流程**：
+```
+SpringBoard 写 STTouchCmd 到 /var/jb/tmp/simtouch-cmd
+    → Darwin notification (BB_CMD_NOTIFY)
+        → backboardd onTouchCommand 回调
+            → 读取 cmd 文件
+            → dispatchTouch(phase, x, y)
+                → IOHIDEventCreateCopy（克隆捕获的模板）
+                → 修改坐标、phase、mask、timestamp
+                → orig_HandleFromSender（注入到原始管道）
 ```
 
-**senderID 捕获**：
-- 注册 `IOHIDEventSystemClientRegisterEventCallback` 回调
-- 监听真实触摸事件（type == kIOHIDEventTypeDigitizer）
-- 提取 senderID 并持久化到 `/var/jb/var/mobile/.simtouch/senderid`
-- **设备重启后需用户触摸屏幕一次**以重新捕获
-
-**触摸序列**：
-
-```
-tap(x, y):
-  1. finger down event (range=1, touch=1, identity=2)
-  2. 50ms delay
-  3. finger up event (range=0, touch=0, identity=2)
-
-longpress(x, y, duration):    # HapticTouch
-  1. finger down event (range=1, touch=1, identity=2)
-  2. hold for duration ms（默认 500ms，iOS HapticTouch 阈值约 350-500ms）
-  3. finger up event (range=0, touch=0, identity=2)
-
-swipe(x1, y1, x2, y2, duration):
-  1. finger down at (x1, y1)
-  2. N 个 finger move 事件（线性插值，~16ms 间隔 ≈ 60fps）
-  3. finger up at (x2, y2)
-```
+**关键发现**：从零创建 IOHIDEvent 不起作用——事件缺少 BKS 内部属性（senderID 之外的隐式状态）。必须克隆真实事件再修改字段。
 
 **坐标系**：
 - IOHIDEvent 使用归一化坐标 [0.0, 1.0]
-- CLI 传入屏幕像素坐标
-- 转换：`normalized_x = pixel_x / screen_width_pixels`
-- 需要获取 `[UIScreen mainScreen].bounds.size` 和 `scale` 来计算
+- CLI/socket 传入屏幕像素坐标
+- TouchInjector 转换：`normalized = pixel / screen_pixels`
+- iPhone 13 Pro：1170x2532 px，390x844 pt，@3x
+
+### 3. TouchInjector（IPC 中继层）
+
+**职责**：接收 SpringBoard 侧的触摸命令，通过文件 + Darwin notification 转发给 backboardd。
+
+**IPC 协议**：
+```c
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t phase;  // kSTPhaseDown=0, kSTPhaseMove=1, kSTPhaseUp=2
+    float x;        // 归一化 X [0,1]
+    float y;        // 归一化 Y [0,1]
+} STTouchCmd;
+#pragma pack(pop)
+```
+
+**特殊 phase 值**（复用同一 IPC 通道）：
+- `0xF0` = 开始录制
+- `0xF1` = 停止录制
+- `0xF2` = 回放
+
+**触摸序列**：
+```
+tap(x, y):
+  1. phase=Down at (x, y)
+  2. 80ms delay
+  3. phase=Up at (x, y)
+
+longpress(x, y, ms):
+  1. phase=Down at (x, y)
+  2. hold for ms（默认 500ms）
+  3. phase=Up at (x, y)
+
+swipe(x1, y1, x2, y2, ms):
+  1. phase=Down at (x1, y1)
+  2. N 个 phase=Move 事件（线性插值，~16ms 间隔）
+  3. phase=Up at (x2, y2)
+```
+
+### 4. 录制/回放引擎
+
+**录制**（在 backboardd 的 hook 中内联执行）：
+- 拦截所有 digitizer type=11 事件，记录到 `/tmp/simtouch-record.bin`
+- 录制时不录制注入的合成事件（`_injecting` 标志）
+- 时间戳用 `mach_absolute_time()` 相对值，精度到毫秒
+
+**录制格式**：
+```c
+#define ST_MAX_CHILDREN 5
+typedef struct {
+    uint32_t time_ms;
+    uint32_t phase;
+    float x, y;
+    uint32_t event_mask;    // 边缘手势标志位
+    int32_t touch, range;
+    float pressure;
+    uint8_t child_count;
+    struct {
+        float x, y, pressure;
+        int32_t touch, range;
+        uint32_t phase;
+    } children[ST_MAX_CHILDREN];
+} STRecordEntry;  // 153 bytes packed
+```
+
+**边缘手势 mask 位**（从真实事件录制中发现）：
+- `0x40000`（bit 18）= 通用边缘手势标志
+- `0x1000000`（bit 24）= 底部边缘（Home 手势）
+- `0x2000000`（bit 25）= 顶部边缘（通知中心）
+
+**回放**（两种实现，均未成功产生可见效果）：
+- v23：后台线程 + `usleep` 定时
+- v24：主线程 `dispatch_after` 定时
+- 待调查原因（基本 tap 有效，但回放录制的完整事件序列无效）
+
+**文件路径约束**：
+- 录制文件必须写到 `/tmp/`（→ `/private/var/tmp/`），不能写到 `/var/jb/tmp/`
+- 原因：backboardd 沙箱禁止写入 preboot 分区（`/var/jb/` → `/private/preboot/.../procursus/`）
+- 命令文件 `/var/jb/tmp/simtouch-cmd` 可读不可写（由 SpringBoard 写入）
 
 ### 3. ScreenCapture（截图层）
 
@@ -227,9 +300,10 @@ simtouch/
 ├── control                # Debian 包元数据
 ├── SimTouch.plist          # 注入 SpringBoard 的过滤器
 ├── icon.svg               # 设置图标源文件（紫色触摸涟漪）
-├── Tweak.x                # SpringBoard tweak 入口（ctor + 开关监听 + 命令注册）
-├── TouchInjector.h        # 触摸注入接口（Phase 2）
-├── TouchInjector.m        # IOHIDEvent 触摸注入实现（Phase 2）
+├── Tweak.x                # SpringBoard tweak 入口（ctor + 命令注册 + 录制/回放命令）
+├── BackboardHook.x        # backboardd hook（_BKHandleIOHIDEventFromSender + 录制/回放引擎）
+├── TouchInjector.h        # 触摸 IPC 中继接口
+├── TouchInjector.m        # Darwin notification + 文件 IPC 到 backboardd
 ├── ScreenCapture.h        # 截图接口
 ├── ScreenCapture.m        # _UICreateScreenUIImage 截图 + JPEG/PNG + 自动清理
 ├── SocketServer.h         # socket server 接口
@@ -256,13 +330,18 @@ simtouch/
 ## Theos 构建配置
 
 ```makefile
-# Tweak（注入 SpringBoard）
+# Tweak（注入 SpringBoard + backboardd）
 TWEAK_NAME = SimTouch
-SimTouch_FILES = Tweak.x ScreenCapture.m SocketServer.m  # Phase 2 加 TouchInjector.m
-SimTouch_FRAMEWORKS = Foundation UIKit
-SimTouch_LIBRARIES = substrate  # ellekit 要求链接 CydiaSubstrate
+SimTouch_FILES = Tweak.x BackboardHook.x SocketServer.m ScreenCapture.m TouchInjector.m
+SimTouch_FRAMEWORKS = Foundation UIKit IOKit
+SimTouch_LIBRARIES = substrate
 SimTouch_CFLAGS = -fobjc-arc
-ARCHS = arm64 arm64e            # iPhone 13 Pro A15 SpringBoard 需要 arm64e
+ARCHS = arm64 arm64e
+
+# 注入过滤器（SimTouch.plist）
+{ Filter = { Executables = ( "SpringBoard", "backboardd" ); }; }
+
+INSTALL_TARGET_PROCESSES = SpringBoard backboardd
 
 # CLI 工具
 TOOL_NAME = simtouch
@@ -280,23 +359,23 @@ SimTouchPrefs_RESOURCE_DIRS = simtouchprefs/Resources
 SimTouchPrefs_CFLAGS = -fobjc-arc
 ```
 
-## senderID 生命周期
+## backboardd 事件捕获生命周期
 
 ```
 设备开机
     ↓
-SpringBoard 启动 → SimTouch.dylib 加载
+backboardd 启动 → SimTouch.dylib 加载
     ↓
-检查 /var/jb/var/mobile/.simtouch/senderid
-    ├── 存在且有效 → senderID ready
-    └── 不存在 → 注册 IOHIDEvent 回调等待真实触摸
-                     ↓
-              用户触摸屏幕（任意触摸）
-                     ↓
-              回调捕获 senderID → 持久化 → ready
+hook _BKHandleIOHIDEventFromSender
+    ↓
+等待首个 digitizer 事件（type=11）
+    ├── 捕获 sender 指针 → CFRetain → 发 diag "sender.captured"
+    └── 捕获有 touch 属性的事件 → IOHIDEventCreateCopy → 保存为模板
+    ↓
+后续注入：clone 模板 → 修改字段 → 调用 orig_HandleFromSender
 ```
 
-**注意**：senderID 在设备重启后失效（硬件随机化），需重新捕获。正常使用中用户总会先触摸屏幕再通过 SSH 发命令，所以这不是实际问题。
+**注意**：捕获需要用户先触摸一次屏幕。backboardd 重启后需重新捕获。
 
 ## 分阶段实现
 
@@ -304,37 +383,41 @@ SpringBoard 启动 → SimTouch.dylib 加载
 - SocketServer + ScreenCapture + CLI + PreferenceBundle
 - 支持 `screenshot`、`info`、`enable`、`disable` 命令
 - `_UICreateScreenUIImage` 截图，JPEG 默认（0.8 quality）
-- PreferenceBundle 设置面板（开关 + 清理参数）
-- CLI enable/disable 通过 CoreFoundation 绕过 socket
 - 已在 iPhone 13 Pro / iOS 15.4.1 上验证
 
-### Phase 2：触摸注入
-- TouchInjector + senderID 捕获
-- 支持 `tap`、`swipe`、`longpress`（HapticTouch）命令
-- 完成通用自动化能力
+### Phase 2：触摸注入 🔧 开发中（v0.0.1-24）
+- BackboardHook + TouchInjector + 录制/回放
+- `_BKHandleIOHIDEventFromSender` hook + 事件克隆注入
+- **已验证**：tap、swipe、longpress 在主屏幕和 App 内生效
+- **已验证**：录制基础设施——录制真实触摸事件到二进制文件
+- **已发现**：边缘手势 mask 位（`0x1040000` = Home，`0x2040000` = 通知中心）
+- **待解决**：回放机制（事件派发但无可见效果）
+- **待实现**：边缘手势（Home、通知中心、控制中心、任务切换器）
 
-### Phase 3：增强
-- `keyinput` 文本输入（GSEvent 或 WebClip 注入）
+### Phase 3：增强（规划）
+- `keyinput` 文本输入
 - 多点触控（pinch/zoom）
-- 录制/回放宏
+- 边缘手势 mask 应用到 dispatchTouch
 
 ## 兼容性
 
 | 组件 | iOS 15.4.1 | iOS 16.3.1 | 备注 |
 |------|------------|------------|------|
 | IOHIDEventSystemClient | ✅ | ✅ | 私有 API，一直存在 |
-| IOHIDEventCreateDigitizerFingerEvent | ✅ | ✅ | 同上 |
-| _UICreateScreenUIImage | ✅ 已验证 | ✅ | UIKit 私有 |
+| IOHIDEventCreateCopy | ✅ 已验证 | ✅ | backboardd 中克隆事件 |
+| _BKHandleIOHIDEventFromSender | ✅ 已验证 | ✅ | backboardd HID 入口 |
+| MSHookFunction | ✅ 已验证 | ✅ | backboardd hook |
 | Unix domain socket | ✅ 已验证 | ✅ | POSIX 标准 |
 | SpringBoard 注入 | ✅ 已验证 | ✅ | ellekit/substrate |
-| PreferenceBundle | ✅ 已验证 | ✅ | PreferenceLoader |
+| backboardd 注入 | ✅ 已验证 | ✅ | ellekit/substrate |
 
 ## 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| senderID API 签名变化 | 触摸注入失效 | 回退到旧版 iolate/SimulateTouch 的 Mach port 方式 |
-| _UICreateScreenUIImage 移除 | 截图失败 | weak_import + 运行时检查，回退到 drawViewHierarchyInRect |
-| SpringBoard crash | 设备 respring | socket server 不阻塞主线程；IOHIDEvent 操作在 @try 内 |
-| Socket 权限问题 | CLI 连不上 | chmod 0666 + 路径 /var/jb/tmp/（已验证） |
+| 事件克隆模板过时 | 注入失效 | 捕获的是 touch-down 事件，结构稳定；如失效可重新触摸捕获 |
+| backboardd 沙箱 | 文件 I/O 受限 | 录制文件写 `/tmp/`（可写），命令文件由 SpringBoard 写到 `/var/jb/tmp/`（backboardd 可读） |
+| _UICreateScreenUIImage 移除 | 截图失败 | weak_import + 运行时检查 |
+| SpringBoard/backboardd crash | respring | hook 内 @try 保护；`_injecting` 标志防递归 |
 | arm64e 架构遗漏 | tweak 不加载 | Makefile 固定 `ARCHS = arm64 arm64e` |
+| 回放事件无效 | 自动化受限 | 基本 tap/swipe/longpress 仍可用；回放待调查 |

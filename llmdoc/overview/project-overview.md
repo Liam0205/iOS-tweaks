@@ -20,13 +20,14 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 | 包名 | 类型 | 用途 |
 |------|------|------|
 | `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.3.2），自愈隧道：进程存活健康检查 + 指数退避自动重连 + 开机持久化 |
+| `page.0x01.simtouch` | Theos Tweak + CLI Tool + PreferenceBundle | 远程触摸模拟与截图捕获（Phase 2 触摸注入开发中，v0.0.1-24） |
 
 sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.3.2 核心能力：(1) autossh 持久隧道（PID 文件状态管理），设备未安装 autossh 时降级为 ssh；(2) 进程存活健康检查（依赖 SSH ServerAliveInterval 检测死连接）；(3) 指数退避自动重连（3-60s）；(4) LaunchDaemon 开机持久化（PathState 激活）。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
 ## 目标环境
 
 - 测试设备 1：iPhone 14 Pro Max / iOS `16.3.1` / Dopamine 2.x（rootless）
-- 测试设备 2：iPhone 13 Pro / iOS `15.4.1` / Dopamine 1.x（rootless，用于 ABCBypass 开发）
+- 测试设备 2：iPhone 13 Pro / iOS `15.4.1` / Dopamine 1.x（rootless，用于 ABCBypass 与 SimTouch 开发）
 - 包管理器：Sileo
 - 构建体系：Theos（`~/theos`），`rootless` 打包方案，`arm64`
 
@@ -36,6 +37,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
 - icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
 - abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
+- simtouch 当前版本：Phase 2 开发中 `v0.0.1-24`，backboardd hook 触摸注入已验证（tap/swipe/longpress），事件录制已完成，回放待调试；截图 MVP 正常
 
 ## 软件源与 CI/CD 架构
 
@@ -72,6 +74,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
 - `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（12 轮迭代，v1-v95）
 - `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + 进程存活健康检查 + sysctl 孤儿检测 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
+- `simtouch/`：远程触摸模拟与截图捕获工具（`Tweak.x` 注入 SpringBoard、`BackboardHook.x` 注入 backboardd hook 触摸事件管道、`SocketServer.m` AF_UNIX IPC、`ScreenCapture.m` 截图管道、`TouchInjector.m` IPC 中继、`tools/simtouch.c` CLI、`simtouchprefs/` 设置面板；详见 `llmdoc/architecture/simtouch-architecture.md`）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
 - `.github/workflows/release.yml`：发版与 Pages 部署 workflow
