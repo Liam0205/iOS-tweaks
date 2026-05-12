@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#5856D6"/>
+  <!-- Touch ripple rings -->
+  <circle cx="256" cy="240" r="120" fill="none" stroke="#ffffff" stroke-width="10" opacity="0.2"/>
+  <circle cx="256" cy="240" r="80" fill="none" stroke="#ffffff" stroke-width="12" opacity="0.4"/>
+  <circle cx="256" cy="240" r="40" fill="none" stroke="#ffffff" stroke-width="14" opacity="0.7"/>
+  <!-- Touch point -->
+  <circle cx="256" cy="240" r="16" fill="#ffffff"/>
+  <!-- Capture indicator: small viewfinder brackets at bottom -->
+  <path d="M176 360 L176 384 L200 384" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.8"/>
+  <path d="M336 360 L336 384 L312 384" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.8"/>
+  <path d="M176 420 L176 396 L200 396" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.8"/>
+  <path d="M336 420 L336 396 L312 396" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.8"/>
+</svg>

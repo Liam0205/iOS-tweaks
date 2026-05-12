@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>SimTouch</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>default</key>
+            <false/>
+            <key>defaults</key>
+            <string>page.0x01.simtouch</string>
+            <key>key</key>
+            <string>enabled</string>
+            <key>label</key>
+            <string>Enabled</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Screenshot Cleanup</string>
+            <key>footerText</key>
+            <string>Screenshots older than max age or exceeding total size limit are auto-deleted.</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSEditTextCell</string>
+            <key>default</key>
+            <string>3600</string>
+            <key>defaults</key>
+            <string>page.0x01.simtouch</string>
+            <key>key</key>
+            <string>maxScreenshotAge</string>
+            <key>label</key>
+            <string>Max Age (seconds)</string>
+            <key>isNumeric</key>
+            <true/>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSEditTextCell</string>
+            <key>default</key>
+            <string>50</string>
+            <key>defaults</key>
+            <string>page.0x01.simtouch</string>
+            <key>key</key>
+            <string>maxScreenshotSize</string>
+            <key>label</key>
+            <string>Max Size (MB)</string>
+            <key>isNumeric</key>
+            <true/>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>SimTouch</string>
+</dict>
+</plist>

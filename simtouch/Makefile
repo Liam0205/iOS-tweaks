@@ -19,9 +19,23 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 
 TOOL_NAME = simtouch
 simtouch_FILES = tools/simtouch.c
+simtouch_FRAMEWORKS = CoreFoundation
 simtouch_INSTALL_PATH = /usr/bin
 ifeq ($(shell uname),Linux)
 simtouch_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
 endif
 
 include $(THEOS_MAKE_PATH)/tool.mk
+
+BUNDLE_NAME = SimTouchPrefs
+SimTouchPrefs_FILES = simtouchprefs/STRootListController.m
+SimTouchPrefs_FRAMEWORKS = UIKit
+SimTouchPrefs_PRIVATE_FRAMEWORKS = Preferences
+SimTouchPrefs_INSTALL_PATH = /Library/PreferenceBundles
+SimTouchPrefs_RESOURCE_DIRS = simtouchprefs/Resources
+SimTouchPrefs_CFLAGS = -fobjc-arc
+ifeq ($(shell uname),Linux)
+SimTouchPrefs_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
+endif
+
+include $(THEOS_MAKE_PATH)/bundle.mk
