@@ -7,7 +7,7 @@ THEOS_PACKAGE_SCHEME = rootless
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = SimTouch
-SimTouch_FILES = Tweak.x
+SimTouch_FILES = Tweak.x SocketServer.m
 SimTouch_CFLAGS = -fobjc-arc
 SimTouch_FRAMEWORKS = Foundation UIKit
 SimTouch_LIBRARIES = substrate
