@@ -14,14 +14,14 @@
 
 - `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
-- `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——ctor 两阶段加载、MSHookFunction + fishhook 混合策略、ARM64 栈切换退出生存机制、CFRunLoop 重定向绕过损坏的 dispatch queue、巡逻定时器线程管理、与 icbcbypass 的关键差异。
-- `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.0 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、TCP 健康检查、指数退避自动重连、LaunchDaemon 开机持久化、进程 spawn 约束与 zombie tunnel 检测。
+- `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——四阶段 ctor 加载（fishhooks-first 顺序）、MSHookFunction + fishhook 混合策略、CFRunLoopAddTimer 定时器拦截、CFRunLoopRunSpecific longjmp 备用恢复、ARM64 栈切换退出生存、双通道杀死对抗（CFRunLoop timer + GCD dispatch_after）、与 icbcbypass 的关键差异。
+- `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.2 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、进程存活健康检查、指数退避自动重连、LaunchDaemon 开机持久化、sysctl 孤儿进程检测。
 
 ## reference/
 
 - `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 - `llmdoc/reference/icbc-detection-vectors.md`：工商银行检测框架（SecureUtilityPlus）、冻结机制（持续 freeze 循环及版本间时序差异）、弹窗退出链路、版本适配记录（3.0.80、3.0.90）与覆盖情况。
-- `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、svc #0x80 不可拦截 syscall、内存完整性扫描、多路径退出机制与当前覆盖状态。
+- `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、双通道杀死机制（CFRunLoop timer + GCD dispatch_after）、第二检测路径（hook 完整性）、svc #0x80 不可拦截 syscall、当前覆盖状态。
 
 ## guides/
 
@@ -38,3 +38,5 @@
 - `llmdoc/memory/reflections/deploy-via-reverse-tunnel.md`：反向隧道部署踩坑——端口号/用户名缺失导致试错、root vs mobile 约束、SSHTunnel 自举问题。
 - `llmdoc/memory/reflections/sshtunnel-autossh-development.md`：SSHTunnel 1.1.1-1.2.1 开发周期——autossh 集成的两个关键 bug（PATH 不传播、process group 继承杀死子进程）、iOS posix_spawn 约束总结。
 - `llmdoc/memory/reflections/abcbypass-round1-9.md`：ABCBypass v1-v81（9 轮迭代）——MSHookFunction 内存扫描触发、inline SVC 不可拦截、_Noreturn 栈切换、dispatch queue 损坏绕过、巡逻定时器策略演进。
+- `llmdoc/memory/reflections/abcbypass-round10-12.md`：ABCBypass v86-v95（3 轮迭代）——exit 存活策略全灭（栈损坏/嵌套 RunLoop/longjmp 状态损坏）、CFRunLoop 定时器拦截、SDK 识别为 mPaaS、ctor 重排序消除文件检测、发现第二检测路径（hook 完整性 + GCD dispatch_after）。
+- `llmdoc/memory/reflections/sshtunnel-v132-release.md`：SSHTunnel v1.3.2 发布反思——TCP 探测在 iOS sandbox 下不可用、sysctl(KERN_PROCARGS2) 替代 ps|grep、SSH 自愈参数组合消除外部健康检查需求、文档滞后复发。

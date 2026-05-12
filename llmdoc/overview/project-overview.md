@@ -11,7 +11,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 | `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 | 已发布 |
 | `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 | 已发布 |
 | `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
-| `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-81) |
+| `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-95) |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
 
@@ -19,9 +19,9 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 
 | 包名 | 类型 | 用途 |
 |------|------|------|
-| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.3.0），自愈隧道：TCP 健康检查 + 指数退避自动重连 + 开机持久化 |
+| `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.3.2），自愈隧道：进程存活健康检查 + 指数退避自动重连 + 开机持久化 |
 
-sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.3.0 核心能力：(1) autossh 持久隧道（PID 文件状态管理），设备未安装 autossh 时降级为 ssh；(2) TCP 健康检查（30s 间隔，3 次连续失败触发重连）；(3) 指数退避自动重连（3-60s）；(4) LaunchDaemon 开机持久化（PathState 激活）。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
+sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.3.2 核心能力：(1) autossh 持久隧道（PID 文件状态管理），设备未安装 autossh 时降级为 ssh；(2) 进程存活健康检查（依赖 SSH ServerAliveInterval 检测死连接）；(3) 指数退避自动重连（3-60s）；(4) LaunchDaemon 开机持久化（PathState 激活）。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
 ## 目标环境
 
@@ -35,6 +35,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - mybankbypass 当前版本：`1.2.0`，已确认绕过网商银行 4.6.4 与 4.7.36 的越狱检测
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
 - icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
+- abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
 
 ## 软件源与 CI/CD 架构
 
@@ -69,8 +70,8 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `mybankbypass/Tweak.x`：网商银行 Hook 主入口
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
-- `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（9 轮迭代，v1-v81）
-- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + TCP 健康检查 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
+- `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（12 轮迭代，v1-v95）
+- `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + 进程存活健康检查 + sysctl 孤儿检测 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置
 - `mybankbypass/control` / `bankcommbypass/control` / `icbcbypass/control`：Debian 包元数据
 - `.github/workflows/release.yml`：发版与 Pages 部署 workflow

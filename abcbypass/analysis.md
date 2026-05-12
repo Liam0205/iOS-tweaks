@@ -830,3 +830,191 @@ v81 部署后，APP 启动 ~10 秒后 UI 冻结（heartbeat 停在 #10，26.53s�
 
 **推荐**: 方案 1（hook CFRunLoopAddTimer），最精准且对 UIKit 影响最小
 
+---
+
+## Round 10: CFRunLoopAddTimer hook + exit() 存活策略 (v86-v88)
+
+核心思路：从 Round 9 的推荐方案出发，hook CFRunLoopAddTimer 跟踪所有注册到主 RunLoop 的定时器，在 exit() 被调用时批量 invalidate。
+
+### v86: 栈切换 + 定时器清扫
+
+**策略**: 
+1. MSHookFunction hook CFRunLoopAddTimer（ctor 阶段立即安装，先于 SDK 注册定时器）
+2. hooked_exit 中: suspend 非关键线程 → invalidate 所有 pre-exit 定时器 → 栈切换到 mmap 分配的 1MB 栈 → 在新栈上泵 CFRunLoopRunInMode
+
+**结果**: 定时器清扫成功——invalidated 11 个 pre-exit 定时器，进程存活超过 25s（bypass 了 svc #0x80 定时器杀死）。但 UI 从未出现——watchdog 在 ~23s 杀死进程。
+
+**分析**: 栈切换破坏了 UIKit 的启动栈状态。UIKit 依赖主线程原始栈上的上下文（CATransaction、UIApplication 初始化状态等），切换到新栈后这些上下文丢失。
+
+### v87: 从 exit() 直接 return
+
+**策略**: 不切换栈，直接从 hooked_exit return，让调用链回到 SDK → RunLoop。
+
+**结果**: return 触发 `__stack_chk_fail` → 10 次 SIGSEGV → 跌入 crash recovery trampoline。UI 短暂出现但冻结，~12s 后进程死亡。
+
+**分析**: `exit()` 是 `__attribute__((noreturn))`，编译器不保留 return 路径的栈状态。SDK 的调用方在 call exit() 后的栈帧已被优化掉，return 跳入垃圾指令。
+
+### v88: RunLoop in-place pump
+
+**策略**: 在 hooked_exit 内部直接泵 CFRunLoopRunInMode——不 return、不切换栈，让 exit() 永不返回同时继续处理 RunLoop 事件。
+
+**结果**: 
+- exit(0) 在 t=15.69s 被拦截 ✅
+- 11 个定时器 invalidated ✅
+- heartbeat 达到 #10（t=27.70s），进程存活 28s ✅
+- 所有 dispatch/pthread 计数器 = 0（SDK 在 exit 后无活动）
+- UI 从未渲染 ❌
+- 进程在 ~28s 被杀（watchdog）
+
+**分析**: 在 exit() 内部泵 RunLoop 创建了**嵌套 RunLoop**。外层 RunLoop（UIKit 的 RunLoop，从 UIApplicationMain 启动的）仍然卡在 `SDK code → exit() → hooked_exit()` 的调用链上。嵌套的 RunLoop 可以处理事件，但 UIKit 的渲染管线依赖外层 RunLoop 的正常迭代，嵌套调用无法触发渲染。
+
+**Round 10 结论**: 三种 exit() 存活策略全部失败:
+- 栈切换: 破坏 UIKit 状态
+- 直接 return: noreturn 导致栈损坏
+- 嵌套 RunLoop: UI 无法渲染
+
+---
+
+## Round 11: longjmp 逃逸 (v89-v92)
+
+核心突破：不在 exit() 内部存活，而是用 setjmp/longjmp 跳回 exit() 调用之前的 RunLoop 入口点。
+
+### v89: longjmp 基础实现
+
+**策略**:
+1. MSHookFunction hook CFRunLoopRunSpecific（CF RunLoop 的底层入口）
+2. hooked_CFRunLoopRunSpecific: 在主线程首次调用时 setjmp → 调用 orig
+3. hooked_exit: longjmp 回到 setjmp 点 → invalidate 定时器 → 重新调用 orig_CFRunLoopRunSpecific
+4. RunLoop 从"干净"的入口重新进入，SDK 的调用栈被完全丢弃
+
+**结果**:
+- exit(0) 在 t=15.55s 被拦截 ✅
+- longjmp 成功回到 RunLoop recovery point ✅
+- 64 tracked timers 中 5 个 invalidated ✅
+- 进程在 ~20s 死亡（watchdog），UI 冻结
+
+**分析**: longjmp 本身成功了，但 UI 仍然冻结。可能原因: (1) longjmp 后 dispatch hook 的 g_exit_blocked 被后续 exit 调用设为 1，冻结了 dispatch 通道; (2) CF RunLoop 内部状态在 longjmp 跨越定时器回调时被破坏。
+
+### v90: 移除 g_exit_blocked + 线程状态诊断
+
+**策略**: hooked_exit 中不设置 g_exit_blocked（避免误触发 dispatch 阻断），recovery 后扫描并恢复所有线程状态。
+
+**结果**:
+- exit(0) 在 t=10.69s 被拦截
+- **29 threads total, 0 suspended, 29 running** — 所有线程正常
+- 进程仍死亡，UI 冻结
+
+### v91: 已知参数恢复
+
+**策略**: longjmp 后 ARM64 参数寄存器(x0-x7)被破坏（setjmp 不保存非 callee-saved 寄存器），原始 CFRunLoopRunSpecific 参数丢失。recovery 后使用已知参数 `orig_CFRunLoopRunSpecific(CFRunLoopGetMain(), kCFRunLoopDefaultMode, 1e10, false)` 重新进入。
+
+**结果**: 同 v90——recovery 成功但 UI 冻结，进程被杀。
+
+**分析**: 参数损坏可能不是主因。更根本的问题是 longjmp 跨越了 CoreFoundation RunLoop 的内部状态边界:
+- `__CFRunLoopDoTimers` → `timer_callback` → `exit()` 路径中，CF 内部维护了"正在触发的定时器"等状态
+- longjmp 跳过了这些状态的清理，RunLoop 重入后可能处于不一致状态
+- 表现为：RunLoop 在跑但无法正常处理 UI 事件
+
+### v92: 预防性定时器拦截
+
+**策略**: 在 hooked_CFRunLoopAddTimer 中检查定时器属性，拦截可疑的 SDK 杀死定时器:
+- interval == 0（一次性）
+- 延迟 > 5s 且 < 60s
+- 直接不调用 orig（定时器不注册到 RunLoop）
+
+**结果**:
+- t=0.13: 拦截 one-shot delay=35.0s ✅
+- t=3.42: 拦截 one-shot delay=15.0s ✅
+- **exit(0) 仍在 t=15.64 被调用** ❌
+
+**分析**: SDK 使用**两种**延时机制:
+1. CFRunLoopTimer → 我们可以拦截 ✅
+2. GCD dispatch timer (dispatch_after) → 不经过 CFRunLoopAddTimer，我们无法拦截 ❌
+
+exit() 在 15.64s 来自 dispatch_after 投递的 block。
+
+**Round 11 结论**: longjmp 机制可靠地捕获 exit()，但 CF RunLoop 内部状态被 longjmp 打断，UI 无法恢复。预防性定时器拦截有效但不完整（只能拦截 CFRunLoop 路径，不能拦截 GCD 路径）。
+
+---
+
+## Round 12: 检测绕过优化 + SDK 识别 (v93-v95)
+
+核心转变：从"如何在 exit() 后存活"转向"如何让检测本身失败，使 exit() 不被调用"。
+
+### SDK 识别: MbapMPaaS (蚂蚁金服 mPaaS)
+
+v94 在 UIAlertController hook 中添加了调用栈日志，关键发现:
+
+```
+BT[1]  MbapMPaaS + 9292048    ← 创建越狱 alert 的函数
+BT[13] MbapMPaaS + 2911556    ← SDK 包装了 UIApplicationMain
+BT[14] dyld start + 2528
+```
+
+**MbapMPaaS 是蚂蚁金服的 mPaaS（Mobile Platform as a Service）框架**，完整包装了 APP 生命周期:
+- SDK 的代码调用 UIApplicationMain（不是 APP 的 main()）
+- SDK 控制何时/是否加载主 UI
+- 检测失败 → 不加载主 UI + 显示 alert + 延时 exit()
+
+### v93: ObjC hooks 移到 ctor
+
+**策略**: 将 hookIOSSecuritySuite / hookABCJailbreakMethods / hookAuthorityJailBreakFlag / hookShowJailBrokenAlert 从延迟块移到 ctor，在 SDK 检测之前就 hook 掉 isJailbroken 等方法。
+
+**结果**: Alert **仍然出现**在 t=0.82。所有 ObjC hooks 在 t=0.07-0.38 安装，但检测仍成功。
+
+**分析**: ObjC 方法 hook 生效了（t=0.07-0.38），但 fishhooks（stat/access 等）在 t=0.62 才安装。**ObjC 扫描（0.3s+）期间文件检测 hooks 未就位**，SDK 趁此窗口完成了文件检测。
+
+### v94: 调用栈诊断
+
+**策略**: 在 UIAlertController hook 中用 `[NSThread callStackSymbols]` 打印完整调用栈。
+
+**结果**: 成功获取调用栈（见上方 SDK 识别部分）。确认 alert 由 MbapMPaaS 框架通过 dispatch_async 投递到主队列。
+
+### v95: fishhooks-first 排序
+
+**策略**: 将 build_dyld_map + rebind_symbols（文件/dyld/sysctl hooks）移到 ctor 最前面，在 ObjC 类扫描之前安装。
+
+**结果**:
+- fishhooks 在 t=0.02 安装 ✅
+- ObjC hooks 在 t=0.08-0.38 安装
+- **没有越狱 alert!** ✅（文件检测被拦截）
+- 但 exit(0) **仍在 t=10.90 被调用** ❌
+- 11 个定时器 invalidated
+- 进程死亡，UI 冻结
+
+**分析**: 文件检测成功绕过（无 alert），但 SDK 仍然调用了 exit()。这表明存在**第二条检测路径**:
+- 可能是 **hook 完整性检查**（FishHookChecker 检测 GOT 修改）
+- 可能是 **环境检测**（检测 DYLD_INSERT_LIBRARIES 或其他越狱痕迹）
+- 可能是 **内存扫描**（检测 MSHookFunction 的 trampoline 指令）
+- 这条路径通过 GCD dispatch_after（非 CFRunLoopTimer）触发 exit()，无 alert
+
+**Round 12 结论**: 
+1. SDK 确认为 MbapMPaaS（蚂蚁金服 mPaaS），控制整个 APP 生命周期
+2. fishhooks-first 排序成功绕过了文件检测层（无 alert）
+3. 第二条检测路径独立于文件检测，可能是 hook/内存完整性检查
+4. 两个独立杀死通道: CFRunLoopTimer（可拦截）和 GCD dispatch timer（未拦截）
+
+---
+
+## 当前状态: v95
+
+### 已解决
+- 文件系统检测绕过 ✅（fishhooks-first 排序）
+- ObjC 方法检测绕过 ✅（10+ classes hooked）
+- CFRunLoopTimer 杀死定时器拦截 ✅（hooked_CFRunLoopAddTimer 过滤 one-shot delay>5s）
+- exit() 捕获 ✅（longjmp 回到 CFRunLoopRunSpecific）
+
+### 未解决
+1. **第二条检测路径**: SDK 在文件检测通过后仍触发 exit()，可能是 hook 完整性检查
+2. **GCD dispatch timer 杀死**: exit() 通过 dispatch_after 触发，不走 CFRunLoopAddTimer
+3. **longjmp 后 UI 恢复**: CF RunLoop 内部状态被 longjmp 打断，UI 无法正常渲染
+4. **SDK 生命周期控制**: MbapMPaaS 包装 UIApplicationMain，检测成功后不启动主 UI
+
+### 候选方案
+
+1. **绕过 hook 检测**: 用 MSHookFunction（内联 hook，不修改 GOT）替代部分 fishhook 调用，使 FishHookChecker 检测不到
+2. **hook dispatch_after**: 拦截 SDK 通过 GCD 投递的延时 exit() block
+3. **直接 hook MbapMPaaS 检测函数**: 根据 backtrace 偏移量找到检测入口，MSHookFunction 使其返回 "clean"
+4. **hook SDK 的 ctor**: 使用 `_dyld_register_func_for_add_image` 在 SDK dylib 加载时立即 hook 其 ctor 内的检测逻辑
+
+

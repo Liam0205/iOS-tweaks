@@ -203,3 +203,4 @@ Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号
 3. `release.yml` 第 93 行的 gh-pages 清理列表包含该 tweak 目录名
 4. `build.yml` 的 `paths-ignore` 列表中不要意外排除新 tweak 的文件
 5. Release notes 范围为 `PREV_TAG..TAG`（不是 HEAD），确认 workflow 逻辑正确
+6. 对应的 `llmdoc/architecture/` 文档已同步更新（版本号、行为变更）

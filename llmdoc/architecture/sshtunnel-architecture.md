@@ -1,4 +1,4 @@
-# SSHTunnel 架构 (v1.3.0)
+# SSHTunnel 架构 (v1.3.2)
 
 ## 核心职责
 
@@ -7,11 +7,11 @@ TunnelManager 是单例状态机，管理 autossh/ssh 子进程的完整生命�
 ## 状态机
 
 ```
-Disconnected ──connect──► Connecting ──TCP verify OK──► Connected
+Disconnected ──connect──► Connecting ──process alive 5s──► Connected
      ▲                         │                            │
      │                   verify timeout /                health check
-     │                   process died                    3x TCP fail /
-     │                         │                        process exit
+     │                   process died                    process exit
+     │                         │                            │
      │                         ▼                            │
      └──── disconnect ◄── Reconnecting ◄────────────────────┘
               (clears state,         │
@@ -33,18 +33,15 @@ Disconnected ──connect──► Connecting ──TCP verify OK──► Conn
 1. `connect` 入口校验 → 状态设为 Connecting
 2. `spawnTunnel`：选择 autossh（优先）或 ssh；构造参数；`posix_spawn` + `POSIX_SPAWN_SETPGROUP` 隔离进程组
 3. `attachMonitor`：创建 `DISPATCH_SOURCE_TYPE_PROC` 监听 `DISPATCH_PROC_EXIT`
-4. `verifyConnection:attempt:`：TCP 轮询（每 2s 一次，最多 8 次）替代旧版 3s 盲等
+4. `verifyConnection:attempt:`：进程存活检查（每 1s 一次，共 5 次），ExitOnForwardFailure=yes 保证绑定失败时 ssh 退出
 5. 验证通过 → Connected + `startHealthCheck`；超时 → kill → `handleTunnelDeath`
 
-## TCP 健康检查
+## 健康检查
 
-实现位置：`sshtunnel/TunnelManager.m` (`tcpConnectTestWithTimeout:`)
-
-- 非阻塞 `connect()` + `select()` 超时
-- 目标：服务器 host:port（验证 SSH 可达性）
-- 健康定时器：30s 间隔，Connected 状态期间持续运行
-- 策略：3 次连续 TCP 失败 → `SIGTERM` kill 进程 → 触发 `handleTunnelDeath`
-- 进程存活但 TCP 不通（zombie tunnel）：probe 阶段也会检测并清理
+- 不再使用 TCP 探测（`tcpConnectTestWithTimeout:` 已移除）
+- 仅检查进程存活：30s 间隔，`kill(pid, 0)` 判断进程是否存在
+- 死服务器检测依赖 SSH 自身的 `ServerAliveInterval` / `ServerAliveCountMax` 参数（ssh 在超时后自行退出）
+- 进程退出 → `DISPATCH_SOURCE_TYPE_PROC`（`DISPATCH_PROC_EXIT`）通知触发 `handleTunnelDeath`
 
 ## 自动重连（指数退避）
 
@@ -58,8 +55,8 @@ delay = 3 * (1 << min(backoffCount, 4))   // cap at 2^4=16 → 48s, 之后 cap 6
 
 触发条件：
 - 进程退出（`DISPATCH_PROC_EXIT` 通知）
-- 健康检查 3 次失败
-- 连接验证超时（8 轮 TCP poll 失败）
+- 健康检查发现进程不存在
+- 连接验证超时（5 次进程存活检查后进程仍存在但未完成绑定的极端场景）
 
 中止条件：
 - `disconnect` 调用：先清除状态再 kill（防止状态机进入 Reconnecting）
@@ -95,7 +92,16 @@ delay = 3 * (1 << min(backoffCount, 4))   // cap at 2^4=16 → 48s, 之后 cap 6
 
 1. 读 PID 文件 → `kill(pid, 0)` 检查进程存活
 2. 进程不在 → 清理 state files
-3. 进程存活 → TCP 验证 → 通过则恢复 Connected + 启动健康检查；TCP 失败则 kill（zombie tunnel 修复）
+3. 进程存活 → 直接恢复 Connected + 启动健康检查
+
+### 孤儿进程检测
+
+当 PID 文件丢失或 stale 时，需要扫描系统进程查找可能的孤儿隧道：
+
+- 使用 `sysctl(KERN_PROCARGS2)` 读取进程命令行参数
+- 搜索匹配 `-R remotePort:localhost:localPort` 模式的进程
+- 替代旧方案（`/bin/sh` + `ps|grep`），旧方案在 rootless 越狱环境下因 `/bin/sh` 不可用而失败
+- 找到孤儿进程后接管其 PID 并恢复状态
 
 ## 状态持久化文件
 
@@ -108,13 +114,12 @@ delay = 3 * (1 << min(backoffCount, 4))   // cap at 2^4=16 → 48s, 之后 cap 6
 | `stderr.log` | 子进程 stderr 输出（用于诊断） |
 | `boot-cmd` | 开机启动脚本（存在 = daemon 激活） |
 
-## 与 v1.2.1 的关键差异
+## 与 v1.3.0 的关键差异
 
-| 能力 | v1.2.1 | v1.3.0 |
+| 能力 | v1.3.0 | v1.3.2 |
 |------|--------|--------|
-| 连接验证 | 3s 盲等 | TCP 轮询 (2s x 8) |
-| 健康检查 | 无 | 30s TCP 探测 |
-| 进程 zombie 检测 | 无 | probe + 健康检查双重覆盖 |
-| 断线恢复 | 手动 | 自动重连 + 指数退避 |
-| 开机启动 | 无 | LaunchDaemon + PathState |
-| 状态数 | 3 (无 Reconnecting) | 4 |
+| 连接验证 | TCP 轮询 (2s x 8) | 进程存活检查 (1s x 5) + ExitOnForwardFailure |
+| 健康检查 | 30s TCP 探测 | 30s 进程存活检查 + SSH ServerAlive 参数 |
+| 死服务器检测 | TCP connect 失败 | SSH ServerAliveInterval/ServerAliveCountMax |
+| 孤儿进程检测 | `/bin/sh` + `ps\|grep` | `sysctl(KERN_PROCARGS2)` 扫描进程参数 |
+| zombie tunnel 处理 | probe TCP 失败则 kill | 不再需要（无 TCP 即无 zombie 概念） |

@@ -9,12 +9,13 @@ iOS 越狱 Tweak 仓库，基于 Theos 构建，面向 rootless 越狱环境（D
 | `page.0x01.mybankbypass` | 网商银行 | 4.6.4 ~ 4.7.36 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
 | `page.0x01.bankcommbypass` | 交通银行 | 10.3.0 | 绕过越狱环境检测，使其在越狱设备上正常运行 |
 | `page.0x01.icbcbypass` | 工商银行 | 3.0.80 ~ 3.0.90 | 绕过越狱检测三层防御（检测+冻结+退出弹窗） |
+| `page.0x01.abcbypass` | 农业银行 | 11.1.0 | 绕过越狱检测（开发中） |
 
 ## Tools
 
 | 包名 | 类型 | 说明 |
 |------|------|------|
-| `page.0x01.sshtunnel` | Application | SSH 反向隧道管理器，用于远程调试越狱设备 |
+| `page.0x01.sshtunnel` | Application | SSH 反向隧道管理器 (v1.3.2)，用于远程调试越狱设备 |
 
 ## 安装
 

@@ -9,6 +9,8 @@
 - 目标 App：`com.bankabc.iphonerelease`
 - 已验证版本：`11.1.0`
 - 主 Binary：`MbapMPaaS`（arm64, ~110MB）
+- SDK 识别：**MbapMPaaS = 蚂蚁金服 mPaaS 框架**（通过 callstack backtrace 确认）
+- mPaaS 封装了 UIApplicationMain，控制整个 App 生命周期
 - 检测框架：SecureUtilityPlus + SecurityGuard + SmAntiFraud
 
 ## 三层检测架构
@@ -70,13 +72,36 @@
 
 检测延迟：启动后约 15 秒触发。
 
+### 双通道杀死架构（v95 确认）
+
+SDK 使用两个独立的杀死通道冗余执行：
+
+| 通道 | 机制 | 拦截方式 | 当前状态 |
+|------|------|----------|----------|
+| CFRunLoop 定时器 | CFRunLoopAddTimer 注册一次性定时器（delay 5-60s） → callback 调用 exit(0) | hook CFRunLoopAddTimer 过滤丢弃 | ✅ 已拦截 |
+| GCD dispatch_after | dispatch_after 延迟投递 block → 调用 exit(0) | 无有效拦截方式 | ❌ 未拦截 |
+
+**GCD 通道无法用 CFRunLoop 方式拦截**：dispatch_after 不经过 CFRunLoopAddTimer，直接走 GCD 内核队列，无公开注册拦截点。
+
 ### 退出路径（多重冗余）
 
 | 优先级 | 路径 | 机制 | 可拦截性 |
 |--------|------|------|----------|
-| 主路径 | exit(0) | 主线程 dispatch block 调用 | ✅ fishhook |
+| 主路径 A | exit(0) via CFRunLoop timer | 主线程定时器 callback 调用 | ✅ timer 被阻断 |
+| 主路径 B | exit(0) via GCD dispatch_after | 主线程 dispatch block 调用 | ⚠️ exit 被 fishhook 但 block 仍执行 |
 | 备选 1 | __stack_chk_fail → abort | 故意栈金丝雀损坏 | ✅ fishhook |
 | 备选 2 | svc #0x80 _exit() | 后台线程直接 syscall | ❌ 不可拦截 |
+
+### 第二检测路径（Hook 完整性检测）
+
+v95 发现：即使越狱文件检测和 ObjC 方法检测均已成功绕过（弹窗不再出现），SDK 仍通过第二条路径调用 exit(0)。
+
+疑似检测机制：
+- FishHookChecker（SecureUtilityPlus 中的类，检测 GOT 篡改）
+- 函数 prologue 完整性检查（检测 inline hook trampoline）
+- 动态 GOT 比对（加载时 GOT vs 当前 GOT）
+
+**关键区分**：第一路径（文件/ObjC）已被 ctor 重排序消除，第二路径（hook 完整性）仍然触发 exit。
 
 **svc #0x80 特性**：
 - 不产生 crash report
@@ -89,19 +114,22 @@
 - 文案："为保护您的资金安全，中国农业银行不支持越狱设备上使用。"
 - 关键字匹配：农业银行/越狱/资金安全
 
-## 当前覆盖状态
+## 当前覆盖状态（v95）
 
 | 检测向量 | 状态 | 实现方式 |
 |----------|------|----------|
 | SecureUtilityPlus (13 classes) | ✅ 已中和 | ObjC method_setImplementation |
-| 文件/dyld/sysctl/env 检测 | ✅ 已隐藏 | fishhook (ctor 阶段) |
+| 文件/dyld/sysctl/env 检测 | ✅ 已隐藏 | fishhook (ctor 第一阶段) |
 | exit/abort/kill 链 | ✅ 已阻断 | fishhook + ARM64 栈切换 |
 | dispatch_async 主线程 block | ✅ 已重定向 | MSHookFunction (560+ redirects) |
 | pthread_create 检测线程 | ✅ 已拦截 | fishhook (非 MSHookFunction) |
+| CFRunLoop 杀死定时器 | ✅ 已拦截 | MSHookFunction CFRunLoopAddTimer + 过滤规则 |
+| GCD dispatch_after 杀死 | ❌ 未拦截 | 无有效拦截方式 |
+| Hook 完整性检测（第二路径） | ❌ 未绕过 | 疑似 FishHookChecker / GOT 比对 |
 | svc #0x80 后台杀死 | ⚠️ 缓解 | 线程挂起 + 巡逻定时器 |
 | 内存完整性扫描 | ✅ 已规避 | 不对 libpthread 使用 inline hook |
 | 弹窗 | ✅ 已抑制 | UIAlertController 关键字拦截 |
-| UI 完全恢复 | ❌ 未解决 | 巡逻定时器可能过度挂起 worker |
+| UI 完全恢复 | ❌ 未解决 | longjmp CF 状态损坏 / 巡逻定时器误挂起 |
 
 ## 与 ICBC 检测的差异
 
@@ -124,3 +152,5 @@ ABC App 升级后建议检查顺序：
 4. SecureUtilityPlus 是否新增 Checker 类
 5. 退出时序是否变化（15s → 更早）
 6. 巡逻定时器挂起的线程是否包含关键 GCD worker
+7. FishHookChecker / hook 完整性检测的具体实现方式
+8. GCD dispatch_after 通道是否有新的投递模式
