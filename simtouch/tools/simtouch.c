@@ -4,9 +4,12 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #define SOCKET_PATH "/var/jb/tmp/simtouch.sock"
 #define BUF_SIZE 4096
+#define PREFS_ID CFSTR("page.0x01.simtouch")
+#define PREFS_NOTIFICATION CFSTR("page.0x01.simtouch.prefsChanged")
 
 static int send_command(const char *cmd) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -51,9 +54,22 @@ static int send_command(const char *cmd) {
     return strncmp(buf, "OK", 2) == 0 ? 0 : 1;
 }
 
+static int set_enabled(int enabled) {
+    CFBooleanRef val = enabled ? kCFBooleanTrue : kCFBooleanFalse;
+    CFPreferencesSetAppValue(CFSTR("enabled"), val, PREFS_ID);
+    CFPreferencesAppSynchronize(PREFS_ID);
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        PREFS_NOTIFICATION, NULL, NULL, true);
+    printf("OK\n");
+    return 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
         "Usage:\n"
+        "  simtouch enable\n"
+        "  simtouch disable\n"
         "  simtouch info\n"
         "  simtouch screenshot [path]\n"
         "  simtouch tap <x> <y>\n"
@@ -66,6 +82,9 @@ int main(int argc, char *argv[]) {
         usage();
         return 1;
     }
+
+    if (strcmp(argv[1], "enable") == 0) return set_enabled(1);
+    if (strcmp(argv[1], "disable") == 0) return set_enabled(0);
 
     char cmd[BUF_SIZE] = {0};
     for (int i = 1; i < argc; i++) {
