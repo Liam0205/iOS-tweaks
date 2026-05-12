@@ -16,3 +16,12 @@ SimTouch_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolc
 endif
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+TOOL_NAME = simtouch
+simtouch_FILES = tools/simtouch.c
+simtouch_INSTALL_PATH = /usr/bin
+ifeq ($(shell uname),Linux)
+simtouch_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
+endif
+
+include $(THEOS_MAKE_PATH)/tool.mk
