@@ -178,49 +178,56 @@ static NSString *findBinary(NSString *name) {
     NSString *needle = [NSString stringWithFormat:@"-R %ld:localhost:%ld",
                         (long)_remotePort, (long)_localPort];
 
-    int fds[2];
-    if (pipe(fds) != 0) return 0;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) return 0;
 
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&actions, fds[0]);
-
-    NSString *shPath = @"/bin/sh";
-    NSString *cmd = [NSString stringWithFormat:
-        @"ps -eo pid,args 2>/dev/null | grep '%@' | grep -v grep | awk '{print $1}'",
-        needle];
-    char *argv[] = {
-        (char *)shPath.UTF8String,
-        "-c",
-        (char *)cmd.UTF8String,
-        NULL
-    };
-
-    extern char **environ;
-    pid_t child = 0;
-    int ret = posix_spawn(&child, shPath.UTF8String, &actions, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(fds[1]);
-
-    if (ret != 0) {
-        close(fds[0]);
+    struct kinfo_proc *procs = malloc(size);
+    if (!procs) return 0;
+    if (sysctl(mib, 4, procs, &size, NULL, 0) != 0) {
+        free(procs);
         return 0;
     }
 
-    char buf[128];
-    ssize_t n = read(fds[0], buf, sizeof(buf) - 1);
-    close(fds[0]);
+    int count = (int)(size / sizeof(struct kinfo_proc));
+    pid_t found = 0;
+    pid_t myPid = getpid();
 
-    int status;
-    waitpid(child, &status, 0);
+    for (int i = 0; i < count && found == 0; i++) {
+        pid_t pid = procs[i].kp_proc.p_pid;
+        if (pid <= 0 || pid == myPid) continue;
 
-    if (n <= 0) return 0;
-    buf[n] = '\0';
+        int argsMib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+        size_t argsSize = 0;
+        if (sysctl(argsMib, 3, NULL, &argsSize, NULL, 0) != 0) continue;
 
-    pid_t found = (pid_t)atoi(buf);
-    if (found > 0 && kill(found, 0) == 0) return found;
-    return 0;
+        char *argsBuf = malloc(argsSize);
+        if (!argsBuf) continue;
+        if (sysctl(argsMib, 3, argsBuf, &argsSize, NULL, 0) != 0) {
+            free(argsBuf);
+            continue;
+        }
+
+        // KERN_PROCARGS2: argc(4B) + exec_path + NUL-separated argv
+        // Replace NULs with spaces so we can search as a single string
+        for (size_t j = 0; j < argsSize; j++) {
+            if (argsBuf[j] == '\0') argsBuf[j] = ' ';
+        }
+        NSString *argsStr = [[NSString alloc] initWithBytes:argsBuf
+                                                     length:argsSize
+                                                   encoding:NSUTF8StringEncoding];
+        free(argsBuf);
+
+        if (argsStr && [argsStr containsString:needle] &&
+            [argsStr containsString:@"ssh"]) {
+            if (kill(pid, 0) == 0) {
+                found = pid;
+            }
+        }
+    }
+
+    free(procs);
+    return found;
 }
 
 - (void)killOrphanTunnel {
@@ -319,19 +326,6 @@ static NSString *findBinary(NSString *name) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self handleTunnelDeath:@"Process exited unexpectedly"];
         });
-        return;
-    }
-
-    if ([self tcpConnectTestWithTimeout:5]) {
-        _healthCheckFailures = 0;
-    } else {
-        _healthCheckFailures++;
-        if (_healthCheckFailures >= 3) {
-            kill(pid, SIGTERM);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self handleTunnelDeath:@"Health check failed (3 consecutive TCP failures)"];
-            });
-        }
     }
 }
 
@@ -385,38 +379,26 @@ static NSString *findBinary(NSString *name) {
         return;
     }
 
-    // Run TCP test on background queue to avoid blocking main thread
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        BOOL tcpOK = [self tcpConnectTestWithTimeout:3];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_pid != pid || self->_state != TunnelStateConnecting) return;
-
-            if (tcpOK) {
-                self->_reconnectBackoff = 0;
-                self->_healthCheckFailures = 0;
-                NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld%@",
-                                 pid, self->_username, self->_serverHost,
-                                 (long)self->_remotePort, (long)self->_localPort,
-                                 self->_usingAutossh ? @" (autossh)" : @""];
-                [self setState:TunnelStateConnected message:msg];
-                [self startHealthCheck];
-                if (self->_autoStartOnBoot) {
-                    [self writeBootCmd];
-                }
-                return;
-            }
-
-            if (attempt < 8) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                               dispatch_get_main_queue(), ^{
-                    [self verifyConnection:pid attempt:attempt + 1];
-                });
-            } else {
-                kill(pid, SIGTERM);
-                [self handleTunnelDeath:@"Connection verification timed out"];
-            }
+    // ExitOnForwardFailure=yes ensures ssh exits quickly on bind failure.
+    // Process surviving 5s means tunnel is established.
+    if (attempt < 5) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            [self verifyConnection:pid attempt:attempt + 1];
         });
-    });
+    } else {
+        _reconnectBackoff = 0;
+        _healthCheckFailures = 0;
+        NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld%@",
+                         pid, _username, _serverHost,
+                         (long)_remotePort, (long)_localPort,
+                         _usingAutossh ? @" (autossh)" : @""];
+        [self setState:TunnelStateConnected message:msg];
+        [self startHealthCheck];
+        if (_autoStartOnBoot) {
+            [self writeBootCmd];
+        }
+    }
 }
 
 #pragma mark - Probe
@@ -446,27 +428,14 @@ static NSString *findBinary(NSString *name) {
     [self writeConfigFile];
     [self attachMonitor:pid];
 
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        BOOL tcpOK = [self tcpConnectTestWithTimeout:5];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_pid != pid) return;
-
-            if (tcpOK) {
-                NSString *host = config[@"host"] ?: self->_serverHost ?: @"?";
-                NSString *user = config[@"user"] ?: self->_username ?: @"?";
-                NSInteger rp = config[@"remotePort"] ? [config[@"remotePort"] integerValue] : self->_remotePort;
-                NSInteger lp = config[@"localPort"] ? [config[@"localPort"] integerValue] : self->_localPort;
-                NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld",
-                                 pid, user, host, (long)rp, (long)lp];
-                [self setState:TunnelStateConnected message:msg];
-                [self startHealthCheck];
-            } else {
-                NSString *msg = [NSString stringWithFormat:@"PID %d — server unreachable, waiting for health check", pid];
-                [self setState:TunnelStateConnected message:msg];
-                [self startHealthCheck];
-            }
-        });
-    });
+    NSString *host = config[@"host"] ?: _serverHost ?: @"?";
+    NSString *user = config[@"user"] ?: _username ?: @"?";
+    NSInteger rp = config[@"remotePort"] ? [config[@"remotePort"] integerValue] : _remotePort;
+    NSInteger lp = config[@"localPort"] ? [config[@"localPort"] integerValue] : _localPort;
+    NSString *msg = [NSString stringWithFormat:@"PID %d — %@@%@:%ld → localhost:%ld",
+                     pid, user, host, (long)rp, (long)lp];
+    [self setState:TunnelStateConnected message:msg];
+    [self startHealthCheck];
 }
 
 #pragma mark - Connect / Disconnect
