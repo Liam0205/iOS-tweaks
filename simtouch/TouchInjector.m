@@ -1,0 +1,184 @@
+#import "TouchInjector.h"
+#import <UIKit/UIKit.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define LOG(fmt, ...) do { \
+    NSString *_msg = [NSString stringWithFormat:@"[SimTouch:Touch] " fmt @"\n", ##__VA_ARGS__]; \
+    NSLog(@"%@", _msg); \
+    NSFileHandle *_fh = [NSFileHandle fileHandleForWritingAtPath:@"/var/jb/tmp/simtouch.log"]; \
+    if (!_fh) { \
+        [@"" writeToFile:@"/var/jb/tmp/simtouch.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; \
+        _fh = [NSFileHandle fileHandleForWritingAtPath:@"/var/jb/tmp/simtouch.log"]; \
+    } \
+    if (_fh) { [_fh seekToEndOfFile]; [_fh writeData:[_msg dataUsingEncoding:NSUTF8StringEncoding]]; [_fh closeFile]; } \
+} while(0)
+
+#define BB_CMD_PATH     "/var/jb/tmp/simtouch-cmd"
+#define BB_CMD_NOTIFY   "page.0x01.simtouch.cmd"
+#define BB_READY_NOTIFY "page.0x01.simtouch.bb.ready"
+#define BB_ACK_NOTIFY   "page.0x01.simtouch.bb.ack"
+#define BB_PING_NOTIFY  "page.0x01.simtouch.bb.ping"
+
+enum {
+    kSTPhaseDown = 0,
+    kSTPhaseMove = 1,
+    kSTPhaseUp   = 2,
+};
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t phase;
+    float x;
+    float y;
+} STTouchCmd;
+#pragma pack(pop)
+
+@implementation STTouchInjector {
+    CGFloat _screenWPx;
+    CGFloat _screenHPx;
+    BOOL _bbReady;
+    NSString *_bbState;
+}
+
++ (instancetype)sharedInstance {
+    static STTouchInjector *inst;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{ inst = [[self alloc] init]; });
+    return inst;
+}
+
+static void onBBReady(CFNotificationCenterRef center, void *observer,
+                      CFStringRef name, const void *object, CFDictionaryRef info) {
+    STTouchInjector *self = (__bridge STTouchInjector *)observer;
+    self->_bbReady = YES;
+    LOG(@"backboardd hook READY");
+}
+
+static void onBBState(CFNotificationCenterRef center, void *observer,
+                      CFStringRef name, const void *object, CFDictionaryRef info) {
+    STTouchInjector *self = (__bridge STTouchInjector *)observer;
+    NSString *n = (__bridge NSString *)name;
+    if ([n hasSuffix:@"captured"]) {
+        self->_bbState = @"captured";
+    } else if ([n hasSuffix:@"sender"]) {
+        self->_bbState = @"sender";
+    } else if ([n hasSuffix:@"hooked"]) {
+        self->_bbState = @"hooked";
+    } else if ([n hasSuffix:@"nohook"]) {
+        self->_bbState = @"nohook";
+    }
+    LOG(@"BB state: %@", self->_bbState);
+}
+
+static void onBBDiag(CFNotificationCenterRef center, void *observer,
+                     CFStringRef name, const void *object, CFDictionaryRef info) {
+    NSString *n = (__bridge NSString *)name;
+    NSString *data = [n stringByReplacingOccurrencesOfString:@"page.0x01.simtouch.bb.diag." withString:@""];
+    LOG(@"BB DIAG: %@", data);
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        CGSize pt = [UIScreen mainScreen].bounds.size;
+        CGFloat scale = [UIScreen mainScreen].scale;
+        _screenWPx = pt.width * scale;
+        _screenHPx = pt.height * scale;
+        _bbReady = NO;
+        _bbState = @"unknown";
+        LOG(@"screen: %.0fx%.0f px", _screenWPx, _screenHPx);
+
+        CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBReady, CFSTR(BB_READY_NOTIFY), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBDiag, CFSTR(BB_ACK_NOTIFY), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBState, CFSTR("page.0x01.simtouch.bb.state.captured"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBState, CFSTR("page.0x01.simtouch.bb.state.sender"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBState, CFSTR("page.0x01.simtouch.bb.state.hooked"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBState, CFSTR("page.0x01.simtouch.bb.state.nohook"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+
+        CFNotificationCenterPostNotification(nc,
+            CFSTR(BB_PING_NOTIFY), NULL, NULL, true);
+        LOG(@"pinged backboardd");
+    }
+    return self;
+}
+
+- (BOOL)isSenderIDReady { return YES; }
+- (BOOL)isUserDeviceReady { return _bbReady; }
+- (NSString *)bbState { return _bbState; }
+- (void)captureSenderIDFromEvent:(void *)event {}
+
+#pragma mark - Send to Backboardd
+
+- (BOOL)_sendPhase:(uint8_t)phase pixelX:(CGFloat)px pixelY:(CGFloat)py {
+    STTouchCmd cmd;
+    cmd.phase = phase;
+    cmd.x = (float)(px / _screenWPx);
+    cmd.y = (float)(py / _screenHPx);
+
+    int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG(@"open cmd file failed: %d", errno);
+        return NO;
+    }
+    write(fd, &cmd, sizeof(cmd));
+    close(fd);
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+    return YES;
+}
+
+#pragma mark - Public API
+
+- (void)tapAtX:(CGFloat)pixelX y:(CGFloat)pixelY {
+    LOG(@"tap: (%.0f, %.0f)", pixelX, pixelY);
+    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY];
+    });
+}
+
+- (void)longPressAtX:(CGFloat)pixelX y:(CGFloat)pixelY durationMs:(NSInteger)ms {
+    if (ms <= 0) ms = 500;
+    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY];
+    });
+}
+
+- (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms {
+    if (ms <= 0) ms = 300;
+    NSInteger steps = MAX(ms / 16, 2);
+    [self _sendPhase:kSTPhaseDown pixelX:x1 pixelY:y1];
+    for (NSInteger i = 1; i <= steps; i++) {
+        CGFloat t = (CGFloat)i / (CGFloat)steps;
+        CGFloat cx = x1 + (x2 - x1) * t;
+        CGFloat cy = y1 + (y2 - y1) * t;
+        BOOL last = (i == steps);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, i * 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (last) {
+                [self _sendPhase:kSTPhaseUp pixelX:cx pixelY:cy];
+            } else {
+                [self _sendPhase:kSTPhaseMove pixelX:cx pixelY:cy];
+            }
+        });
+    }
+}
+
+@end
