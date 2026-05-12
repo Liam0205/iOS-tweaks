@@ -45,15 +45,16 @@
 # 命令格式
 tap <x> <y>                        # 点按（屏幕坐标，像素）
 swipe <x1> <y1> <x2> <y2> [ms]    # 滑动（默认 300ms）
-screenshot [path]                   # 截图（默认 /var/jb/tmp/simtouch/screen.png）
+longpress <x> <y> [ms]            # 长按 / HapticTouch（默认 500ms）
+screenshot [path]                   # 截图（默认 /var/jb/tmp/simtouch/screen_<ts>.jpg）
 keyinput <text>                     # 文本输入（未来）
 info                                # 返回屏幕尺寸、scale、senderID 状态
-enable                              # 运行时启用（启动 socket server）
-disable                             # 运行时禁用（停止 socket server）
+enable                              # 运行时启用（CLI 直接写偏好 + Darwin 通知）
+disable                             # 运行时禁用（CLI 直接写偏好 + Darwin 通知）
 
 # 响应格式
-OK                                  # tap/swipe/enable/disable 成功
-OK /var/jb/tmp/simtouch/screen.png 1170x2532  # screenshot 成功
+OK                                  # tap/swipe/longpress/enable/disable 成功
+OK /var/jb/tmp/simtouch/screen.jpg 1170x2532  # screenshot 成功
 OK 390x844 @3x senderID=ready      # info 响应
 ERR no senderID                     # senderID 未捕获
 ERR invalid command                 # 解析失败
@@ -95,6 +96,11 @@ tap(x, y):
   2. 50ms delay
   3. finger up event (range=0, touch=0, identity=2)
 
+longpress(x, y, duration):    # HapticTouch
+  1. finger down event (range=1, touch=1, identity=2)
+  2. hold for duration ms（默认 500ms，iOS HapticTouch 阈值约 350-500ms）
+  3. finger up event (range=0, touch=0, identity=2)
+
 swipe(x1, y1, x2, y2, duration):
   1. finger down at (x1, y1)
   2. N 个 finger move 事件（线性插值，~16ms 间隔 ≈ 60fps）
@@ -109,28 +115,31 @@ swipe(x1, y1, x2, y2, duration):
 
 ### 3. ScreenCapture（截图层）
 
-**职责**：静默截取当前屏幕，保存为 PNG。
+**职责**：静默截取当前屏幕，保存为图片。
 
-**实现方案**：IOSurface + CARenderServerRenderDisplay
+**实现方案**：`_UICreateScreenUIImage()`（UIKit 私有 API，weak_import）
 
 ```objc
 // 私有 API 声明
-extern void CARenderServerRenderDisplay(
-    kern_return_t, CFStringRef, IOSurfaceRef, int, int);
-extern CGImageRef UICreateCGImageFromIOSurface(IOSurfaceRef);
+extern UIImage *_UICreateScreenUIImage(void) __attribute__((weak_import));
 
 // 流程
-1. 获取屏幕尺寸（pixels = points × scale）
-2. IOSurfaceCreate({width, height, bytesPerRow=width*4, pixelFormat=BGRA})
-3. IOSurfaceLock()
-4. CARenderServerRenderDisplay(0, CFSTR("LCD"), surface, 0, 0)
-5. IOSurfaceUnlock()
-6. UICreateCGImageFromIOSurface() → UIImage → PNG data
-7. 写入指定路径
-8. CFRelease(surface)
+1. 必须在主线程调用（dispatch_sync(dispatch_get_main_queue(), ...)）
+2. _UICreateScreenUIImage() → CIImage-backed UIImage
+3. 重绘到 bitmap context（CIImage 不含 CGImage，UIImageJPEGRepresentation 会返回 nil）
+   UIGraphicsBeginImageContextWithOptions(size, YES, 1.0)
+   [image drawAtPoint:CGPointZero]
+   UIImage *bitmapImage = UIGraphicsGetImageFromCurrentImageContext()
+4. JPEG 编码（quality 0.8）或 PNG（按文件后缀）
+5. 写入指定路径
 ```
 
-**备选方案**：`_UICreateScreenUIImage()`（一行调用，但线程安全性不确定）
+**废弃方案**：CARenderServerRenderDisplay + IOSurface（在测试中产生全白截图，已放弃）
+
+**格式选择**：
+- 默认 JPEG（quality 0.8），~646KB（1170x2532）
+- `.png` 后缀时自动使用 PNG，~7MB（同分辨率）
+- JPEG 更适合自动化场景：文件小、50MB 配额可存约 77 张
 
 **截图存储管理**：
 
@@ -139,7 +148,7 @@ extern CGImageRef UICreateCGImageFromIOSurface(IOSurfaceRef);
 ```
 saveScreenshot(path)
   ↓
-写入 PNG 文件
+写入 JPEG/PNG 文件
   ↓
 scanDirectory(/var/jb/tmp/simtouch/)
   ↓
@@ -151,7 +160,7 @@ Phase 2: 计算剩余文件总体积
 
 - 清理只在 screenshot 命令触发时执行——不截图就不清理，零开销
 - 只管理 `/var/jb/tmp/simtouch/` 目录内的文件，用户指定自定义路径的不清理
-- 默认阈值：`maxAge = 3600s`，`maxSize = 50MB`
+- 默认阈值可通过 Settings 面板调整（`maxAge`、`maxSize`）
 
 ### 5. 开关控制
 
@@ -187,21 +196,24 @@ Phase 2: 计算剩余文件总体积
 
 ### 6. CLI 工具（simtouch）
 
-**职责**：连接 Unix socket，发送命令，输出结果。
+**职责**：连接 Unix socket 发送命令，或直接操作偏好（enable/disable）。
 
-**实现**：纯 C，无框架依赖。
+**实现**：C + CoreFoundation。enable/disable 通过 CFPreferences + CFNotificationCenter 直接写偏好并发 Darwin 通知，无需 socket 连接（server 关闭时也能工作）。其他命令通过 Unix socket 转发到 tweak。
 
 ```
 用法：
+  simtouch enable                      # 启用（写偏好 + Darwin 通知）
+  simtouch disable                     # 禁用（写偏好 + Darwin 通知）
   simtouch tap <x> <y>
   simtouch swipe <x1> <y1> <x2> <y2> [duration_ms]
+  simtouch longpress <x> <y> [ms]      # HapticTouch 长按（默认 500ms）
   simtouch screenshot [output_path]
   simtouch info
 
 通过 SSH 远程调用：
-  ssh -p 2216 mobile@localhost "simtouch tap 200 400"
-  ssh -p 2216 mobile@localhost "simtouch screenshot /tmp/s.png"
-  scp -P 2216 mobile@localhost:/tmp/s.png ./screen.png
+  ssh -p 2215 mobile@localhost "simtouch tap 200 400"
+  ssh -p 2215 mobile@localhost "simtouch screenshot /tmp/s.jpg"
+  scp -P 2215 mobile@localhost:/tmp/s.jpg ./screen.jpg
 ```
 
 退出码：0 = 成功，1 = 错误（ERR 响应或连接失败）
@@ -214,25 +226,31 @@ simtouch/
 ├── Makefile               # Theos：同时构建 tweak + tool + prefs
 ├── control                # Debian 包元数据
 ├── SimTouch.plist          # 注入 SpringBoard 的过滤器
-├── Tweak.x                # SpringBoard tweak 入口（ctor + 开关监听）
-├── TouchInjector.h        # 触摸注入接口
-├── TouchInjector.m        # IOHIDEvent 触摸注入实现
+├── icon.svg               # 设置图标源文件（紫色触摸涟漪）
+├── Tweak.x                # SpringBoard tweak 入口（ctor + 开关监听 + 命令注册）
+├── TouchInjector.h        # 触摸注入接口（Phase 2）
+├── TouchInjector.m        # IOHIDEvent 触摸注入实现（Phase 2）
 ├── ScreenCapture.h        # 截图接口
-├── ScreenCapture.m        # IOSurface 截图实现
+├── ScreenCapture.m        # _UICreateScreenUIImage 截图 + JPEG/PNG + 自动清理
 ├── SocketServer.h         # socket server 接口
-├── SocketServer.m         # Unix socket IPC 实现
+├── SocketServer.m         # Unix socket IPC 实现（dispatch_source 异步）
 ├── headers/
-│   ├── IOHIDEvent.h       # IOHIDEvent 私有 API 声明
+│   ├── IOHIDEvent.h       # IOHIDEvent 私有 API 声明（Phase 2）
 │   └── IOHIDEventSystemClient.h
 ├── tools/
-│   └── simtouch.c         # CLI 客户端
+│   └── simtouch.c         # CLI 客户端（C + CoreFoundation）
+├── layout/
+│   └── Library/PreferenceLoader/Preferences/
+│       └── SimTouch.plist # PreferenceLoader 注册
 └── simtouchprefs/
     ├── STRootListController.h
     ├── STRootListController.m  # PreferenceBundle 控制器
-    ├── Resources/
-    │   ├── Root.plist          # 设置面板布局
-    │   └── Info.plist
-    └── entry.plist             # PreferenceLoader 注册
+    ├── entry.plist             # PreferenceLoader 注册（源文件）
+    └── Resources/
+        ├── Root.plist          # 设置面板布局
+        ├── Info.plist
+        ├── icon@2x.png         # 58x58 设置图标
+        └── icon@3x.png         # 87x87 设置图标
 ```
 
 ## Theos 构建配置
@@ -240,15 +258,17 @@ simtouch/
 ```makefile
 # Tweak（注入 SpringBoard）
 TWEAK_NAME = SimTouch
-SimTouch_FILES = Tweak.x TouchInjector.m ScreenCapture.m SocketServer.m
-SimTouch_FRAMEWORKS = UIKit IOKit IOSurface CoreGraphics QuartzCore
-SimTouch_CFLAGS = -fobjc-arc -Iheaders
-SimTouch_LDFLAGS = -lIOKit
+SimTouch_FILES = Tweak.x ScreenCapture.m SocketServer.m  # Phase 2 加 TouchInjector.m
+SimTouch_FRAMEWORKS = Foundation UIKit
+SimTouch_LIBRARIES = substrate  # ellekit 要求链接 CydiaSubstrate
+SimTouch_CFLAGS = -fobjc-arc
+ARCHS = arm64 arm64e            # iPhone 13 Pro A15 SpringBoard 需要 arm64e
 
 # CLI 工具
 TOOL_NAME = simtouch
 simtouch_FILES = tools/simtouch.c
-simtouch_INSTALL_PATH = /usr/local/bin
+simtouch_FRAMEWORKS = CoreFoundation  # enable/disable 用 CFPreferences + CFNotificationCenter
+simtouch_INSTALL_PATH = /usr/bin      # rootless → /var/jb/usr/bin
 
 # PreferenceBundle（设置面板）
 BUNDLE_NAME = SimTouchPrefs
@@ -256,6 +276,7 @@ SimTouchPrefs_FILES = simtouchprefs/STRootListController.m
 SimTouchPrefs_FRAMEWORKS = UIKit
 SimTouchPrefs_PRIVATE_FRAMEWORKS = Preferences
 SimTouchPrefs_INSTALL_PATH = /Library/PreferenceBundles
+SimTouchPrefs_RESOURCE_DIRS = simtouchprefs/Resources
 SimTouchPrefs_CFLAGS = -fobjc-arc
 ```
 
@@ -279,15 +300,17 @@ SpringBoard 启动 → SimTouch.dylib 加载
 
 ## 分阶段实现
 
-### Phase 1：截图（MVP）
-- SocketServer + ScreenCapture + CLI
-- 支持 `screenshot` 和 `info` 命令
-- 不含触摸功能
-- 对 ABCBypass 测试立即有用
+### Phase 1：截图（MVP）✅ 已完成
+- SocketServer + ScreenCapture + CLI + PreferenceBundle
+- 支持 `screenshot`、`info`、`enable`、`disable` 命令
+- `_UICreateScreenUIImage` 截图，JPEG 默认（0.8 quality）
+- PreferenceBundle 设置面板（开关 + 清理参数）
+- CLI enable/disable 通过 CoreFoundation 绕过 socket
+- 已在 iPhone 13 Pro / iOS 15.4.1 上验证
 
 ### Phase 2：触摸注入
 - TouchInjector + senderID 捕获
-- 支持 `tap` 和 `swipe` 命令
+- 支持 `tap`、`swipe`、`longpress`（HapticTouch）命令
 - 完成通用自动化能力
 
 ### Phase 3：增强
@@ -301,16 +324,17 @@ SpringBoard 启动 → SimTouch.dylib 加载
 |------|------------|------------|------|
 | IOHIDEventSystemClient | ✅ | ✅ | 私有 API，一直存在 |
 | IOHIDEventCreateDigitizerFingerEvent | ✅ | ✅ | 同上 |
-| CARenderServerRenderDisplay | ✅ | ✅ | QuartzCore 私有 |
-| IOSurface | ✅ | ✅ | 公开框架 |
-| Unix domain socket | ✅ | ✅ | POSIX 标准 |
-| SpringBoard 注入 | ✅ | ✅ | ellekit/substrate |
+| _UICreateScreenUIImage | ✅ 已验证 | ✅ | UIKit 私有 |
+| Unix domain socket | ✅ 已验证 | ✅ | POSIX 标准 |
+| SpringBoard 注入 | ✅ 已验证 | ✅ | ellekit/substrate |
+| PreferenceBundle | ✅ 已验证 | ✅ | PreferenceLoader |
 
 ## 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| senderID 变了 API 签名 | 触摸注入失效 | 回退到旧版 iolate/SimulateTouch 的 Mach port 方式 |
-| CARenderServerRenderDisplay 参数变化 | 截图失败 | 回退到 `_UICreateScreenUIImage()` |
-| SpringBoard crash | 设备 respring | 所有 IOHIDEvent 操作在 @try 内；socket server 不阻塞主线程 |
-| Socket 权限问题 | CLI 连不上 | chmod 0666 + 路径选择 /var/jb/tmp/ |
+| senderID API 签名变化 | 触摸注入失效 | 回退到旧版 iolate/SimulateTouch 的 Mach port 方式 |
+| _UICreateScreenUIImage 移除 | 截图失败 | weak_import + 运行时检查，回退到 drawViewHierarchyInRect |
+| SpringBoard crash | 设备 respring | socket server 不阻塞主线程；IOHIDEvent 操作在 @try 内 |
+| Socket 权限问题 | CLI 连不上 | chmod 0666 + 路径 /var/jb/tmp/（已验证） |
+| arm64e 架构遗漏 | tweak 不加载 | Makefile 固定 `ARCHS = arm64 arm64e` |
