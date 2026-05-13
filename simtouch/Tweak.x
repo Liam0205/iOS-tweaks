@@ -11,6 +11,20 @@
 
 #define LOG(fmt, ...) NSLog(@"[SimTouch] " fmt, ##__VA_ARGS__)
 #define PREFS_DOMAIN @"page.0x01.simtouch"
+
+@interface UIApplication (SpringBoardLaunch)
+- (BOOL)launchApplicationWithIdentifier:(NSString *)identifier suspended:(BOOL)suspended;
+@end
+
+@interface LSApplicationWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
+@end
+
+@interface FBSSystemService : NSObject
++ (instancetype)sharedService;
+- (void)openApplication:(NSString *)bundleID options:(NSDictionary *)options withResult:(id)result;
+@end
 #define PREFS_NOTIFICATION CFSTR("page.0x01.simtouch.prefsChanged")
 #define DEFAULT_SCREENSHOT_DIR @"/var/jb/tmp/simtouch"
 #define BB_CMD_PATH      "/var/jb/tmp/simtouch-cmd"
@@ -594,6 +608,94 @@ static void registerCommands(void) {
             CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
 
         return [NSString stringWithFormat:@"OK replaying %zu events over %ums (speed=%.1fx)", count, (uint32_t)(duration / speed), speed];
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"open" handler:^NSString *(NSArray<NSString *> *args) {
+        if (args.count < 1) return @"ERR usage: open <bundle-id>";
+        NSString *bundleID = args[0];
+        __block BOOL success = NO;
+        __block NSString *method = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            UIApplication *app = [UIApplication sharedApplication];
+            if ([app respondsToSelector:@selector(launchApplicationWithIdentifier:suspended:)]) {
+                success = [app launchApplicationWithIdentifier:bundleID suspended:NO];
+                method = @"SpringBoard";
+            }
+            if (!success) {
+                LSApplicationWorkspace *ws = [LSApplicationWorkspace defaultWorkspace];
+                if (ws && [ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
+                    success = [ws openApplicationWithBundleID:bundleID];
+                    method = @"LSWorkspace";
+                }
+            }
+            if (!success) {
+                FBSSystemService *fbs = [FBSSystemService sharedService];
+                if (fbs && [fbs respondsToSelector:@selector(openApplication:options:withResult:)]) {
+                    [fbs openApplication:bundleID options:@{} withResult:nil];
+                    success = YES;
+                    method = @"FBSSystemService";
+                }
+            }
+        });
+        if (success)
+            return [NSString stringWithFormat:@"OK launched %@ via %@", bundleID, method];
+        else
+            return [NSString stringWithFormat:@"ERR failed to launch %@", bundleID];
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"waitfor" handler:^NSString *(NSArray<NSString *> *args) {
+        NSInteger timeoutMs = 5000;
+        NSString *path = nil;
+        if (args.count > 0) timeoutMs = [args[0] integerValue];
+        if (timeoutMs <= 0) timeoutMs = 5000;
+        if (args.count > 1) {
+            path = args[1];
+        } else {
+            NSString *name = [NSString stringWithFormat:@"screen_%lld.jpg", (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+            path = [DEFAULT_SCREENSHOT_DIR stringByAppendingPathComponent:name];
+        }
+
+        __block NSData *initialData = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            initialData = [STScreenCapture captureAsJPEGData];
+        });
+        if (!initialData) return @"ERR capture failed";
+
+        NSTimeInterval start = [[NSDate date] timeIntervalSince1970];
+        NSTimeInterval deadline = start + timeoutMs / 1000.0;
+        __block NSData *finalData = nil;
+        BOOL changed = NO;
+
+        while ([[NSDate date] timeIntervalSince1970] < deadline) {
+            usleep(100000);
+            __block NSData *current = nil;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                current = [STScreenCapture captureAsJPEGData];
+            });
+            if (!current) continue;
+            if (![current isEqualToData:initialData]) {
+                finalData = current;
+                changed = YES;
+                break;
+            }
+        }
+
+        if (!finalData) finalData = initialData;
+
+        NSString *dir = [path stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [finalData writeToFile:path atomically:YES];
+
+        int width = 0, height = 0;
+        UIImage *img = [UIImage imageWithData:finalData];
+        if (img) {
+            width = (int)(img.size.width * img.scale);
+            height = (int)(img.size.height * img.scale);
+        }
+
+        NSInteger elapsed = (NSInteger)(([[NSDate date] timeIntervalSince1970] - start) * 1000);
+        return [NSString stringWithFormat:@"OK %@ %dx%d %@ %ldms",
+            path, width, height, changed ? @"changed" : @"timeout", (long)elapsed];
     }];
 
 }

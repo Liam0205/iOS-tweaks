@@ -85,6 +85,8 @@ static void usage(void) {
         "  simtouch switcher\n"
         "  simtouch record <start [name]|stop|list|dump [name]|delete <name>>\n"
         "  simtouch replay [name] [speed]\n"
+        "  simtouch open <bundle-id>          (launch app)\n"
+        "  simtouch waitfor [timeout_ms] [path]  (wait for screen change, default 5000ms)\n"
     );
 }
 

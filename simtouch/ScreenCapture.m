@@ -9,6 +9,20 @@ extern UIImage *_UICreateScreenUIImage(void) __attribute__((weak_import));
 
 @implementation STScreenCapture
 
++ (NSData *)captureAsJPEGData {
+    UIImage *image = nil;
+    if (_UICreateScreenUIImage) {
+        image = _UICreateScreenUIImage();
+    }
+    if (!image) return nil;
+
+    UIGraphicsBeginImageContextWithOptions(image.size, YES, image.scale);
+    [image drawAtPoint:CGPointZero];
+    UIImage *bitmapImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return UIImageJPEGRepresentation(bitmapImage, 0.8);
+}
+
 + (NSString *)captureToPath:(NSString *)path {
     UIImage *image = nil;
 

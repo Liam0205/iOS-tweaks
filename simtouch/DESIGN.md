@@ -77,6 +77,8 @@ bbstatus                            # ping backboardd 并返回 hook 状态
 diag                                # 列出可用的 IOHIDEvent API 和 UIKit 内部类
 record <start [name]|stop|list|dump [name]|delete <name>>  # 多录制管理
 replay [name] [speed]               # 回放（可指定录制名 + 速度倍率）
+open <bundle-id>                    # 启动 App（SpringBoard/FBS/LSWorkspace）
+waitfor [timeout_ms] [path]         # 等待屏幕变化（默认 5000ms，返回截图）
 enable                              # 运行时启用（CLI 直接写偏好 + Darwin 通知）
 disable                             # 运行时禁用（CLI 直接写偏好 + Darwin 通知）
 
