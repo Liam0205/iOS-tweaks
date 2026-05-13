@@ -1,6 +1,6 @@
 Package: page.0x01.simtouch
 Name: SimTouch
-Version: 0.0.1
+Version: 0.1.0
 Architecture: iphoneos-arm64
 Description: Remote touch simulation and screenshot capture for jailbroken iOS
 Maintainer: 0x01
