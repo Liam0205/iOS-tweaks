@@ -24,6 +24,7 @@ enum {
     kSTPhaseDown = 0,
     kSTPhaseMove = 1,
     kSTPhaseUp   = 2,
+    kSTPhaseSwipe = 3,
 };
 
 #pragma pack(push, 1)
@@ -31,7 +32,15 @@ typedef struct {
     uint8_t phase;
     float x;
     float y;
+    uint32_t edge_mask;
 } STTouchCmd;
+
+typedef struct {
+    uint8_t phase;
+    float x1, y1, x2, y2;
+    uint32_t duration_ms;
+    uint32_t edge_mask;
+} STSwipeCmd;
 #pragma pack(pop)
 
 @implementation STTouchInjector {
@@ -59,7 +68,9 @@ static void onBBState(CFNotificationCenterRef center, void *observer,
                       CFStringRef name, const void *object, CFDictionaryRef info) {
     STTouchInjector *self = (__bridge STTouchInjector *)observer;
     NSString *n = (__bridge NSString *)name;
-    if ([n hasSuffix:@"captured"]) {
+    if ([n hasSuffix:@"captured+edge"]) {
+        self->_bbState = @"captured+edge";
+    } else if ([n hasSuffix:@"captured"]) {
         self->_bbState = @"captured";
     } else if ([n hasSuffix:@"sender"]) {
         self->_bbState = @"sender";
@@ -97,6 +108,9 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
             onBBDiag, CFSTR(BB_ACK_NOTIFY), NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
+            onBBState, CFSTR("page.0x01.simtouch.bb.state.captured+edge"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
             onBBState, CFSTR("page.0x01.simtouch.bb.state.captured"), NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
@@ -123,11 +137,12 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 
 #pragma mark - Send to Backboardd
 
-- (BOOL)_sendPhase:(uint8_t)phase pixelX:(CGFloat)px pixelY:(CGFloat)py {
-    STTouchCmd cmd;
+- (BOOL)_sendPhase:(uint8_t)phase pixelX:(CGFloat)px pixelY:(CGFloat)py edgeMask:(uint32_t)edgeMask {
+    STTouchCmd cmd = {0};
     cmd.phase = phase;
     cmd.x = (float)(px / _screenWPx);
     cmd.y = (float)(py / _screenHPx);
+    cmd.edge_mask = edgeMask;
 
     int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -147,38 +162,71 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 
 - (void)tapAtX:(CGFloat)pixelX y:(CGFloat)pixelY {
     LOG(@"tap: (%.0f, %.0f)", pixelX, pixelY);
-    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY];
+    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY edgeMask:0];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY];
+        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY edgeMask:0];
     });
 }
 
 - (void)longPressAtX:(CGFloat)pixelX y:(CGFloat)pixelY durationMs:(NSInteger)ms {
     if (ms <= 0) ms = 500;
-    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY];
+    [self _sendPhase:kSTPhaseDown pixelX:pixelX pixelY:pixelY edgeMask:0];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY];
+        [self _sendPhase:kSTPhaseUp pixelX:pixelX pixelY:pixelY edgeMask:0];
     });
 }
 
 - (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms {
+    [self swipeFromX:x1 y:y1 toX:x2 y:y2 durationMs:ms edgeMask:0];
+}
+
+- (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms edgeMask:(uint32_t)edgeMask {
     if (ms <= 0) ms = 300;
-    NSInteger steps = MAX(ms / 16, 2);
-    [self _sendPhase:kSTPhaseDown pixelX:x1 pixelY:y1];
-    for (NSInteger i = 1; i <= steps; i++) {
-        CGFloat t = (CGFloat)i / (CGFloat)steps;
-        CGFloat cx = x1 + (x2 - x1) * t;
-        CGFloat cy = y1 + (y2 - y1) * t;
-        BOOL last = (i == steps);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, i * 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (last) {
-                [self _sendPhase:kSTPhaseUp pixelX:cx pixelY:cy];
-            } else {
-                [self _sendPhase:kSTPhaseMove pixelX:cx pixelY:cy];
-            }
-        });
+    STSwipeCmd cmd = {0};
+    cmd.phase = kSTPhaseSwipe;
+    cmd.x1 = (float)(x1 / _screenWPx);
+    cmd.y1 = (float)(y1 / _screenHPx);
+    cmd.x2 = (float)(x2 / _screenWPx);
+    cmd.y2 = (float)(y2 / _screenHPx);
+    cmd.duration_ms = (uint32_t)ms;
+    cmd.edge_mask = edgeMask;
+
+    int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG(@"open cmd file failed: %d", errno);
+        return;
     }
+    write(fd, &cmd, sizeof(cmd));
+    close(fd);
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+}
+
+- (void)homeGesture {
+    [self swipeFromX:_screenWPx * 0.5f y:_screenHPx * 0.985f
+                toX:_screenWPx * 0.5f y:_screenHPx * 0.86f
+         durationMs:150 edgeMask:0x1040000];
+}
+
+- (void)notificationCenter {
+    [self swipeFromX:_screenWPx * 0.5f y:_screenHPx * 0.015f
+                toX:_screenWPx * 0.5f y:_screenHPx * 0.4f
+         durationMs:200 edgeMask:0x2040000];
+}
+
+- (void)controlCenter {
+    [self swipeFromX:_screenWPx * 0.9f y:_screenHPx * 0.015f
+                toX:_screenWPx * 0.9f y:_screenHPx * 0.4f
+         durationMs:200 edgeMask:0x2040000];
+}
+
+- (void)appSwitcher {
+    [self swipeFromX:_screenWPx * 0.5f y:_screenHPx * 0.985f
+                toX:_screenWPx * 0.5f y:_screenHPx * 0.7f
+         durationMs:400 edgeMask:0x1040000];
 }
 
 @end

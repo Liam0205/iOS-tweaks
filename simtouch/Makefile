@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = SimTouch
 SimTouch_FILES = Tweak.x BackboardHook.x SocketServer.m ScreenCapture.m TouchInjector.m
-SimTouch_CFLAGS = -fobjc-arc
+SimTouch_CFLAGS = -fobjc-arc -Wno-arc-performSelector-leaks
 SimTouch_FRAMEWORKS = Foundation UIKit IOKit
 SimTouch_LIBRARIES = substrate
 ifeq ($(shell uname),Linux)

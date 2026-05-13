@@ -75,6 +75,10 @@ static void usage(void) {
         "  simtouch tap <x> <y>\n"
         "  simtouch swipe <x1> <y1> <x2> <y2> [ms]\n"
         "  simtouch longpress <x> <y> [ms]\n"
+        "  simtouch home\n"
+        "  simtouch notif\n"
+        "  simtouch cc\n"
+        "  simtouch switcher\n"
         "  simtouch record <start|stop|dump>\n"
         "  simtouch replay\n"
     );

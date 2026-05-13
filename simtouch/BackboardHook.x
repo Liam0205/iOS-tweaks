@@ -82,6 +82,7 @@ enum {
     kSTPhaseDown = 0,
     kSTPhaseMove = 1,
     kSTPhaseUp   = 2,
+    kSTPhaseSwipe = 3,
     kSTPhaseRecordStart = 0xF0,
     kSTPhaseRecordStop  = 0xF1,
     kSTPhaseReplay      = 0xF2,
@@ -100,7 +101,15 @@ typedef struct {
     uint8_t phase;
     float x;
     float y;
+    uint32_t edge_mask;
 } STTouchCmd;
+
+typedef struct {
+    uint8_t phase;
+    float x1, y1, x2, y2;
+    uint32_t duration_ms;
+    uint32_t edge_mask;
+} STSwipeCmd;
 #pragma pack(pop)
 
 #define ST_MAX_CHILDREN 5
@@ -134,7 +143,10 @@ static HandleFromSender_t orig_HandleFromSender = NULL;
 
 static void *_capturedSender = NULL;
 static IOHIDEventRef _capturedEvent = NULL;
+static IOHIDEventRef _capturedEdgeEvent = NULL;
 static uint64_t _capturedSenderID = 0;
+static void *_capturedC = NULL;
+static void *_capturedD = NULL;
 static BOOL _injecting = NO;
 
 static void hook_HandleFromSender(void *a, void *b, void *c, void *d) {
@@ -189,13 +201,28 @@ static void hook_HandleFromSender(void *a, void *b, void *c, void *d) {
                     _capturedSender = b;
                     CFRetain(b);
                     _capturedSenderID = IOHIDEventGetSenderID((IOHIDEventRef)a);
+                    _capturedC = c;
+                    _capturedD = d;
                     DIAG_NOTIFY("sender.captured");
                 }
-                // Capture a touch-down event (phase has Touch bit set)
                 int touchVal = IOHIDEventGetIntegerValue((IOHIDEventRef)a, kIOHIDEventFieldDigitizerTouch);
                 if (touchVal && !_capturedEvent) {
                     _capturedEvent = IOHIDEventCreateCopy(kCFAllocatorDefault, (IOHIDEventRef)a);
                     DIAG_NOTIFY("event.captured");
+                }
+            }
+        } @catch(...) {}
+    }
+
+    if (!_capturedEdgeEvent) {
+        @try {
+            int type = IOHIDEventGetType((IOHIDEventRef)a);
+            if (type == 11) {
+                uint32_t mask = IOHIDEventGetIntegerValue((IOHIDEventRef)a, kIOHIDEventFieldDigitizerEventMask);
+                int touchVal = IOHIDEventGetIntegerValue((IOHIDEventRef)a, kIOHIDEventFieldDigitizerTouch);
+                if (touchVal && (mask & 0x40000)) {
+                    _capturedEdgeEvent = IOHIDEventCreateCopy(kCFAllocatorDefault, (IOHIDEventRef)a);
+                    DIAG_NOTIFY("edge.captured");
                 }
             }
         } @catch(...) {}
@@ -235,13 +262,16 @@ static void setChildCoords(IOHIDEventRef event, float nx, float ny, BOOL touch, 
     }
 }
 
-static void dispatchTouch(uint8_t phase, float nx, float ny) {
-    if (!_capturedEvent || !_capturedSender || !orig_HandleFromSender) {
+static void dispatchTouch(uint8_t phase, float nx, float ny, uint32_t edgeMask) {
+    BOOL isEdge = (edgeMask != 0);
+    IOHIDEventRef tmpl = isEdge ? (_capturedEdgeEvent ?: _capturedEvent) : _capturedEvent;
+
+    if (!tmpl || !_capturedSender || !orig_HandleFromSender) {
         DIAG_NOTIFY("no.capture");
         return;
     }
 
-    IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, _capturedEvent);
+    IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, tmpl);
     if (!clone) {
         DIAG_NOTIFY("clone.fail");
         return;
@@ -249,34 +279,61 @@ static void dispatchTouch(uint8_t phase, float nx, float ny) {
 
     updateTimestamps(clone);
 
-    BOOL touch = (phase != kSTPhaseUp);
-    float pressure = touch ? 1.0f : 0.0f;
+    if (isEdge) {
+        // Minimal mutation: only update coordinates and touch state for up
+        IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerX, nx);
+        IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerY, ny);
 
-    uint32_t mask;
-    switch (phase) {
-        case kSTPhaseDown:
-            mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
-            IOHIDEventSetPhase(clone, kIOHIDEventPhaseBegan);
-            break;
-        case kSTPhaseMove:
-            mask = kIOHIDDigitizerEventPosition;
-            IOHIDEventSetPhase(clone, kIOHIDEventPhaseChanged);
-            break;
-        default:
-            mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
-                   kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
-            IOHIDEventSetPhase(clone, kIOHIDEventPhaseEnded);
-            break;
+        CFArrayRef children = IOHIDEventGetChildren(clone);
+        if (children && CFArrayGetCount(children) > 0) {
+            IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, 0);
+            IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerX, nx);
+            IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerY, ny);
+        }
+
+        if (phase == kSTPhaseUp) {
+            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, 0);
+            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, 0);
+            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask,
+                kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity);
+            if (children && CFArrayGetCount(children) > 0) {
+                IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, 0);
+                IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerTouch, 0);
+                IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerRange, 0);
+            }
+        }
+    } else {
+        BOOL touch = (phase != kSTPhaseUp);
+        float pressure = touch ? 1.0f : 0.0f;
+
+        uint32_t mask;
+        switch (phase) {
+            case kSTPhaseDown:
+                mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
+                       kIOHIDDigitizerEventIdentity;
+                IOHIDEventSetPhase(clone, kIOHIDEventPhaseBegan);
+                break;
+            case kSTPhaseMove:
+                mask = kIOHIDDigitizerEventPosition;
+                IOHIDEventSetPhase(clone, kIOHIDEventPhaseChanged);
+                break;
+            default:
+                mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
+                       kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
+                IOHIDEventSetPhase(clone, kIOHIDEventPhaseEnded);
+                break;
+        }
+
+        setChildCoords(clone, nx, ny, touch, pressure);
+        IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, mask);
+        IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
+        IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
     }
 
-    setChildCoords(clone, nx, ny, touch, pressure);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, mask);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
     IOHIDEventSetSenderID(clone, _capturedSenderID);
 
     _injecting = YES;
-    orig_HandleFromSender(clone, _capturedSender, NULL, NULL);
+    orig_HandleFromSender(clone, _capturedSender, _capturedC, _capturedD);
     _injecting = NO;
 
     CFRelease(clone);
@@ -285,20 +342,52 @@ static void dispatchTouch(uint8_t phase, float nx, float ny) {
 
 #pragma mark - Darwin Notification Handlers
 
+static void performSwipe(float x1, float y1, float x2, float y2,
+                         uint32_t durationMs, uint32_t edgeMask) {
+    if (durationMs == 0) durationMs = 300;
+    NSInteger steps = MAX((NSInteger)(durationMs / 16), 2);
+
+    dispatchTouch(kSTPhaseDown, x1, y1, edgeMask);
+
+    for (NSInteger i = 1; i <= steps; i++) {
+        float t = (float)i / (float)steps;
+        float cx = x1 + (x2 - x1) * t;
+        float cy = y1 + (y2 - y1) * t;
+        BOOL last = (i == steps);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)i * 16 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+                if (last) {
+                    dispatchTouch(kSTPhaseUp, cx, cy, edgeMask);
+                } else {
+                    dispatchTouch(kSTPhaseMove, cx, cy, edgeMask);
+                }
+            });
+    }
+}
+
 static void onTouchCommand(CFNotificationCenterRef center, void *observer,
                            CFStringRef name, const void *object, CFDictionaryRef info) {
     int fd = open(BB_CMD_PATH, O_RDONLY);
     if (fd < 0) return;
 
-    STTouchCmd cmd;
-    ssize_t n = read(fd, &cmd, sizeof(cmd));
+    uint8_t buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf));
     close(fd);
 
-    if (n < (ssize_t)sizeof(cmd)) return;
+    if (n < 1) return;
 
+    uint8_t phase = buf[0];
     CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
 
-    if (cmd.phase == kSTPhaseRecordStart) {
+    if (phase == kSTPhaseSwipe) {
+        if (n < (ssize_t)sizeof(STSwipeCmd)) return;
+        STSwipeCmd *sc = (STSwipeCmd *)buf;
+        performSwipe(sc->x1, sc->y1, sc->x2, sc->y2, sc->duration_ms, sc->edge_mask);
+        CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
+        return;
+    }
+
+    if (phase == kSTPhaseRecordStart) {
         if (_recording && _recordFd >= 0) { close(_recordFd); _recordFd = -1; }
         unlink(BB_RECORD_PATH);
         _recordFd = open(BB_RECORD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -314,7 +403,7 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    if (cmd.phase == kSTPhaseRecordStop) {
+    if (phase == kSTPhaseRecordStop) {
         _recording = NO;
         if (_recordFd >= 0) { close(_recordFd); _recordFd = -1; }
         DIAG_NOTIFY("record.stopped");
@@ -322,7 +411,7 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    if (cmd.phase == kSTPhaseReplay) {
+    if (phase == kSTPhaseReplay) {
         if (!_capturedEvent || !_capturedSender || !orig_HandleFromSender) {
             DIAG_NOTIFY("replay.no.capture");
             CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
@@ -383,7 +472,7 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
                         return;
                     }
 
-                    dispatchTouch(stPhase, e->x, e->y);
+                    dispatchTouch(stPhase, e->x, e->y, e->event_mask & 0xFFFF0000);
 
                     if (idx == total - 1) {
                         _replaying = NO;
@@ -394,7 +483,9 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    dispatchTouch(cmd.phase, cmd.x, cmd.y);
+    if (n < (ssize_t)sizeof(STTouchCmd)) return;
+    STTouchCmd *cmd = (STTouchCmd *)buf;
+    dispatchTouch(cmd->phase, cmd->x, cmd->y, cmd->edge_mask);
 
     CFNotificationCenterPostNotification(nc,
         CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
@@ -405,8 +496,13 @@ static void onPing(CFNotificationCenterRef center, void *observer,
     CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
 
     if (_capturedEvent) {
-        CFNotificationCenterPostNotification(nc,
-            CFSTR("page.0x01.simtouch.bb.state.captured"), NULL, NULL, true);
+        if (_capturedEdgeEvent) {
+            CFNotificationCenterPostNotification(nc,
+                CFSTR("page.0x01.simtouch.bb.state.captured+edge"), NULL, NULL, true);
+        } else {
+            CFNotificationCenterPostNotification(nc,
+                CFSTR("page.0x01.simtouch.bb.state.captured"), NULL, NULL, true);
+        }
     } else if (_capturedSender) {
         CFNotificationCenterPostNotification(nc,
             CFSTR("page.0x01.simtouch.bb.state.sender"), NULL, NULL, true);

@@ -27,6 +27,7 @@ typedef struct {
     uint8_t phase;
     float x;
     float y;
+    uint32_t edge_mask;
 } STTouchCmd;
 
 typedef struct {
@@ -276,6 +277,86 @@ static void registerCommands(void) {
             return r;
         }
         return @"ERR unknown subcommand (start|stop|dump)";
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"home" handler:^NSString *(NSArray<NSString *> *args) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id uiCtrl = [NSClassFromString(@"SBUIController") sharedInstance];
+            if ([uiCtrl respondsToSelector:@selector(handleHomeButtonSinglePressUp)]) {
+                [uiCtrl performSelector:@selector(handleHomeButtonSinglePressUp)];
+            } else if ([uiCtrl respondsToSelector:@selector(clickedMenuButton)]) {
+                [uiCtrl performSelector:@selector(clickedMenuButton)];
+            }
+        });
+        return @"OK springboard-api";
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"notif" handler:^NSString *(NSArray<NSString *> *args) {
+        __block NSString *result;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            id mgr = [NSClassFromString(@"SBCoverSheetPresentationManager") sharedInstance];
+            if (mgr) {
+                SEL sel = NSSelectorFromString(@"setCoverSheetPresented:animated:withCompletion:");
+                if ([mgr respondsToSelector:sel]) {
+                    NSMethodSignature *sig = [mgr methodSignatureForSelector:sel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setTarget:mgr];
+                    [inv setSelector:sel];
+                    BOOL yes = YES;
+                    id nilBlock = nil;
+                    [inv setArgument:&yes atIndex:2];
+                    [inv setArgument:&yes atIndex:3];
+                    [inv setArgument:&nilBlock atIndex:4];
+                    [inv invoke];
+                    result = @"OK notif presented";
+                    return;
+                }
+            }
+            id nc = [NSClassFromString(@"SBNotificationCenterController") sharedInstance];
+            if (nc && [nc respondsToSelector:@selector(presentAnimated:)]) {
+                [nc performSelector:@selector(presentAnimated:) withObject:@YES];
+                result = @"OK notif presented";
+                return;
+            }
+            result = @"ERR no notification center class found";
+        });
+        return result;
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"cc" handler:^NSString *(NSArray<NSString *> *args) {
+        __block NSString *result;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            id cc = [NSClassFromString(@"SBControlCenterController") sharedInstance];
+            if (cc && [cc respondsToSelector:@selector(presentAnimated:)]) {
+                [cc performSelector:@selector(presentAnimated:) withObject:@YES];
+                result = @"OK cc presented";
+            } else {
+                result = @"ERR no control center class found";
+            }
+        });
+        return result;
+    }];
+
+    [[STSocketServer sharedInstance] registerCommand:@"switcher" handler:^NSString *(NSArray<NSString *> *args) {
+        __block NSString *result;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            id switcher = [NSClassFromString(@"SBMainSwitcherViewController") sharedInstance];
+            if (!switcher) {
+                result = @"ERR class not found";
+                return;
+            }
+            SEL sel = NSSelectorFromString(@"toggleMainSwitcherNoninteractivelyWithSource:animated:");
+            if ([switcher respondsToSelector:sel]) {
+                [switcher performSelector:sel withObject:@(1) withObject:@YES];
+                result = @"OK switcher toggled";
+            } else if ([switcher respondsToSelector:@selector(toggleSwitcherNoninteractively)]) {
+                [switcher performSelector:@selector(toggleSwitcherNoninteractively)];
+                result = @"OK switcher toggled (legacy)";
+            } else {
+                result = @"ERR no known selector";
+            }
+        });
+        return result;
     }];
 
     [[STSocketServer sharedInstance] registerCommand:@"replay" handler:^NSString *(NSArray<NSString *> *args) {
