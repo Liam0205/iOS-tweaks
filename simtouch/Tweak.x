@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <string.h>
 #import "SocketServer.h"
 #import "ScreenCapture.h"
 #import "TouchInjector.h"
@@ -44,10 +45,17 @@ typedef struct {
         uint32_t phase;
     } children[ST_MAX_CHILDREN];
 } STRecordEntry;
+
+typedef struct {
+    uint8_t phase;      // 0xF0 (start) or 0xF2 (replay)
+    float speed;        // replay speed multiplier (1.0 = normal; only for 0xF2)
+    char name[32];      // recording name (null-terminated)
+} STRecordCmd;          // 37 bytes
 #pragma pack(pop)
 
 static NSTimeInterval g_maxAge = 3600.0;
 static unsigned long long g_maxSize = 50ULL * 1024 * 1024;
+static char g_currentRecordName[32] = {0};
 
 static BOOL readBoolPref(NSString *key, BOOL fallback) {
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:PREFS_DOMAIN];
@@ -77,7 +85,54 @@ static void onPrefsChanged(CFNotificationCenterRef center, void *observer,
     }
 }
 
+static void getRecordPath(const char *name, char *out, size_t outLen) {
+    if (!name || name[0] == '\0')
+        snprintf(out, outLen, "/tmp/simtouch-record.bin");
+    else
+        snprintf(out, outLen, "/tmp/simtouch-record-%s.bin", name);
+}
+
+static void onReplayGesture(CFNotificationCenterRef center, void *observer,
+                            CFStringRef name, const void *object, CFDictionaryRef info) {
+    NSString *n = (__bridge NSString *)name;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([n hasSuffix:@".home"]) {
+            id uiCtrl = [NSClassFromString(@"SBUIController") sharedInstance];
+            if ([uiCtrl respondsToSelector:@selector(handleHomeButtonSinglePressUp)])
+                [uiCtrl performSelector:@selector(handleHomeButtonSinglePressUp)];
+            else if ([uiCtrl respondsToSelector:@selector(clickedMenuButton)])
+                [uiCtrl performSelector:@selector(clickedMenuButton)];
+        } else if ([n hasSuffix:@".notif"]) {
+            id mgr = [NSClassFromString(@"SBCoverSheetPresentationManager") sharedInstance];
+            if (mgr) {
+                SEL sel = @selector(setCoverSheetPresented:animated:withCompletion:);
+                if ([mgr respondsToSelector:sel]) {
+                    NSMethodSignature *sig = [mgr methodSignatureForSelector:sel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setTarget:mgr];
+                    [inv setSelector:sel];
+                    BOOL yes = YES;
+                    id nilBlock = nil;
+                    [inv setArgument:&yes atIndex:2];
+                    [inv setArgument:&yes atIndex:3];
+                    [inv setArgument:&nilBlock atIndex:4];
+                    [inv invoke];
+                }
+            }
+        }
+    });
+}
+
 static void registerCommands(void) {
+    // Register replay gesture notification observers
+    CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
+    CFNotificationCenterAddObserver(nc, NULL, onReplayGesture,
+        CFSTR("page.0x01.simtouch.replay.home"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(nc, NULL, onReplayGesture,
+        CFSTR("page.0x01.simtouch.replay.notif"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+
     [[STSocketServer sharedInstance] registerCommand:@"info" handler:^NSString *(NSArray<NSString *> *args) {
         CGSize size = [UIScreen mainScreen].bounds.size;
         CGFloat scale = [UIScreen mainScreen].scale;
@@ -292,12 +347,29 @@ static void registerCommands(void) {
     }];
 
     [[STSocketServer sharedInstance] registerCommand:@"record" handler:^NSString *(NSArray<NSString *> *args) {
-        if (args.count < 1) return @"ERR usage: record <start|stop|dump>";
+        if (args.count < 1) return @"ERR usage: record <start [name]|stop|list|dump [name]|delete <name>>";
         NSString *sub = args[0];
 
-        if ([sub isEqualToString:@"start"] || [sub isEqualToString:@"stop"]) {
+        if ([sub isEqualToString:@"start"]) {
+            STRecordCmd cmd = {0};
+            cmd.phase = 0xF0;
+            cmd.speed = 1.0f;
+            memset(g_currentRecordName, 0, sizeof(g_currentRecordName));
+            if (args.count > 1) {
+                strncpy(cmd.name, [args[1] UTF8String], sizeof(cmd.name) - 1);
+                strncpy(g_currentRecordName, [args[1] UTF8String], sizeof(g_currentRecordName) - 1);
+            }
+            int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) return @"ERR open cmd file failed";
+            write(fd, &cmd, sizeof(cmd));
+            close(fd);
+            CFNotificationCenterPostNotification(
+                CFNotificationCenterGetDarwinNotifyCenter(),
+                CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+            return @"OK recording started";
+        } else if ([sub isEqualToString:@"stop"]) {
             STTouchCmd cmd = {0};
-            cmd.phase = [sub isEqualToString:@"start"] ? 0xF0 : 0xF1;
+            cmd.phase = 0xF1;
             int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) return @"ERR open cmd file failed";
             write(fd, &cmd, sizeof(cmd));
@@ -306,20 +378,58 @@ static void registerCommands(void) {
                 CFNotificationCenterGetDarwinNotifyCenter(),
                 CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
 
-            if ([sub isEqualToString:@"stop"]) {
-                usleep(200000);
-                NSData *data = [NSData dataWithContentsOfFile:@(BB_RECORD_PATH)];
-                size_t count = data.length / sizeof(STRecordEntry);
-                uint32_t duration = 0;
-                if (count > 0) {
-                    const STRecordEntry *entries = (const STRecordEntry *)data.bytes;
-                    duration = entries[count - 1].time_ms;
-                }
-                return [NSString stringWithFormat:@"OK stopped, %zu events, %ums", count, duration];
+            usleep(200000);
+            char stoppedPath[64];
+            getRecordPath(g_currentRecordName, stoppedPath, sizeof(stoppedPath));
+            NSData *data = [NSData dataWithContentsOfFile:@(stoppedPath)];
+            size_t count = data.length / sizeof(STRecordEntry);
+            uint32_t duration = 0;
+            if (count > 0) {
+                const STRecordEntry *entries = (const STRecordEntry *)data.bytes;
+                duration = entries[count - 1].time_ms;
             }
-            return @"OK recording started";
+            NSString *nameStr = g_currentRecordName[0] ? @(g_currentRecordName) : @"(default)";
+            memset(g_currentRecordName, 0, sizeof(g_currentRecordName));
+            return [NSString stringWithFormat:@"OK stopped %@, %zu events, %ums", nameStr, count, duration];
+        } else if ([sub isEqualToString:@"list"]) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSArray *files = [fm contentsOfDirectoryAtPath:@"/tmp" error:nil];
+            NSMutableString *r = [NSMutableString stringWithString:@"OK recordings:\n"];
+            NSUInteger found = 0;
+            for (NSString *f in files) {
+                if ([f hasPrefix:@"simtouch-record"] && [f hasSuffix:@".bin"]) {
+                    NSString *fullPath = [@"/tmp" stringByAppendingPathComponent:f];
+                    NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
+                    unsigned long long size = [attrs fileSize];
+                    size_t evCount = (size_t)(size / sizeof(STRecordEntry));
+                    // Extract name from filename
+                    NSString *name = @"(default)";
+                    if ([f hasPrefix:@"simtouch-record-"]) {
+                        name = [[f substringFromIndex:@"simtouch-record-".length] stringByDeletingPathExtension];
+                    }
+                    [r appendFormat:@"  %@ - %zu events, %llu bytes\n", name, evCount, size];
+                    found++;
+                }
+            }
+            if (found == 0) [r appendString:@"  (none)\n"];
+            return r;
+        } else if ([sub isEqualToString:@"delete"]) {
+            if (args.count < 2) return @"ERR usage: record delete <name>";
+            char path[64];
+            getRecordPath([args[1] UTF8String], path, sizeof(path));
+            if (unlink(path) == 0) {
+                return [NSString stringWithFormat:@"OK deleted %s", path];
+            } else {
+                return [NSString stringWithFormat:@"ERR file not found: %s", path];
+            }
         } else if ([sub isEqualToString:@"dump"]) {
-            NSData *data = [NSData dataWithContentsOfFile:@(BB_RECORD_PATH)];
+            char path[64];
+            if (args.count > 1) {
+                getRecordPath([args[1] UTF8String], path, sizeof(path));
+            } else {
+                getRecordPath("", path, sizeof(path));
+            }
+            NSData *data = [NSData dataWithContentsOfFile:@(path)];
             if (!data || data.length == 0) return @"ERR no recording";
             size_t count = data.length / sizeof(STRecordEntry);
             const STRecordEntry *entries = (const STRecordEntry *)data.bytes;
@@ -356,7 +466,7 @@ static void registerCommands(void) {
             if (count > 200) [r appendFormat:@"... (%zu more events)\n", count - 200];
             return r;
         }
-        return @"ERR unknown subcommand (start|stop|dump)";
+        return @"ERR unknown subcommand (start|stop|list|dump|delete)";
     }];
 
     [[STSocketServer sharedInstance] registerCommand:@"home" handler:^NSString *(NSArray<NSString *> *args) {
@@ -443,14 +553,38 @@ static void registerCommands(void) {
         if (![[STTouchInjector sharedInstance] isUserDeviceReady]) {
             return @"ERR backboardd not connected";
         }
-        NSData *data = [NSData dataWithContentsOfFile:@(BB_RECORD_PATH)];
-        if (!data || data.length == 0) return @"ERR no recording";
+
+        char recName[32] = {0};
+        float speed = 1.0f;
+        if (args.count > 0 && ![args[0] hasPrefix:@"0"] && [args[0] floatValue] == 0) {
+            // First arg is a name (not a number)
+            strncpy(recName, [args[0] UTF8String], sizeof(recName) - 1);
+            if (args.count > 1) speed = [args[1] floatValue];
+        } else if (args.count > 0) {
+            // First arg might be speed (number) or name
+            float val = [args[0] floatValue];
+            if (val > 0) {
+                speed = val;
+            } else {
+                strncpy(recName, [args[0] UTF8String], sizeof(recName) - 1);
+                if (args.count > 1) speed = [args[1] floatValue];
+            }
+        }
+        if (speed <= 0) speed = 1.0f;
+
+        char recPath[64];
+        getRecordPath(recName, recPath, sizeof(recPath));
+
+        NSData *data = [NSData dataWithContentsOfFile:@(recPath)];
+        if (!data || data.length == 0) return [NSString stringWithFormat:@"ERR no recording at %s", recPath];
         size_t count = data.length / sizeof(STRecordEntry);
         const STRecordEntry *entries = (const STRecordEntry *)data.bytes;
         uint32_t duration = count > 1 ? entries[count - 1].time_ms - entries[0].time_ms : 0;
 
-        STTouchCmd cmd = {0};
+        STRecordCmd cmd = {0};
         cmd.phase = 0xF2;
+        cmd.speed = speed;
+        strncpy(cmd.name, recName, sizeof(cmd.name) - 1);
         int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return @"ERR open cmd file failed";
         write(fd, &cmd, sizeof(cmd));
@@ -459,7 +593,7 @@ static void registerCommands(void) {
             CFNotificationCenterGetDarwinNotifyCenter(),
             CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
 
-        return [NSString stringWithFormat:@"OK replaying %zu events over %ums", count, duration];
+        return [NSString stringWithFormat:@"OK replaying %zu events over %ums (speed=%.1fx)", count, (uint32_t)(duration / speed), speed];
     }];
 
 }

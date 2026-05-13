@@ -75,8 +75,8 @@ screenshot [path]                   # 截图（默认 /var/jb/tmp/simtouch/scree
 info                                # 屏幕尺寸、scale、backboardd 连接状态
 bbstatus                            # ping backboardd 并返回 hook 状态
 diag                                # 列出可用的 IOHIDEvent API 和 UIKit 内部类
-record <start|stop|dump>            # 录制/停止/导出 backboardd 侧触摸事件
-replay                              # 回放上次录制的事件序列
+record <start [name]|stop|list|dump [name]|delete <name>>  # 多录制管理
+replay [name] [speed]               # 回放（可指定录制名 + 速度倍率）
 enable                              # 运行时启用（CLI 直接写偏好 + Darwin 通知）
 disable                             # 运行时禁用（CLI 直接写偏好 + Darwin 通知）
 
@@ -87,8 +87,9 @@ OK springboard-api                  # home/系统手势响应
 OK cc presented                     # cc 响应
 OK notif presented                  # notif 响应
 OK switcher toggled                 # switcher 响应
-OK stopped, 42 events, 1234ms       # record stop 响应
-OK replaying 42 events over 1234ms  # replay 响应
+OK stopped test1, 42 events, 1234ms  # record stop 响应（含名称）
+OK replaying 42 events over 1234ms (speed=2.0x)  # replay 响应
+OK recordings:\n  test1 - 42 events, 6426 bytes  # record list 响应
 ERR no senderID                     # backboardd 未捕获事件
 ERR invalid command                 # 解析失败
 ```
@@ -225,9 +226,19 @@ swipe(x1, y1, x2, y2, ms):
 ### 4. 录制/回放引擎
 
 **录制**（在 backboardd 的 hook 中内联执行）：
-- 拦截所有 digitizer type=11 事件，记录到 `/tmp/simtouch-record.bin`
+- 拦截所有 digitizer type=11 事件，记录到命名文件
+- 文件路径：`/tmp/simtouch-record-<name>.bin`（无名称则 `/tmp/simtouch-record.bin`）
 - 录制时不录制注入的合成事件（`_injecting` 标志）
 - 时间戳用 `mach_absolute_time()` 相对值，精度到毫秒
+
+**多录制管理**：
+```
+record start [name]    → 开始录制到命名文件
+record stop            → 停止当前录制
+record list            → 列出所有录制（名称 + 事件数 + 文件大小）
+record dump [name]     → 导出事件详情（最多 200 条）
+record delete <name>   → 删除指定录制文件
+```
 
 **录制格式**：
 ```c
@@ -248,16 +259,26 @@ typedef struct {
 } STRecordEntry;  // 153 bytes packed
 ```
 
-**边缘手势 mask 位**（从真实事件录制中发现，仅诊断参考）：
+**录制/回放 IPC**：
+```c
+typedef struct {
+    uint8_t phase;      // 0xF0 (start) or 0xF2 (replay)
+    float speed;        // 回放速度倍率（1.0 = 原速）
+    char name[32];      // 录制名称
+} STRecordCmd;          // 37 bytes
+```
+
+**边缘手势 mask 位**（从真实事件录制中发现）：
 - `0x40000`（bit 18）= 通用边缘手势标志
 - `0x1000000`（bit 24）= 底部边缘（Home 手势）
 - `0x2000000`（bit 25）= 顶部边缘（通知中心）
-- 注意：这些 mask 值不能用于注入系统手势（arbiter 验证投递路径，见"系统手势"节）
 
 **回放**：
-- 主线程 `dispatch_after` 调度（按录制时间戳间隔）
+- 主线程 `dispatch_after` 调度（按录制时间戳间隔 ÷ 速度倍率）
 - 使用 `dispatchTouch()` 路径注入（与 tap 相同路径）
 - 录制数据中的 touch/range 字段用于推断 phase 状态转换
+- **速度控制**：`replay [name] [speed]`，delay = 原始间隔 / speed
+- **边缘手势智能替换**：检测 `event_mask & 0x40000`，跳过触摸注入，改为发送 Darwin notification 给 SpringBoard 调用系统手势 API（home/notif）
 
 **文件路径约束**：
 - 录制文件必须写到 `/tmp/`（→ `/private/var/tmp/`），不能写到 `/var/jb/tmp/`
@@ -367,6 +388,12 @@ Phase 2: 计算剩余文件总体积
   simtouch switcher                     # 打开任务切换器
   simtouch screenshot [output_path]
   simtouch info
+  simtouch record start [name]          # 开始命名录制
+  simtouch record stop                  # 停止录制
+  simtouch record list                  # 列出所有录制
+  simtouch record dump [name]           # 导出事件详情
+  simtouch record delete <name>         # 删除录制
+  simtouch replay [name] [speed]        # 回放（可指定名称 + 速度倍率）
 
 通过 SSH 远程调用：
   ssh -p 2215 mobile@localhost "simtouch tap 200 400"
@@ -491,6 +518,15 @@ hook _BKHandleIOHIDEventFromSender
 - **已验证**：pinch zoom in/out 在高德地图
 - **关键发现**：多指触摸必须从零创建事件（type=Hand），不能克隆单指模板
 - **部署要求**：更新 backboardd hook 需 `killall backboardd`，sbreload 不够
+
+### Phase 4：录制回放增强 ✅ 已完成
+- 多录制管理（命名录制、列表、删除）
+- 回放速度控制（任意倍率）
+- 边缘手势智能替换（回放时检测 edge mask → 调用 SpringBoard API）
+- **已验证**：命名录制文件创建/删除/列表
+- **已验证**：速度倍率计算正确（2x=半时长, 0.5x=倍时长）
+- **已验证**：录制中 Home 手势回放时自动触发 SpringBoard home API
+- **未实现（记录供后续）**：多指手势录制回放（需要在回放时重建 Hand+Finger 事件结构）
 
 ## 兼容性
 

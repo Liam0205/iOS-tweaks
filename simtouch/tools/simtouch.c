@@ -83,8 +83,8 @@ static void usage(void) {
         "  simtouch notif\n"
         "  simtouch cc\n"
         "  simtouch switcher\n"
-        "  simtouch record <start|stop|dump>\n"
-        "  simtouch replay\n"
+        "  simtouch record <start [name]|stop|list|dump [name]|delete <name>>\n"
+        "  simtouch replay [name] [speed]\n"
     );
 }
 

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <substrate.h>
 
 #pragma mark - IOHIDEvent Private API
@@ -140,6 +141,12 @@ typedef struct {
     float scale;         // >1 = zoom in, <1 = zoom out
     uint32_t duration_ms;
 } STPinchCmd;
+
+typedef struct {
+    uint8_t phase;      // 0xF0 (start) or 0xF2 (replay)
+    float speed;        // replay speed multiplier (1.0 = normal; only for 0xF2)
+    char name[32];      // recording name (null-terminated)
+} STRecordCmd;          // 37 bytes
 #pragma pack(pop)
 
 #define ST_MAX_CHILDREN 5
@@ -165,6 +172,14 @@ static BOOL _recording = NO;
 static BOOL _replaying = NO;
 static uint64_t _recordStartMach = 0;
 static int _recordFd = -1;
+static char _currentRecordPath[64] = {0};
+
+static void getRecordPath(const char *name, char *out, size_t outLen) {
+    if (!name || name[0] == '\0')
+        snprintf(out, outLen, "/tmp/simtouch-record.bin");
+    else
+        snprintf(out, outLen, "/tmp/simtouch-record-%s.bin", name);
+}
 
 #pragma mark - Hook _BKHandleIOHIDEventFromSender
 
@@ -581,8 +596,14 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
 
     if (phase == kSTPhaseRecordStart) {
         if (_recording && _recordFd >= 0) { close(_recordFd); _recordFd = -1; }
-        unlink(BB_RECORD_PATH);
-        _recordFd = open(BB_RECORD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        char recName[32] = {0};
+        if (n >= (ssize_t)sizeof(STRecordCmd)) {
+            STRecordCmd *rc = (STRecordCmd *)buf;
+            strncpy(recName, rc->name, sizeof(recName) - 1);
+        }
+        getRecordPath(recName, _currentRecordPath, sizeof(_currentRecordPath));
+        unlink(_currentRecordPath);
+        _recordFd = open(_currentRecordPath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (_recordFd < 0) {
             DIAG_NOTIFY("record.open.fail");
             CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
@@ -598,6 +619,7 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
     if (phase == kSTPhaseRecordStop) {
         _recording = NO;
         if (_recordFd >= 0) { close(_recordFd); _recordFd = -1; }
+        _currentRecordPath[0] = '\0';
         DIAG_NOTIFY("record.stopped");
         CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
         return;
@@ -619,7 +641,19 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
             if (_recordFd >= 0) { close(_recordFd); _recordFd = -1; }
         }
 
-        int rfd = open(BB_RECORD_PATH, O_RDONLY);
+        char replayName[32] = {0};
+        float speed = 1.0f;
+        if (n >= (ssize_t)sizeof(STRecordCmd)) {
+            STRecordCmd *rc = (STRecordCmd *)buf;
+            strncpy(replayName, rc->name, sizeof(replayName) - 1);
+            speed = rc->speed;
+        }
+        if (speed <= 0.0f) speed = 1.0f;
+
+        char replayPath[64];
+        getRecordPath(replayName, replayPath, sizeof(replayPath));
+
+        int rfd = open(replayPath, O_RDONLY);
         if (rfd < 0) { DIAG_NOTIFY("replay.no.file"); CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true); return; }
 
         off_t fileSize = lseek(rfd, 0, SEEK_END);
@@ -639,14 +673,34 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         NSData *recordData = [NSData dataWithBytesNoCopy:entries length:fileSize freeWhenDone:YES];
         const STRecordEntry *ep = (const STRecordEntry *)recordData.bytes;
         uint32_t baseTime = ep[0].time_ms;
+        __block BOOL edgeGestureActive = NO;
 
         for (size_t i = 0; i < count; i++) {
-            uint32_t delay = ep[i].time_ms - baseTime;
+            uint32_t delay = (uint32_t)((ep[i].time_ms - baseTime) / speed);
             NSUInteger idx = i;
             NSUInteger total = count;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay * NSEC_PER_MSEC),
                 dispatch_get_main_queue(), ^{
                     const STRecordEntry *e = &((const STRecordEntry *)recordData.bytes)[idx];
+
+                    // Feature A: Edge gesture detection & smart replacement
+                    if (e->event_mask & 0x40000) {
+                        if (!edgeGestureActive) {
+                            edgeGestureActive = YES;
+                            CFNotificationCenterRef dnc = CFNotificationCenterGetDarwinNotifyCenter();
+                            if (e->event_mask & 0x1000000) {
+                                CFNotificationCenterPostNotification(dnc,
+                                    CFSTR("page.0x01.simtouch.replay.home"), NULL, NULL, true);
+                            } else if (e->event_mask & 0x2000000) {
+                                CFNotificationCenterPostNotification(dnc,
+                                    CFSTR("page.0x01.simtouch.replay.notif"), NULL, NULL, true);
+                            }
+                        }
+                        if (idx == total - 1) { _replaying = NO; DIAG_NOTIFY("replay.done"); }
+                        return;
+                    } else {
+                        edgeGestureActive = NO;
+                    }
 
                     uint8_t stPhase;
                     BOOL prevTouch = (idx > 0) ?
