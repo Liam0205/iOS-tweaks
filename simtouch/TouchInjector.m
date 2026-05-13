@@ -25,6 +25,7 @@ enum {
     kSTPhaseMove = 1,
     kSTPhaseUp   = 2,
     kSTPhaseSwipe = 3,
+    kSTPhaseKeyboard = 4,
 };
 
 enum {
@@ -51,6 +52,15 @@ typedef struct {
     uint8_t curve_type;
     float bz_x1, bz_y1, bz_x2, bz_y2;
 } STSwipeCmd;
+
+typedef struct {
+    uint8_t phase;
+    uint8_t key_count;
+    struct {
+        uint16_t usage;
+        uint8_t down;
+    } keys[8];
+} STKeyCmd;
 #pragma pack(pop)
 
 @implementation STTouchInjector {
@@ -209,6 +219,53 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
         LOG(@"open cmd file failed: %d", errno);
         return;
     }
+    write(fd, &cmd, sizeof(cmd));
+    close(fd);
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+}
+
+- (void)sendKeyUsage:(uint16_t)usage {
+    STKeyCmd cmd = {0};
+    cmd.phase = kSTPhaseKeyboard;
+    cmd.key_count = 2;
+    cmd.keys[0].usage = usage;
+    cmd.keys[0].down = 1;
+    cmd.keys[1].usage = usage;
+    cmd.keys[1].down = 0;
+
+    int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, &cmd, sizeof(cmd));
+    close(fd);
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+}
+
+- (void)sendKeyCombination:(NSArray<NSNumber *> *)usages {
+    if (usages.count == 0 || usages.count > 4) return;
+
+    STKeyCmd cmd = {0};
+    cmd.phase = kSTPhaseKeyboard;
+    uint8_t idx = 0;
+    for (NSNumber *u in usages) {
+        cmd.keys[idx].usage = [u unsignedShortValue];
+        cmd.keys[idx].down = 1;
+        idx++;
+    }
+    for (NSInteger i = usages.count - 1; i >= 0; i--) {
+        cmd.keys[idx].usage = [usages[i] unsignedShortValue];
+        cmd.keys[idx].down = 0;
+        idx++;
+    }
+    cmd.key_count = idx;
+
+    int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
     write(fd, &cmd, sizeof(cmd));
     close(fd);
 

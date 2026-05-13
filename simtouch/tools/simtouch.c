@@ -76,6 +76,8 @@ static void usage(void) {
         "  simtouch swipe <x1> <y1> <x2> <y2> [ms] [curve]\n"
         "    curves: linear, easein, easeout, easeinout, bezier:cx1,cy1,cx2,cy2\n"
         "  simtouch longpress <x> <y> [ms]\n"
+        "  simtouch keyinput <key>          (enter/tab/backspace/esc/space/delete/up/down/left/right/a-z/0-9)\n"
+        "  simtouch keyinput text <string>  (paste via clipboard)\n"
         "  simtouch home\n"
         "  simtouch notif\n"
         "  simtouch cc\n"

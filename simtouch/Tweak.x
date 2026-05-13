@@ -231,6 +231,53 @@ static void registerCommands(void) {
         return [NSString stringWithFormat:@"OK bb=%s", ti.isUserDeviceReady ? "connected" : "disconnected"];
     }];
 
+    [[STSocketServer sharedInstance] registerCommand:@"keyinput" handler:^NSString *(NSArray<NSString *> *args) {
+        if (args.count < 1) return @"ERR usage: keyinput <key>|text <string>";
+        STTouchInjector *ti = [STTouchInjector sharedInstance];
+        NSString *sub = args[0];
+
+        if ([sub isEqualToString:@"text"]) {
+            if (args.count < 2) return @"ERR usage: keyinput text <string>";
+            NSMutableString *text = [NSMutableString string];
+            for (NSUInteger i = 1; i < args.count; i++) {
+                if (i > 1) [text appendString:@" "];
+                [text appendString:args[i]];
+            }
+            [UIPasteboard generalPasteboard].string = text;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [ti sendKeyCombination:@[@(0xE3), @(0x19)]];
+            });
+            return [NSString stringWithFormat:@"OK pasted %lu chars", (unsigned long)text.length];
+        }
+
+        // HID usage codes (USB HID Keyboard page 0x07)
+        uint16_t usage = 0;
+        if ([sub isEqualToString:@"enter"] || [sub isEqualToString:@"return"]) usage = 0x28;
+        else if ([sub isEqualToString:@"tab"]) usage = 0x2B;
+        else if ([sub isEqualToString:@"backspace"]) usage = 0x2A;
+        else if ([sub isEqualToString:@"escape"] || [sub isEqualToString:@"esc"]) usage = 0x29;
+        else if ([sub isEqualToString:@"space"]) usage = 0x2C;
+        else if ([sub isEqualToString:@"delete"]) usage = 0x4C;
+        else if ([sub isEqualToString:@"up"]) usage = 0x52;
+        else if ([sub isEqualToString:@"down"]) usage = 0x51;
+        else if ([sub isEqualToString:@"left"]) usage = 0x50;
+        else if ([sub isEqualToString:@"right"]) usage = 0x4F;
+        else if ([sub isEqualToString:@"home_key"]) usage = 0x4A;
+        else if ([sub isEqualToString:@"end"]) usage = 0x4D;
+        else if (sub.length == 1) {
+            unichar c = [sub characterAtIndex:0];
+            if (c >= 'a' && c <= 'z') usage = 0x04 + (c - 'a');
+            else if (c >= 'A' && c <= 'Z') usage = 0x04 + (c - 'A');
+            else if (c >= '1' && c <= '9') usage = 0x1E + (c - '1');
+            else if (c == '0') usage = 0x27;
+        }
+
+        if (usage == 0) return [NSString stringWithFormat:@"ERR unknown key: %@", sub];
+
+        dispatch_async(dispatch_get_main_queue(), ^{ [ti sendKeyUsage:usage]; });
+        return @"OK key sent";
+    }];
+
     [[STSocketServer sharedInstance] registerCommand:@"record" handler:^NSString *(NSArray<NSString *> *args) {
         if (args.count < 1) return @"ERR usage: record <start|stop|dump>";
         NSString *sub = args[0];

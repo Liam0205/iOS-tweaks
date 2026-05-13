@@ -63,6 +63,8 @@ extern IOHIDEventRef IOHIDEventCreateCopy(CFAllocatorRef, IOHIDEventRef);
 extern CFArrayRef IOHIDEventGetChildren(IOHIDEventRef);
 extern void IOHIDEventSetPhase(IOHIDEventRef, uint32_t);
 extern uint32_t IOHIDEventGetPhase(IOHIDEventRef);
+extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef, uint64_t,
+    uint32_t usagePage, uint32_t usage, Boolean down, uint32_t flags);
 
 extern void IOHIDEventSetTimeStamp(IOHIDEventRef, uint64_t);
 
@@ -83,6 +85,7 @@ enum {
     kSTPhaseMove = 1,
     kSTPhaseUp   = 2,
     kSTPhaseSwipe = 3,
+    kSTPhaseKeyboard = 4,
     kSTPhaseRecordStart = 0xF0,
     kSTPhaseRecordStop  = 0xF1,
     kSTPhaseReplay      = 0xF2,
@@ -120,6 +123,15 @@ typedef struct {
     uint8_t curve_type;
     float bz_x1, bz_y1, bz_x2, bz_y2;
 } STSwipeCmd;
+
+typedef struct {
+    uint8_t phase;         // = kSTPhaseKeyboard (4)
+    uint8_t key_count;     // number of key events in sequence
+    struct {
+        uint16_t usage;    // HID usage code
+        uint8_t down;      // 1=down, 0=up
+    } keys[8];
+} STKeyCmd;
 #pragma pack(pop)
 
 #define ST_MAX_CHILDREN 5
@@ -342,6 +354,38 @@ static float applyEasing(float t, uint8_t curveType, float bx1, float by1, float
     }
 }
 
+#pragma mark - Keyboard Event Injection
+
+static void dispatchKeyEvent(uint16_t usage, BOOL down) {
+    if (!_capturedSender || !orig_HandleFromSender) return;
+
+    IOHIDEventRef event = IOHIDEventCreateKeyboardEvent(
+        kCFAllocatorDefault, mach_absolute_time(),
+        0x07, usage, down, 0);
+    if (!event) return;
+
+    IOHIDEventSetSenderID(event, _capturedSenderID);
+    IOHIDEventSetIntegerValue(event, kIOHIDEventFieldIsBuiltIn, 1);
+
+    _injecting = YES;
+    orig_HandleFromSender(event, _capturedSender, _capturedC, _capturedD);
+    _injecting = NO;
+
+    CFRelease(event);
+}
+
+static void performKeySequence(STKeyCmd *kc) {
+    for (uint8_t i = 0; i < kc->key_count && i < 8; i++) {
+        uint32_t delay = i * 10;
+        uint16_t usage = kc->keys[i].usage;
+        BOOL down = kc->keys[i].down;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+                dispatchKeyEvent(usage, down);
+            });
+    }
+}
+
 #pragma mark - Darwin Notification Handlers
 
 static void performSwipe(STSwipeCmd *sc) {
@@ -390,6 +434,14 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         if (n < (ssize_t)sizeof(STSwipeCmd)) return;
         STSwipeCmd *sc = (STSwipeCmd *)buf;
         performSwipe(sc);
+        CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
+        return;
+    }
+
+    if (phase == kSTPhaseKeyboard) {
+        if (n < 2) return;
+        STKeyCmd *kc = (STKeyCmd *)buf;
+        performKeySequence(kc);
         CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
         return;
     }

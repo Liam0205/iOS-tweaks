@@ -12,4 +12,6 @@
         durationMs:(NSInteger)ms curveType:(uint8_t)curve
             bz_x1:(float)bx1 bz_y1:(float)by1 bz_x2:(float)bx2 bz_y2:(float)by2;
 - (void)longPressAtX:(CGFloat)pixelX y:(CGFloat)pixelY durationMs:(NSInteger)ms;
+- (void)sendKeyUsage:(uint16_t)usage;
+- (void)sendKeyCombination:(NSArray<NSNumber *> *)usages;
 @end
