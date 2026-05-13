@@ -78,6 +78,7 @@ static void usage(void) {
         "  simtouch longpress <x> <y> [ms]\n"
         "  simtouch keyinput <key>          (enter/tab/backspace/esc/space/delete/up/down/left/right/a-z/0-9)\n"
         "  simtouch keyinput text <string>  (paste via clipboard)\n"
+        "  simtouch pinch <cx> <cy> <scale> [ms]  (scale>1 zoom in, <1 zoom out)\n"
         "  simtouch home\n"
         "  simtouch notif\n"
         "  simtouch cc\n"

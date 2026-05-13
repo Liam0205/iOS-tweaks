@@ -14,4 +14,5 @@
 - (void)longPressAtX:(CGFloat)pixelX y:(CGFloat)pixelY durationMs:(NSInteger)ms;
 - (void)sendKeyUsage:(uint16_t)usage;
 - (void)sendKeyCombination:(NSArray<NSNumber *> *)usages;
+- (void)pinchAtX:(CGFloat)pixelX y:(CGFloat)pixelY scale:(float)scale durationMs:(NSInteger)ms;
 @end

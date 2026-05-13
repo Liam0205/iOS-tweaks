@@ -278,6 +278,19 @@ static void registerCommands(void) {
         return @"OK key sent";
     }];
 
+    [[STSocketServer sharedInstance] registerCommand:@"pinch" handler:^NSString *(NSArray<NSString *> *args) {
+        if (args.count < 3) return @"ERR usage: pinch <cx> <cy> <scale> [ms]";
+        STTouchInjector *ti = [STTouchInjector sharedInstance];
+        CGFloat cx = [args[0] floatValue];
+        CGFloat cy = [args[1] floatValue];
+        float scale = [args[2] floatValue];
+        NSInteger ms = args.count > 3 ? [args[3] integerValue] : 300;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ti pinchAtX:cx y:cy scale:scale durationMs:ms];
+        });
+        return [NSString stringWithFormat:@"OK bb=%s", ti.isUserDeviceReady ? "connected" : "disconnected"];
+    }];
+
     [[STSocketServer sharedInstance] registerCommand:@"record" handler:^NSString *(NSArray<NSString *> *args) {
         if (args.count < 1) return @"ERR usage: record <start|stop|dump>";
         NSString *sub = args[0];

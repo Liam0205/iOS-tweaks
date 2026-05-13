@@ -26,6 +26,7 @@ enum {
     kSTPhaseUp   = 2,
     kSTPhaseSwipe = 3,
     kSTPhaseKeyboard = 4,
+    kSTPhasePinch = 5,
 };
 
 enum {
@@ -61,6 +62,13 @@ typedef struct {
         uint8_t down;
     } keys[8];
 } STKeyCmd;
+
+typedef struct {
+    uint8_t phase;
+    float cx, cy;
+    float scale;
+    uint32_t duration_ms;
+} STPinchCmd;
 #pragma pack(pop)
 
 @implementation STTouchInjector {
@@ -263,6 +271,25 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
         idx++;
     }
     cmd.key_count = idx;
+
+    int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, &cmd, sizeof(cmd));
+    close(fd);
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(BB_CMD_NOTIFY), NULL, NULL, true);
+}
+
+- (void)pinchAtX:(CGFloat)pixelX y:(CGFloat)pixelY scale:(float)scale durationMs:(NSInteger)ms {
+    if (ms <= 0) ms = 300;
+    STPinchCmd cmd = {0};
+    cmd.phase = kSTPhasePinch;
+    cmd.cx = (float)(pixelX / _screenWPx);
+    cmd.cy = (float)(pixelY / _screenHPx);
+    cmd.scale = scale;
+    cmd.duration_ms = (uint32_t)ms;
 
     int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return;

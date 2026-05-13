@@ -86,6 +86,7 @@ enum {
     kSTPhaseUp   = 2,
     kSTPhaseSwipe = 3,
     kSTPhaseKeyboard = 4,
+    kSTPhasePinch = 5,
     kSTPhaseRecordStart = 0xF0,
     kSTPhaseRecordStop  = 0xF1,
     kSTPhaseReplay      = 0xF2,
@@ -132,6 +133,13 @@ typedef struct {
         uint8_t down;      // 1=down, 0=up
     } keys[8];
 } STKeyCmd;
+
+typedef struct {
+    uint8_t phase;       // = kSTPhasePinch (5)
+    float cx, cy;        // center point (normalized)
+    float scale;         // >1 = zoom in, <1 = zoom out
+    uint32_t duration_ms;
+} STPinchCmd;
 #pragma pack(pop)
 
 #define ST_MAX_CHILDREN 5
@@ -386,6 +394,124 @@ static void performKeySequence(STKeyCmd *kc) {
     }
 }
 
+#pragma mark - Multi-touch (Pinch)
+
+static void dispatchTwoFingerTouch(uint8_t phase, float x1, float y1, float x2, float y2) {
+    if (!_capturedEvent || !_capturedSender || !orig_HandleFromSender) {
+        DIAG_NOTIFY("no.capture");
+        return;
+    }
+
+    IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, _capturedEvent);
+    if (!clone) return;
+
+    updateTimestamps(clone);
+
+    BOOL touch = (phase != kSTPhaseUp);
+    float pressure = touch ? 1.0f : 0.0f;
+
+    uint32_t mask;
+    uint32_t hidPhase;
+    switch (phase) {
+        case kSTPhaseDown:
+            mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
+            hidPhase = kIOHIDEventPhaseBegan;
+            break;
+        case kSTPhaseMove:
+            mask = kIOHIDDigitizerEventPosition;
+            hidPhase = kIOHIDEventPhaseChanged;
+            break;
+        default:
+            mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
+                   kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
+            hidPhase = kIOHIDEventPhaseEnded;
+            break;
+    }
+
+    float midX = (x1 + x2) / 2.0f;
+    float midY = (y1 + y2) / 2.0f;
+    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerX, midX);
+    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerY, midY);
+    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, mask);
+    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
+    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
+    IOHIDEventSetPhase(clone, hidPhase);
+
+    CFArrayRef children = IOHIDEventGetChildren(clone);
+    if (children && CFArrayGetCount(children) > 0) {
+        IOHIDEventRef child0 = (IOHIDEventRef)CFArrayGetValueAtIndex(children, 0);
+        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerX, x1);
+        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerY, y1);
+        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerTipPressure, pressure);
+        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
+        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
+        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerEventMask, mask);
+        IOHIDEventSetPhase(child0, hidPhase);
+        IOHIDEventSetTimeStamp(child0, mach_absolute_time());
+    }
+
+    uint64_t ts = mach_absolute_time();
+    IOHIDEventRef finger2 = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, ts,
+        1, 2, mask,
+        x2, y2, 0,
+        pressure, 0,
+        touch, touch, 0);
+    if (finger2) {
+        IOHIDEventSetPhase(finger2, hidPhase);
+        IOHIDEventAppendEvent(clone, finger2);
+        CFRelease(finger2);
+    }
+
+    IOHIDEventSetSenderID(clone, _capturedSenderID);
+    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerCollection, 1);
+
+    _injecting = YES;
+    orig_HandleFromSender(clone, _capturedSender, _capturedC, _capturedD);
+    _injecting = NO;
+
+    CFRelease(clone);
+}
+
+static void performPinch(STPinchCmd *pc) {
+    uint32_t durationMs = pc->duration_ms;
+    if (durationMs == 0) durationMs = 300;
+    NSInteger steps = MAX((NSInteger)(durationMs / 16), 2);
+
+    float cx = pc->cx, cy = pc->cy;
+    float scale = pc->scale;
+    float baseOffset = 0.06f;
+
+    float startOff, endOff;
+    if (scale > 1.0f) {
+        startOff = baseOffset;
+        endOff = baseOffset * scale;
+    } else {
+        startOff = baseOffset;
+        endOff = baseOffset * scale;
+    }
+
+    float fx1 = cx - startOff, fy1 = cy;
+    float fx2 = cx + startOff, fy2 = cy;
+    dispatchTwoFingerTouch(kSTPhaseDown, fx1, fy1, fx2, fy2);
+
+    for (NSInteger i = 1; i <= steps; i++) {
+        float t = (float)i / (float)steps;
+        float off = startOff + (endOff - startOff) * t;
+        float mx1 = cx - off, my1 = cy;
+        float mx2 = cx + off, my2 = cy;
+        BOOL last = (i == steps);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)i * 16 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+                if (last) {
+                    dispatchTwoFingerTouch(kSTPhaseUp, mx1, my1, mx2, my2);
+                } else {
+                    dispatchTwoFingerTouch(kSTPhaseMove, mx1, my1, mx2, my2);
+                }
+            });
+    }
+}
+
 #pragma mark - Darwin Notification Handlers
 
 static void performSwipe(STSwipeCmd *sc) {
@@ -442,6 +568,14 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
         if (n < 2) return;
         STKeyCmd *kc = (STKeyCmd *)buf;
         performKeySequence(kc);
+        CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
+        return;
+    }
+
+    if (phase == kSTPhasePinch) {
+        if (n < (ssize_t)sizeof(STPinchCmd)) return;
+        STPinchCmd *pc = (STPinchCmd *)buf;
+        performPinch(pc);
         CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
         return;
     }
