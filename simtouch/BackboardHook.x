@@ -73,9 +73,6 @@ extern void IOHIDEventSetTimeStamp(IOHIDEventRef, uint64_t);
 #define BB_PING_NOTIFY  "page.0x01.simtouch.bb.ping"
 
 #define BB_RECORD_PATH    "/tmp/simtouch-record.bin"
-#define BB_RECORD_START   "page.0x01.simtouch.record.start"
-#define BB_RECORD_STOP    "page.0x01.simtouch.record.stop"
-#define BB_REPLAY_NOTIFY  "page.0x01.simtouch.replay"
 
 #define DIAG_NOTIFY(tag) CFNotificationCenterPostNotification( \
     CFNotificationCenterGetDarwinNotifyCenter(), \
@@ -370,36 +367,23 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
                 dispatch_get_main_queue(), ^{
                     const STRecordEntry *e = &((const STRecordEntry *)recordData.bytes)[idx];
 
-                    IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, _capturedEvent);
-                    if (!clone) return;
+                    uint8_t stPhase;
+                    BOOL prevTouch = (idx > 0) ?
+                        ((const STRecordEntry *)recordData.bytes)[idx - 1].touch : NO;
+                    BOOL curTouch = e->touch;
 
-                    updateTimestamps(clone);
-                    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerX, e->x);
-                    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerY, e->y);
-                    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, e->event_mask);
-                    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, e->touch);
-                    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, e->range);
-                    IOHIDEventSetPhase(clone, e->phase);
-                    IOHIDEventSetSenderID(clone, _capturedSenderID);
-
-                    CFArrayRef children = IOHIDEventGetChildren(clone);
-                    if (children) {
-                        CFIndex cc = MIN(CFArrayGetCount(children), (CFIndex)e->child_count);
-                        for (CFIndex j = 0; j < cc; j++) {
-                            IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, j);
-                            IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerX, e->children[j].x);
-                            IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerY, e->children[j].y);
-                            IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerTipPressure, e->children[j].pressure);
-                            IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerTouch, e->children[j].touch);
-                            IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerRange, e->children[j].range);
-                            IOHIDEventSetPhase(child, e->children[j].phase);
-                        }
+                    if (curTouch && !prevTouch) {
+                        stPhase = kSTPhaseDown;
+                    } else if (curTouch && prevTouch) {
+                        stPhase = kSTPhaseMove;
+                    } else if (!curTouch && prevTouch) {
+                        stPhase = kSTPhaseUp;
+                    } else {
+                        if (idx == total - 1) { _replaying = NO; DIAG_NOTIFY("replay.done"); }
+                        return;
                     }
 
-                    _injecting = YES;
-                    orig_HandleFromSender(clone, _capturedSender, NULL, NULL);
-                    _injecting = NO;
-                    CFRelease(clone);
+                    dispatchTouch(stPhase, e->x, e->y);
 
                     if (idx == total - 1) {
                         _replaying = NO;
@@ -437,110 +421,6 @@ static void onPing(CFNotificationCenterRef center, void *observer,
     CFNotificationCenterPostNotification(nc, CFSTR(BB_READY_NOTIFY), NULL, NULL, true);
 }
 
-#pragma mark - Record / Replay Handlers
-
-static void onRecordStart(CFNotificationCenterRef center, void *observer,
-                          CFStringRef name, const void *object, CFDictionaryRef info) {
-    if (_recording) {
-        if (_recordFd >= 0) { close(_recordFd); _recordFd = -1; }
-    }
-    unlink(BB_RECORD_PATH);
-    _recordFd = open(BB_RECORD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (_recordFd < 0) {
-        DIAG_NOTIFY("record.open.fail");
-        return;
-    }
-    _recordStartMach = mach_absolute_time();
-    _recording = YES;
-    DIAG_NOTIFY("record.started");
-}
-
-static void onRecordStop(CFNotificationCenterRef center, void *observer,
-                         CFStringRef name, const void *object, CFDictionaryRef info) {
-    _recording = NO;
-    if (_recordFd >= 0) {
-        close(_recordFd);
-        _recordFd = -1;
-    }
-    DIAG_NOTIFY("record.stopped");
-}
-
-static void onReplay(CFNotificationCenterRef center, void *observer,
-                     CFStringRef name, const void *object, CFDictionaryRef info) {
-    if (!_capturedEvent || !_capturedSender || !orig_HandleFromSender) {
-        DIAG_NOTIFY("replay.no.capture");
-        return;
-    }
-    if (_replaying) {
-        DIAG_NOTIFY("replay.busy");
-        return;
-    }
-    if (_recording) {
-        _recording = NO;
-        if (_recordFd >= 0) { close(_recordFd); _recordFd = -1; }
-    }
-
-    int fd = open(BB_RECORD_PATH, O_RDONLY);
-    if (fd < 0) { DIAG_NOTIFY("replay.no.file"); return; }
-
-    off_t fileSize = lseek(fd, 0, SEEK_END);
-    lseek(fd, 0, SEEK_SET);
-    if (fileSize <= 0) { close(fd); DIAG_NOTIFY("replay.empty"); return; }
-
-    size_t count = fileSize / sizeof(STRecordEntry);
-    STRecordEntry *entries = (STRecordEntry *)malloc(fileSize);
-    if (!entries) { close(fd); DIAG_NOTIFY("replay.alloc.fail"); return; }
-    read(fd, entries, fileSize);
-    close(fd);
-
-    _replaying = YES;
-    DIAG_NOTIFY("replay.start");
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        for (size_t i = 0; i < count; i++) {
-            if (i > 0) {
-                uint32_t delta = entries[i].time_ms - entries[i-1].time_ms;
-                if (delta > 0) usleep(delta * 1000);
-            }
-
-            IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, _capturedEvent);
-            if (!clone) continue;
-
-            updateTimestamps(clone);
-            IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerX, entries[i].x);
-            IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerY, entries[i].y);
-            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, entries[i].event_mask);
-            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, entries[i].touch);
-            IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, entries[i].range);
-            IOHIDEventSetPhase(clone, entries[i].phase);
-            IOHIDEventSetSenderID(clone, _capturedSenderID);
-
-            CFArrayRef children = IOHIDEventGetChildren(clone);
-            if (children) {
-                CFIndex cc = MIN(CFArrayGetCount(children), (CFIndex)entries[i].child_count);
-                for (CFIndex j = 0; j < cc; j++) {
-                    IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, j);
-                    IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerX, entries[i].children[j].x);
-                    IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerY, entries[i].children[j].y);
-                    IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerTipPressure, entries[i].children[j].pressure);
-                    IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerTouch, entries[i].children[j].touch);
-                    IOHIDEventSetIntegerValue(child, kIOHIDEventFieldDigitizerRange, entries[i].children[j].range);
-                    IOHIDEventSetPhase(child, entries[i].children[j].phase);
-                }
-            }
-
-            _injecting = YES;
-            orig_HandleFromSender(clone, _capturedSender, NULL, NULL);
-            _injecting = NO;
-            CFRelease(clone);
-        }
-
-        free(entries);
-        _replaying = NO;
-        DIAG_NOTIFY("replay.done");
-    });
-}
-
 %ctor {
     NSString *proc = [NSProcessInfo processInfo].processName;
     if (![proc isEqualToString:@"backboardd"]) return;
@@ -558,11 +438,5 @@ static void onReplay(CFNotificationCenterRef center, void *observer,
         CFSTR(BB_CMD_NOTIFY), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(nc, NULL, onPing,
         CFSTR(BB_PING_NOTIFY), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(nc, NULL, onRecordStart,
-        CFSTR(BB_RECORD_START), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(nc, NULL, onRecordStop,
-        CFSTR(BB_RECORD_STOP), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(nc, NULL, onReplay,
-        CFSTR(BB_REPLAY_NOTIFY), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterPostNotification(nc, CFSTR(BB_READY_NOTIFY), NULL, NULL, true);
 }
