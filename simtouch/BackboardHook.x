@@ -104,11 +104,21 @@ typedef struct {
     uint32_t edge_mask;
 } STTouchCmd;
 
+enum {
+    kSTCurveLinear    = 0,
+    kSTCurveEaseIn    = 1,
+    kSTCurveEaseOut   = 2,
+    kSTCurveEaseInOut = 3,
+    kSTCurveBezier    = 4,
+};
+
 typedef struct {
     uint8_t phase;
     float x1, y1, x2, y2;
     uint32_t duration_ms;
     uint32_t edge_mask;
+    uint8_t curve_type;
+    float bz_x1, bz_y1, bz_x2, bz_y2;
 } STSwipeCmd;
 #pragma pack(pop)
 
@@ -297,18 +307,59 @@ static void dispatchTouch(uint8_t phase, float nx, float ny) {
     DIAG_NOTIFY("injected");
 }
 
+#pragma mark - Cubic Bezier Easing
+
+static float cubicBezierSample(float t, float a, float b) {
+    return ((1.0f - 3.0f*b + 3.0f*a)*t*t*t + (3.0f*b - 6.0f*a)*t*t + 3.0f*a*t);
+}
+
+static float cubicBezierSolveX(float x, float x1, float x2) {
+    float t = x;
+    for (int i = 0; i < 8; i++) {
+        float err = cubicBezierSample(t, x1, x2) - x;
+        if (fabsf(err) < 1e-6f) break;
+        float d = (3.0f*(1.0f - 3.0f*x2 + 3.0f*x1)*t*t + 2.0f*(3.0f*x2 - 6.0f*x1)*t + 3.0f*x1);
+        if (fabsf(d) < 1e-6f) break;
+        t -= err / d;
+    }
+    return t;
+}
+
+static float cubicBezierEase(float x, float x1, float y1, float x2, float y2) {
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    float t = cubicBezierSolveX(x, x1, x2);
+    return cubicBezierSample(t, y1, y2);
+}
+
+static float applyEasing(float t, uint8_t curveType, float bx1, float by1, float bx2, float by2) {
+    switch (curveType) {
+        case kSTCurveEaseIn:    return cubicBezierEase(t, 0.42f, 0.0f, 1.0f, 1.0f);
+        case kSTCurveEaseOut:   return cubicBezierEase(t, 0.0f, 0.0f, 0.58f, 1.0f);
+        case kSTCurveEaseInOut: return cubicBezierEase(t, 0.42f, 0.0f, 0.58f, 1.0f);
+        case kSTCurveBezier:    return cubicBezierEase(t, bx1, by1, bx2, by2);
+        default:                return t;
+    }
+}
+
 #pragma mark - Darwin Notification Handlers
 
-static void performSwipe(float x1, float y1, float x2, float y2, uint32_t durationMs) {
+static void performSwipe(STSwipeCmd *sc) {
+    uint32_t durationMs = sc->duration_ms;
     if (durationMs == 0) durationMs = 300;
     NSInteger steps = MAX((NSInteger)(durationMs / 16), 2);
+
+    float x1 = sc->x1, y1 = sc->y1, x2 = sc->x2, y2 = sc->y2;
+    uint8_t curveType = sc->curve_type;
+    float bx1 = sc->bz_x1, by1 = sc->bz_y1, bx2 = sc->bz_x2, by2 = sc->bz_y2;
 
     dispatchTouch(kSTPhaseDown, x1, y1);
 
     for (NSInteger i = 1; i <= steps; i++) {
-        float t = (float)i / (float)steps;
-        float cx = x1 + (x2 - x1) * t;
-        float cy = y1 + (y2 - y1) * t;
+        float tLinear = (float)i / (float)steps;
+        float tEased = applyEasing(tLinear, curveType, bx1, by1, bx2, by2);
+        float cx = x1 + (x2 - x1) * tEased;
+        float cy = y1 + (y2 - y1) * tEased;
         BOOL last = (i == steps);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)i * 16 * NSEC_PER_MSEC),
             dispatch_get_main_queue(), ^{
@@ -338,7 +389,7 @@ static void onTouchCommand(CFNotificationCenterRef center, void *observer,
     if (phase == kSTPhaseSwipe) {
         if (n < (ssize_t)sizeof(STSwipeCmd)) return;
         STSwipeCmd *sc = (STSwipeCmd *)buf;
-        performSwipe(sc->x1, sc->y1, sc->x2, sc->y2, sc->duration_ms);
+        performSwipe(sc);
         CFNotificationCenterPostNotification(nc, CFSTR(BB_ACK_NOTIFY), NULL, NULL, true);
         return;
     }

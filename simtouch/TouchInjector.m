@@ -27,6 +27,14 @@ enum {
     kSTPhaseSwipe = 3,
 };
 
+enum {
+    kSTCurveLinear    = 0,
+    kSTCurveEaseIn    = 1,
+    kSTCurveEaseOut   = 2,
+    kSTCurveEaseInOut = 3,
+    kSTCurveBezier    = 4,
+};
+
 #pragma pack(push, 1)
 typedef struct {
     uint8_t phase;
@@ -40,6 +48,8 @@ typedef struct {
     float x1, y1, x2, y2;
     uint32_t duration_ms;
     uint32_t edge_mask;
+    uint8_t curve_type;
+    float bz_x1, bz_y1, bz_x2, bz_y2;
 } STSwipeCmd;
 #pragma pack(pop)
 
@@ -173,6 +183,12 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 }
 
 - (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms {
+    [self swipeFromX:x1 y:y1 toX:x2 y:y2 durationMs:ms curveType:kSTCurveLinear bz_x1:0 bz_y1:0 bz_x2:0 bz_y2:0];
+}
+
+- (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2
+        durationMs:(NSInteger)ms curveType:(uint8_t)curve
+            bz_x1:(float)bx1 bz_y1:(float)by1 bz_x2:(float)bx2 bz_y2:(float)by2 {
     if (ms <= 0) ms = 300;
     STSwipeCmd cmd = {0};
     cmd.phase = kSTPhaseSwipe;
@@ -182,6 +198,11 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
     cmd.y2 = (float)(y2 / _screenHPx);
     cmd.duration_ms = (uint32_t)ms;
     cmd.edge_mask = 0;
+    cmd.curve_type = curve;
+    cmd.bz_x1 = bx1;
+    cmd.bz_y1 = by1;
+    cmd.bz_x2 = bx2;
+    cmd.bz_y2 = by2;
 
     int fd = open(BB_CMD_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {

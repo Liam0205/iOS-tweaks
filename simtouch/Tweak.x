@@ -132,14 +132,34 @@ static void registerCommands(void) {
     }];
 
     [[STSocketServer sharedInstance] registerCommand:@"swipe" handler:^NSString *(NSArray<NSString *> *args) {
-        if (args.count < 4) return @"ERR usage: swipe <x1> <y1> <x2> <y2> [ms]";
+        if (args.count < 4) return @"ERR usage: swipe <x1> <y1> <x2> <y2> [ms] [curve]";
         STTouchInjector *ti = [STTouchInjector sharedInstance];
         CGFloat x1 = [args[0] floatValue];
         CGFloat y1 = [args[1] floatValue];
         CGFloat x2 = [args[2] floatValue];
         CGFloat y2 = [args[3] floatValue];
         NSInteger ms = args.count > 4 ? [args[4] integerValue] : 300;
-        dispatch_async(dispatch_get_main_queue(), ^{ [ti swipeFromX:x1 y:y1 toX:x2 y:y2 durationMs:ms]; });
+
+        uint8_t curve = 0;
+        float bx1 = 0, by1 = 0, bx2 = 0, by2 = 0;
+        if (args.count > 5) {
+            NSString *c = args[5];
+            if ([c isEqualToString:@"easein"]) { curve = 1; }
+            else if ([c isEqualToString:@"easeout"]) { curve = 2; }
+            else if ([c isEqualToString:@"easeinout"]) { curve = 3; }
+            else if ([c hasPrefix:@"bezier:"]) {
+                NSArray *pts = [[c substringFromIndex:7] componentsSeparatedByString:@","];
+                if (pts.count == 4) {
+                    curve = 4;
+                    bx1 = [pts[0] floatValue]; by1 = [pts[1] floatValue];
+                    bx2 = [pts[2] floatValue]; by2 = [pts[3] floatValue];
+                }
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ti swipeFromX:x1 y:y1 toX:x2 y:y2 durationMs:ms curveType:curve bz_x1:bx1 bz_y1:by1 bz_x2:bx2 bz_y2:by2];
+        });
         return [NSString stringWithFormat:@"OK bb=%s", ti.isUserDeviceReady ? "connected" : "disconnected"];
     }];
 
