@@ -397,16 +397,11 @@ static void performKeySequence(STKeyCmd *kc) {
 #pragma mark - Multi-touch (Pinch)
 
 static void dispatchTwoFingerTouch(uint8_t phase, float x1, float y1, float x2, float y2) {
-    if (!_capturedEvent || !_capturedSender || !orig_HandleFromSender) {
-        DIAG_NOTIFY("no.capture");
+    if (!_capturedSender || !orig_HandleFromSender) {
         return;
     }
 
-    IOHIDEventRef clone = IOHIDEventCreateCopy(kCFAllocatorDefault, _capturedEvent);
-    if (!clone) return;
-
-    updateTimestamps(clone);
-
+    uint64_t ts = mach_absolute_time();
     BOOL touch = (phase != kSTPhaseUp);
     float pressure = touch ? 1.0f : 0.0f;
 
@@ -430,27 +425,34 @@ static void dispatchTwoFingerTouch(uint8_t phase, float x1, float y1, float x2, 
 
     float midX = (x1 + x2) / 2.0f;
     float midY = (y1 + y2) / 2.0f;
-    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerX, midX);
-    IOHIDEventSetFloatValue(clone, kIOHIDEventFieldDigitizerY, midY);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerEventMask, mask);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
-    IOHIDEventSetPhase(clone, hidPhase);
 
-    CFArrayRef children = IOHIDEventGetChildren(clone);
-    if (children && CFArrayGetCount(children) > 0) {
-        IOHIDEventRef child0 = (IOHIDEventRef)CFArrayGetValueAtIndex(children, 0);
-        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerX, x1);
-        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerY, y1);
-        IOHIDEventSetFloatValue(child0, kIOHIDEventFieldDigitizerTipPressure, pressure);
-        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
-        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerRange, touch ? 1 : 0);
-        IOHIDEventSetIntegerValue(child0, kIOHIDEventFieldDigitizerEventMask, mask);
-        IOHIDEventSetPhase(child0, hidPhase);
-        IOHIDEventSetTimeStamp(child0, mach_absolute_time());
+    IOHIDEventRef parent = IOHIDEventCreateDigitizerEvent(
+        kCFAllocatorDefault, ts,
+        3, 0, 0,
+        mask, 0,
+        midX, midY, 0,
+        pressure, 0,
+        touch, touch, 0);
+    if (!parent) return;
+
+    IOHIDEventSetPhase(parent, hidPhase);
+    IOHIDEventSetIntegerValue(parent, kIOHIDEventFieldDigitizerCollection, 1);
+    IOHIDEventSetIntegerValue(parent, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+    IOHIDEventSetIntegerValue(parent, kIOHIDEventFieldIsBuiltIn, 1);
+    IOHIDEventSetSenderID(parent, _capturedSenderID);
+
+    IOHIDEventRef finger1 = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, ts,
+        0, 1, mask,
+        x1, y1, 0,
+        pressure, 0,
+        touch, touch, 0);
+    if (finger1) {
+        IOHIDEventSetPhase(finger1, hidPhase);
+        IOHIDEventAppendEvent(parent, finger1);
+        CFRelease(finger1);
     }
 
-    uint64_t ts = mach_absolute_time();
     IOHIDEventRef finger2 = IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, ts,
         1, 2, mask,
@@ -459,18 +461,15 @@ static void dispatchTwoFingerTouch(uint8_t phase, float x1, float y1, float x2, 
         touch, touch, 0);
     if (finger2) {
         IOHIDEventSetPhase(finger2, hidPhase);
-        IOHIDEventAppendEvent(clone, finger2);
+        IOHIDEventAppendEvent(parent, finger2);
         CFRelease(finger2);
     }
 
-    IOHIDEventSetSenderID(clone, _capturedSenderID);
-    IOHIDEventSetIntegerValue(clone, kIOHIDEventFieldDigitizerCollection, 1);
-
     _injecting = YES;
-    orig_HandleFromSender(clone, _capturedSender, _capturedC, _capturedD);
+    orig_HandleFromSender(parent, _capturedSender, _capturedC, _capturedD);
     _injecting = NO;
 
-    CFRelease(clone);
+    CFRelease(parent);
 }
 
 static void performPinch(STPinchCmd *pc) {
