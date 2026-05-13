@@ -2,7 +2,7 @@
 
 ## 核心职责
 
-SimTouch 是远程触摸模拟与截图捕获工具。Phase 1 完成了截图 MVP，Phase 2 实现了基于 backboardd hook 的触摸注入、事件录制，以及 SpringBoard 私有 API 系统手势。
+SimTouch 是远程触摸模拟与截图捕获工具。Phase 1 完成了截图 MVP，Phase 2 实现了基于 backboardd hook 的触摸注入、事件录制，以及 SpringBoard 私有 API 系统手势。Phase 3 新增自定义 swipe 曲线（cubic-bezier easing）、键盘输入（HID keyboard + 剪贴板粘贴）、多指 pinch/zoom。
 
 目标环境：iPhone 13 Pro / iOS 15.4.1 / Dopamine 1.x（rootless）
 
@@ -36,7 +36,7 @@ SimTouch 是远程触摸模拟与截图捕获工具。Phase 1 完成了截图 MV
 | SocketServer | `SocketServer.m` | SpringBoard | AF_UNIX socket 命令分发 |
 | ScreenCapture | `ScreenCapture.m` | SpringBoard | 截图捕获、格式转换、文件写入 |
 | TouchInjector | `TouchInjector.m` | SpringBoard | 触摸命令 IPC 中继到 backboardd（tap/longpress/swipe） |
-| BackboardHook | `BackboardHook.x` | backboardd | HID 事件 hook + 捕获 + 注入 + swipe 轨迹生成 + 录制 |
+| BackboardHook | `BackboardHook.x` | backboardd | HID 事件 hook + 捕获 + 注入 + swipe 轨迹/easing + 键盘事件 + pinch 多指 + 录制 |
 | CLI | `tools/simtouch.c` | 独立进程 | 命令行接口 |
 | PreferenceBundle | `simtouchprefs/` | Settings.app | 开关面板 |
 
@@ -51,8 +51,10 @@ SimTouch 是远程触摸模拟与截图捕获工具。Phase 1 完成了截图 MV
 | `info` | 无 | 屏幕尺寸、scale、backboardd 状态 |
 | `screenshot` | `[path]` | 截图路径或错误 |
 | `tap` | `<x> <y>` | OK + bb 状态 |
-| `swipe` | `<x1> <y1> <x2> <y2> [ms]` | OK + bb 状态 |
+| `swipe` | `<x1> <y1> <x2> <y2> [ms] [curve]` | 带可选 easing 曲线 |
 | `longpress` | `<x> <y> [ms]` | OK + bb 状态 |
+| `keyinput` | `<key>` 或 `text <string>` | 键盘输入或文本粘贴 |
+| `pinch` | `<cx> <cy> <scale> [ms]` | 多指缩放 |
 | `home` | 无 | OK springboard-api |
 | `cc` | 无 | OK cc presented |
 | `notif` | 无 | OK notif presented |
@@ -186,7 +188,9 @@ SpringBoard → backboardd 通过文件 + Darwin notification：
 | phase 值 | 结构体 | 语义 |
 |-----------|--------|------|
 | 0 (Down) / 1 (Move) / 2 (Up) | `STTouchCmd` (13B) | 单次触摸事件 |
-| 3 (Swipe) | `STSwipeCmd` (25B) | 完整 swipe 轨迹（一次 IPC） |
+| 3 (Swipe) | `STSwipeCmd` (46B) | 完整 swipe 轨迹 + 可选 easing 曲线 |
+| 4 (Keyboard) | `STKeyCmd` | 键盘事件序列 |
+| 5 (Pinch) | `STPinchCmd` (17B) | 多指 pinch/zoom |
 | 0xF0 / 0xF1 / 0xF2 | `STTouchCmd` (仅 phase) | 录制开始/停止/回放 |
 
 ### Swipe IPC 设计（单次投递）
@@ -209,3 +213,51 @@ backboardd 收到后：
 1. 立即 `dispatchTouch(Down, x1, y1)`
 2. `dispatch_after` 按 16ms 间隔发出 N 个 Move 事件（线性插值）
 3. 最后一帧发出 `dispatchTouch(Up, x2, y2)`
+
+## Phase 3 新增功能
+
+### 自定义 Swipe 曲线
+
+STSwipeCmd 结构体扩展（30B → 46B）：新增 `curve_type`(uint8_t) + `bz_x1/bz_y1/bz_x2/bz_y2`(float x4)。
+
+backboardd `performSwipe()` 在轨迹插值时应用 easing 函数：
+
+| curve_type | 名称 | 行为 |
+|------------|------|------|
+| 0 | linear | 匀速（默认，向后兼容） |
+| 1 | easein | 慢启快停 |
+| 2 | easeout | 快启慢停 |
+| 3 | easeinout | 慢启慢停 |
+| 4 | bezier | 自定义 cubic-bezier（使用 bz_x1/y1/x2/y2） |
+
+bezier 实现：Newton's method 迭代求解（8 次迭代），与 CSS `cubic-bezier()` 行为一致。
+
+### 键盘输入 (HID Keyboard Events)
+
+注入路径：`IOHIDEventCreateKeyboardEvent(usagePage=0x07)` + `orig_HandleFromSender`
+
+两种模式：
+- **单键/组合键**：直接注入 HID keyboard event（USB HID usage page 0x07）
+- **文本字符串**：SpringBoard 设置 `UIPasteboard.generalPasteboard.string` + 注入 Cmd+V（HID usage 0xE3 + 0x19）
+
+STKeyCmd 结构体：`phase`(1B) + `key_count`(1B) + `keys[8]` x {`usage`(2B) + `down`(1B)}
+
+### Pinch/Zoom (多指触摸)
+
+**不使用模板克隆**，从零创建事件（与单指触摸策略相反，见技术决策 #15）：
+
+```
+Parent: IOHIDEventCreateDigitizerEvent(type=3/Hand)
+  ├─ Finger1: IOHIDEventCreateDigitizerFingerEvent(index=0, identity=1)
+  └─ Finger2: IOHIDEventCreateDigitizerFingerEvent(index=1, identity=2)
+```
+
+关键字段设置：
+- `kIOHIDEventFieldDigitizerCollection = 1`
+- `kIOHIDEventFieldDigitizerIsDisplayIntegrated = 1`
+- `kIOHIDEventFieldIsBuiltIn = 1`
+- 正确的 SenderID
+
+STPinchCmd 结构体：`phase`(1B) + `cx/cy`(float x2) + `scale`(float) + `duration_ms`(uint32)
+
+`performPinch()` 行为：两指从 center ± baseOffset 对称展开（scale > 1）或收缩（scale < 1），按 16ms 间隔插值。

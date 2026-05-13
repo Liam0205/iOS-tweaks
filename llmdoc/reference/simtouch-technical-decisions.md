@@ -1,6 +1,6 @@
 # SimTouch 技术决策记录
 
-Phase 1 截图 MVP 和 Phase 2 触摸注入开发过程中的关键技术决策。
+Phase 1 截图 MVP、Phase 2 触摸注入、Phase 3 自定义曲线/键盘输入/多指 pinch 开发过程中的关键技术决策。
 
 ## 1. _UICreateScreenUIImage vs CARenderServerRenderDisplay
 
@@ -138,3 +138,50 @@ Tweak 收到通知后读取 preference 并启动/停止 socket server。这避�
 - `0x2000000`（bit 25）= 顶部边缘（通知中心）
 
 **用途限制**：这些 mask 值仅用于录制分析诊断（识别用户执行了何种手势），**不能用于注入系统手势**——原因见决策 13（arbiter 验证投递路径）。
+
+## 15. 多指触摸：从零创建 vs 克隆模板（决策 #8 修正）
+
+**原始结论（Phase 2 决策 #8）**：从零创建 IOHIDEvent 不生效，必须克隆真实事件。
+
+**Phase 3 修正**：这是条件性规则，取决于事件类型：
+- 单指触摸：必须克隆（BKS 附加的隐式内部属性无法通过公开 API 复制）
+- 多指 pinch/zoom：必须从零创建（克隆的单指模板 parent 为 Finger type，而多指需要 Hand type；且模板子事件数量不可控）
+
+**根因**：
+- 单指：BKS 验证事件的 routing info/policy flags 等隐式属性
+- 多指：手势识别器验证事件结构（parent type=Hand + N 个 Finger children），对隐式属性要求较松
+
+**技术实现**：
+```c
+IOHIDEventCreateDigitizerEvent(allocator, ts, 3/*Hand*/, 0, 0, mask, 0, midX, midY, 0, pressure, 0, range, touch, 0)
+IOHIDEventCreateDigitizerFingerEvent(allocator, ts, 0/*index*/, 1/*identity*/, ...)  // finger 1
+IOHIDEventCreateDigitizerFingerEvent(allocator, ts, 1/*index*/, 2/*identity*/, ...)  // finger 2
+```
+
+设置：`kIOHIDEventFieldDigitizerCollection=1`, `kIOHIDEventFieldDigitizerIsDisplayIntegrated=1`, `kIOHIDEventFieldIsBuiltIn=1`, 正确的 SenderID。
+
+## 16. 自定义曲线：Newton's method cubic-bezier
+
+**选择**：Newton's method 迭代求解（8 iterations）
+
+**原因**：与 CSS `cubic-bezier()` 行为一致。输入为 t 对应的 X 坐标，输出为 Y 坐标（进度）。8 次迭代在 ARM64 上收敛速度足够且计算开销极低。
+
+## 17. 键盘输入：HID keyboard + 剪贴板粘贴
+
+**选择**：混合方案
+
+两种输入模式：
+- 特殊键（enter/tab/backspace/arrows/a-z/0-9）：直接注入 `IOHIDEventCreateKeyboardEvent`（USB HID usage page 0x07）
+- 文本字符串：`UIPasteboard.generalPasteboard.string` + Cmd+V（usage 0xE3 + 0x19）
+
+**原因**：HID keyboard 用 USB usage code（page 0x07），逐字符注入需要处理 shift 组合、输入法状态等复杂性。剪贴板方案绕过输入法直接粘贴完整文本。
+
+## 18. backboardd 部署：killall 而非 sbreload
+
+**选择**：`sudo killall backboardd`
+
+**问题**：更新 backboardd hook dylib 后需要重启进程加载新代码。
+
+**陷阱**：`sbreload` 只重启 SpringBoard（通过 launchd 发信号），backboardd 是独立的 launchd 守护进程（`com.apple.backboardd`），不受 sbreload 影响。
+
+**解决方案**：`sudo killall backboardd`，launchd 会自动重启它（因为 backboardd 的 plist 配置了 `KeepAlive`）。注意：killall backboardd 会同时导致 SpringBoard 重启（因 SpringBoard 依赖 backboardd 的 Mach port）。

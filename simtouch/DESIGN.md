@@ -60,8 +60,13 @@
 ```
 # 命令格式
 tap <x> <y>                        # 点按（屏幕像素坐标）
-swipe <x1> <y1> <x2> <y2> [ms]    # 滑动（默认 300ms）
+swipe <x1> <y1> <x2> <y2> [ms] [curve]  # 滑动（默认 300ms，可选曲线）
+                                        #   curve: linear, easein, easeout, easeinout
+                                        #   bezier:cx1,cy1,cx2,cy2 (自定义 cubic-bezier)
 longpress <x> <y> [ms]            # 长按（默认 500ms）
+keyinput <key>                     # 单键注入（enter/tab/backspace/esc/space/delete/arrows/a-z/0-9）
+keyinput text <string>             # 文本输入（剪贴板 + Cmd+V 粘贴）
+pinch <cx> <cy> <scale> [ms]       # 多指缩放（scale>1 放大, <1 缩小，默认 300ms）
 home                               # 返回主屏幕（SpringBoard API）
 cc                                 # 打开控制中心（SpringBoard API）
 notif                              # 打开通知中心（SpringBoard API）
@@ -108,7 +113,9 @@ SpringBoard 写命令结构体到 /var/jb/tmp/simtouch-cmd
         → backboardd onTouchCommand 回调
             → 读取 cmd 文件，按 phase 字段分发：
                 phase=0/1/2 → dispatchTouch(phase, x, y)
-                phase=3     → performSwipe(x1, y1, x2, y2, duration)
+                phase=3     → performSwipe(x1, y1, x2, y2, duration, curve)
+                phase=4     → performKeySequence(keys)
+                phase=5     → performPinch(cx, cy, scale, duration)
                 phase=0xF0  → 开始录制
                 phase=0xF1  → 停止录制
                 phase=0xF2  → 回放
@@ -123,7 +130,9 @@ SpringBoard 写命令结构体到 /var/jb/tmp/simtouch-cmd
 - backboardd 内部生成 N 步线性插值（16ms 间隔），通过 `dispatch_after` 调度
 - 消除了旧方案中逐步跨进程 IPC 导致的 Darwin notification 合并竞态
 
-**关键发现**：从零创建 IOHIDEvent 不起作用——事件缺少 BKS 内部属性（senderID 之外的隐式状态）。必须克隆真实事件再修改字段。
+**关键发现**：
+- 单指触摸：从零创建 IOHIDEvent 不起作用（缺少 BKS 内部属性），必须克隆真实事件再修改字段
+- 多指触摸（pinch）：必须从零创建 IOHIDEventCreateDigitizerEvent(type=Hand) + Finger children。克隆单指模板的 parent type 错误，且子事件结构不可控
 
 **坐标系**：
 - IOHIDEvent 使用归一化坐标 [0.0, 1.0]
@@ -151,11 +160,32 @@ typedef struct {
     float x2, y2;        // 归一化终点
     uint32_t duration_ms;
     uint32_t edge_mask;  // 保留
-} STSwipeCmd;       // 25 bytes
+    uint8_t curve_type;  // 0=linear, 1=easein, 2=easeout, 3=easeinout, 4=bezier
+    float bz_x1, bz_y1, bz_x2, bz_y2;  // cubic-bezier 控制点（curve_type=4 时使用）
+} STSwipeCmd;       // 46 bytes
+
+typedef struct {
+    uint8_t phase;       // = kSTPhaseKeyboard (4)
+    uint8_t key_count;   // 按键事件数（down+up 序列，最多 8）
+    struct {
+        uint16_t usage;  // USB HID usage code (page 0x07)
+        uint8_t down;    // 1=down, 0=up
+    } keys[8];
+} STKeyCmd;         // 26 bytes
+
+typedef struct {
+    uint8_t phase;       // = kSTPhasePinch (5)
+    float cx, cy;        // 归一化中心点
+    float scale;         // >1 放大, <1 缩小
+    uint32_t duration_ms;
+} STPinchCmd;       // 17 bytes
 #pragma pack(pop)
 ```
 
 **特殊 phase 值**（复用同一 IPC 通道）：
+- `3` = 完整 swipe（含曲线参数）
+- `4` = 键盘事件序列
+- `5` = pinch/zoom 多指触摸
 - `0xF0` = 开始录制
 - `0xF1` = 停止录制
 - `0xF2` = 回放
@@ -326,8 +356,11 @@ Phase 2: 计算剩余文件总体积
   simtouch enable                      # 启用（写偏好 + Darwin 通知）
   simtouch disable                     # 禁用（写偏好 + Darwin 通知）
   simtouch tap <x> <y>
-  simtouch swipe <x1> <y1> <x2> <y2> [duration_ms]
+  simtouch swipe <x1> <y1> <x2> <y2> [duration_ms] [curve]
   simtouch longpress <x> <y> [ms]      # HapticTouch 长按（默认 500ms）
+  simtouch keyinput <key>              # 单键（enter/tab/backspace/arrows/a-z/0-9）
+  simtouch keyinput text <string>      # 文本粘贴
+  simtouch pinch <cx> <cy> <scale> [ms]  # 多指缩放
   simtouch home                         # 返回主屏幕
   simtouch cc                           # 打开控制中心
   simtouch notif                        # 打开通知中心
@@ -449,10 +482,15 @@ hook _BKHandleIOHIDEventFromSender
 - **已清理**：移除死代码（edge gesture injection、旧 swipe 逐步 IPC）
 - **回放**：使用 dispatchTouch 路径，基本可用
 
-### Phase 3：增强（规划）
-- `keyinput` 文本输入
-- 多点触控（pinch/zoom）
-- 自定义 swipe 曲线（非线性轨迹）
+### Phase 3：增强 ✅ 已完成
+- 自定义 swipe 曲线（cubic-bezier easing，CSS 兼容）
+- `keyinput` 文本输入（HID keyboard + 剪贴板粘贴）
+- 多点触控 `pinch`（从零创建 IOHIDDigitizerEvent Hand type + 双 Finger children）
+- **已验证**：easeinout 和自定义 bezier 曲线在主屏幕滑动
+- **已验证**：文本粘贴（"hello世界"）和特殊键（backspace）在 Spotlight
+- **已验证**：pinch zoom in/out 在高德地图
+- **关键发现**：多指触摸必须从零创建事件（type=Hand），不能克隆单指模板
+- **部署要求**：更新 backboardd hook 需 `killall backboardd`，sbreload 不够
 
 ## 兼容性
 
