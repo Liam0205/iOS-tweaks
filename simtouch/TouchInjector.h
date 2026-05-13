@@ -8,10 +8,5 @@
 - (void)captureSenderIDFromEvent:(void *)event;
 - (void)tapAtX:(CGFloat)pixelX y:(CGFloat)pixelY;
 - (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms;
-- (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms edgeMask:(uint32_t)edgeMask;
 - (void)longPressAtX:(CGFloat)pixelX y:(CGFloat)pixelY durationMs:(NSInteger)ms;
-- (void)homeGesture;
-- (void)notificationCenter;
-- (void)controlCenter;
-- (void)appSwitcher;
 @end
