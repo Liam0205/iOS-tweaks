@@ -99,3 +99,42 @@ Tweak 收到通知后读取 preference 并启动/停止 socket server。这避�
 **原因**：`/var/jb/` 实际指向 preboot 分区（`/private/preboot/.../procursus/`），backboardd 的沙箱 profile 禁止写入该路径。backboardd 可以读取该路径下的文件（命令文件由 SpringBoard 写入后 backboardd 读取），但不能写入。
 
 **解决方案**：改用 `/tmp/`（→ `/private/var/tmp/`），这是标准 iOS 临时目录，所有进程均可读写。
+
+## 12. 单次 IPC swipe 替代逐步 IPC swipe
+
+**选择**：发送单个 `STSwipeCmd` 结构体，由 backboardd 内部生成轨迹
+
+**尝试的方案**：每个 swipe 步骤（Down → N 个 Move → Up）各发一次文件写入 + Darwin notification IPC，由 SpringBoard 用 `dispatch_after` 按 16ms 间隔驱动。
+
+**结果**：Darwin notification 存在合并（coalescing）——连续快速发送的多个 notification 可能被系统合并为一次回调。导致 swipe 步骤丢失、轨迹不连续。
+
+**解决方案**：设计 `STSwipeCmd` 结构体包含完整 swipe 参数（起点、终点、时长），一次 IPC 传递所有信息。backboardd 的 `performSwipe()` 使用 `dispatch_after` 在进程内按 16ms 间隔生成线性插值轨迹，调用 `dispatchTouch()` 注入每帧。消除跨进程 notification 合并竞态。
+
+## 13. 系统手势使用 SpringBoard 私有 API 而非 HID 事件注入
+
+**选择**：直接调用 SpringBoard 私有 API（`SBUIController`、`SBControlCenterController` 等）
+
+**尝试的方案**：通过 HID 事件注入实现系统手势（Home、控制中心、通知中心、App 切换器）——在注入的 IOHIDEvent 上设置录制中发现的 edge mask 位（`0x1040000` = Home，`0x2040000` = 通知中心）。
+
+**结果**：无论如何设置事件的 mask、phase、坐标、edge flags，系统手势均不触发。常规 tap/swipe 仍正常工作。
+
+**根因**：iOS gesture arbiter 验证事件的**投递路径**（delivery path），不仅仅是事件数据内容。通过 `_BKHandleIOHIDEventFromSender` hook 注入的事件虽然通过了 BKS 管道的基本验证（因为是从真实事件克隆），但 arbiter 知道该事件不是从物理硬件经过完整的 IOHIDEventDriver → IOHIDEventSystem → backboardd 链路到达的。这是 iOS 的安全设计，防止软件层伪造系统手势。
+
+**解决方案**：系统手势走独立路径——在 SpringBoard 进程内直接调用私有 API：
+- `home`：`[SBUIController handleHomeButtonSinglePressUp]`
+- `cc`：`[SBControlCenterController presentAnimated:]`
+- `notif`：`[SBCoverSheetPresentationManager setCoverSheetPresented:animated:withCompletion:]`
+- `switcher`：`[SBMainSwitcherViewController toggleMainSwitcherNoninteractivelyWithSource:animated:]`
+
+这些 API 直接触发 UI 状态转换，绕过 gesture arbiter 验证。因为 Tweak 本身运行在 SpringBoard 进程中，调用这些 API 等同于 SpringBoard 自身发起操作。
+
+## 14. 边缘手势 mask 位（仅诊断参考）
+
+**发现来源**：录制真实 Home 手势和通知中心下拉后，对比 event_mask 字段差异。
+
+**mask 值**：
+- `0x40000`（bit 18）= 通用边缘手势标志
+- `0x1000000`（bit 24）= 底部边缘（Home 手势）
+- `0x2000000`（bit 25）= 顶部边缘（通知中心）
+
+**用途限制**：这些 mask 值仅用于录制分析诊断（识别用户执行了何种手势），**不能用于注入系统手势**——原因见决策 13（arbiter 验证投递路径）。

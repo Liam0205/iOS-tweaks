@@ -13,7 +13,7 @@
   (ssh -p 22xx)  /var/jb/tmp/         │
                  simtouch.sock    ├── SocketServer (命令分发)
                                   ├── ScreenCapture (截图)
-                                  ├── TouchInjector (IPC 中继)
+                                  ├── TouchInjector (触摸 IPC 中继)
                                   │      │
                                   │      │ 文件写入 /var/jb/tmp/simtouch-cmd
                                   │      │ + Darwin notification
@@ -21,7 +21,13 @@
                                   │   backboardd (SimTouch.dylib)
                                   │      ├── _BKHandleIOHIDEventFromSender hook
                                   │      ├── 事件捕获 + 克隆注入
+                                  │      ├── swipe 轨迹生成 (performSwipe)
                                   │      └── 录制/回放引擎
+                                  ├── 系统手势 (SpringBoard 私有 API, 进程内直接调用)
+                                  │      ├── home → SBUIController
+                                  │      ├── cc → SBControlCenterController
+                                  │      ├── notif → SBCoverSheetPresentationManager
+                                  │      └── switcher → SBMainSwitcherViewController
                                   └── Tweak.x (ctor + 命令注册)
 ```
 
@@ -56,6 +62,10 @@
 tap <x> <y>                        # 点按（屏幕像素坐标）
 swipe <x1> <y1> <x2> <y2> [ms]    # 滑动（默认 300ms）
 longpress <x> <y> [ms]            # 长按（默认 500ms）
+home                               # 返回主屏幕（SpringBoard API）
+cc                                 # 打开控制中心（SpringBoard API）
+notif                              # 打开通知中心（SpringBoard API）
+switcher                           # 打开任务切换器（SpringBoard API）
 screenshot [path]                   # 截图（默认 /var/jb/tmp/simtouch/screen_<ts>.jpg）
 info                                # 屏幕尺寸、scale、backboardd 连接状态
 bbstatus                            # ping backboardd 并返回 hook 状态
@@ -68,6 +78,10 @@ disable                             # 运行时禁用（CLI 直接写偏好 + Da
 # 响应格式
 OK                                  # 成功
 OK 390x844 @3x conn=connected hook=captured  # info 响应
+OK springboard-api                  # home/系统手势响应
+OK cc presented                     # cc 响应
+OK notif presented                  # notif 响应
+OK switcher toggled                 # switcher 响应
 OK stopped, 42 events, 1234ms       # record stop 响应
 OK replaying 42 events over 1234ms  # replay 响应
 ERR no senderID                     # backboardd 未捕获事件
@@ -89,15 +103,25 @@ ERR invalid command                 # 解析失败
 
 **注入流程**：
 ```
-SpringBoard 写 STTouchCmd 到 /var/jb/tmp/simtouch-cmd
+SpringBoard 写命令结构体到 /var/jb/tmp/simtouch-cmd
     → Darwin notification (BB_CMD_NOTIFY)
         → backboardd onTouchCommand 回调
-            → 读取 cmd 文件
-            → dispatchTouch(phase, x, y)
+            → 读取 cmd 文件，按 phase 字段分发：
+                phase=0/1/2 → dispatchTouch(phase, x, y)
+                phase=3     → performSwipe(x1, y1, x2, y2, duration)
+                phase=0xF0  → 开始录制
+                phase=0xF1  → 停止录制
+                phase=0xF2  → 回放
+            → dispatchTouch:
                 → IOHIDEventCreateCopy（克隆捕获的模板）
                 → 修改坐标、phase、mask、timestamp
                 → orig_HandleFromSender（注入到原始管道）
 ```
+
+**Swipe 轨迹生成**（`performSwipe`）：
+- SpringBoard 发送单个 `STSwipeCmd`（起点、终点、时长）
+- backboardd 内部生成 N 步线性插值（16ms 间隔），通过 `dispatch_after` 调度
+- 消除了旧方案中逐步跨进程 IPC 导致的 Darwin notification 合并竞态
 
 **关键发现**：从零创建 IOHIDEvent 不起作用——事件缺少 BKS 内部属性（senderID 之外的隐式状态）。必须克隆真实事件再修改字段。
 
@@ -118,7 +142,16 @@ typedef struct {
     uint8_t phase;  // kSTPhaseDown=0, kSTPhaseMove=1, kSTPhaseUp=2
     float x;        // 归一化 X [0,1]
     float y;        // 归一化 Y [0,1]
-} STTouchCmd;
+    uint32_t edge_mask; // 保留
+} STTouchCmd;       // 13 bytes
+
+typedef struct {
+    uint8_t phase;       // = kSTPhaseSwipe (3)
+    float x1, y1;        // 归一化起点
+    float x2, y2;        // 归一化终点
+    uint32_t duration_ms;
+    uint32_t edge_mask;  // 保留
+} STSwipeCmd;       // 25 bytes
 #pragma pack(pop)
 ```
 
@@ -140,10 +173,24 @@ longpress(x, y, ms):
   3. phase=Up at (x, y)
 
 swipe(x1, y1, x2, y2, ms):
-  1. phase=Down at (x1, y1)
-  2. N 个 phase=Move 事件（线性插值，~16ms 间隔）
-  3. phase=Up at (x2, y2)
+  单次 IPC：发送 STSwipeCmd（phase=3）
+  backboardd 内部：Down → N 个 Move（16ms 间隔线性插值）→ Up
 ```
+
+### 3b. 系统手势（SpringBoard 私有 API）
+
+**职责**：触发 iOS 系统手势（Home、控制中心、通知中心、App 切换器），绕过 gesture arbiter。
+
+**实现**：直接在 SpringBoard 进程内调用私有 API（不经过 backboardd IPC）。
+
+| 命令 | API 调用 | 目标类 |
+|------|----------|--------|
+| `home` | `handleHomeButtonSinglePressUp` / `clickedMenuButton` | `SBUIController` |
+| `cc` | `presentAnimated:` | `SBControlCenterController` |
+| `notif` | `setCoverSheetPresented:animated:withCompletion:` | `SBCoverSheetPresentationManager` |
+| `switcher` | `toggleMainSwitcherNoninteractivelyWithSource:animated:` | `SBMainSwitcherViewController` |
+
+**平台限制**：iOS gesture arbiter 验证 HID 事件的投递路径（delivery path），而非事件数据。通过 `_BKHandleIOHIDEventFromSender` 注入的事件无法触发系统手势，无论 edge mask 设置如何。常规触摸（tap/swipe/longpress）不受此限制。
 
 ### 4. 录制/回放引擎
 
@@ -171,15 +218,16 @@ typedef struct {
 } STRecordEntry;  // 153 bytes packed
 ```
 
-**边缘手势 mask 位**（从真实事件录制中发现）：
+**边缘手势 mask 位**（从真实事件录制中发现，仅诊断参考）：
 - `0x40000`（bit 18）= 通用边缘手势标志
 - `0x1000000`（bit 24）= 底部边缘（Home 手势）
 - `0x2000000`（bit 25）= 顶部边缘（通知中心）
+- 注意：这些 mask 值不能用于注入系统手势（arbiter 验证投递路径，见"系统手势"节）
 
-**回放**（两种实现，均未成功产生可见效果）：
-- v23：后台线程 + `usleep` 定时
-- v24：主线程 `dispatch_after` 定时
-- 待调查原因（基本 tap 有效，但回放录制的完整事件序列无效）
+**回放**：
+- 主线程 `dispatch_after` 调度（按录制时间戳间隔）
+- 使用 `dispatchTouch()` 路径注入（与 tap 相同路径）
+- 录制数据中的 touch/range 字段用于推断 phase 状态转换
 
 **文件路径约束**：
 - 录制文件必须写到 `/tmp/`（→ `/private/var/tmp/`），不能写到 `/var/jb/tmp/`
@@ -280,11 +328,16 @@ Phase 2: 计算剩余文件总体积
   simtouch tap <x> <y>
   simtouch swipe <x1> <y1> <x2> <y2> [duration_ms]
   simtouch longpress <x> <y> [ms]      # HapticTouch 长按（默认 500ms）
+  simtouch home                         # 返回主屏幕
+  simtouch cc                           # 打开控制中心
+  simtouch notif                        # 打开通知中心
+  simtouch switcher                     # 打开任务切换器
   simtouch screenshot [output_path]
   simtouch info
 
 通过 SSH 远程调用：
   ssh -p 2215 mobile@localhost "simtouch tap 200 400"
+  ssh -p 2215 mobile@localhost "simtouch home"
   ssh -p 2215 mobile@localhost "simtouch screenshot /tmp/s.jpg"
   scp -P 2215 mobile@localhost:/tmp/s.jpg ./screen.jpg
 ```
@@ -385,19 +438,21 @@ hook _BKHandleIOHIDEventFromSender
 - `_UICreateScreenUIImage` 截图，JPEG 默认（0.8 quality）
 - 已在 iPhone 13 Pro / iOS 15.4.1 上验证
 
-### Phase 2：触摸注入 🔧 开发中（v0.0.1-24）
-- BackboardHook + TouchInjector + 录制/回放
+### Phase 2：触摸注入 ✅ 核心完成
+- BackboardHook + TouchInjector + 录制/回放 + 系统手势
 - `_BKHandleIOHIDEventFromSender` hook + 事件克隆注入
 - **已验证**：tap、swipe、longpress 在主屏幕和 App 内生效
+- **已验证**：单次 IPC swipe（STSwipeCmd），消除 notification 合并竞态
+- **已验证**：系统手势（home/cc/notif/switcher）通过 SpringBoard 私有 API
 - **已验证**：录制基础设施——录制真实触摸事件到二进制文件
-- **已发现**：边缘手势 mask 位（`0x1040000` = Home，`0x2040000` = 通知中心）
-- **待解决**：回放机制（事件派发但无可见效果）
-- **待实现**：边缘手势（Home、通知中心、控制中心、任务切换器）
+- **已确认**：edge mask 位仅用于诊断，不能注入系统手势（arbiter 验证投递路径）
+- **已清理**：移除死代码（edge gesture injection、旧 swipe 逐步 IPC）
+- **回放**：使用 dispatchTouch 路径，基本可用
 
 ### Phase 3：增强（规划）
 - `keyinput` 文本输入
 - 多点触控（pinch/zoom）
-- 边缘手势 mask 应用到 dispatchTouch
+- 自定义 swipe 曲线（非线性轨迹）
 
 ## 兼容性
 
@@ -420,4 +475,6 @@ hook _BKHandleIOHIDEventFromSender
 | _UICreateScreenUIImage 移除 | 截图失败 | weak_import + 运行时检查 |
 | SpringBoard/backboardd crash | respring | hook 内 @try 保护；`_injecting` 标志防递归 |
 | arm64e 架构遗漏 | tweak 不加载 | Makefile 固定 `ARCHS = arm64 arm64e` |
-| 回放事件无效 | 自动化受限 | 基本 tap/swipe/longpress 仍可用；回放待调查 |
+| gesture arbiter 投递路径验证 | 系统手势无法通过 HID 注入 | 已用 SpringBoard 私有 API 绕过（已解决） |
+| SpringBoard 私有 API 版本变化 | 系统手势命令失败 | 多 selector 降级（如 `handleHomeButtonSinglePressUp` → `clickedMenuButton`） |
+| Darwin notification 合并 | swipe 步骤丢失 | 已用单次 STSwipeCmd IPC 解决（backboardd 内部生成轨迹） |

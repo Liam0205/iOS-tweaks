@@ -16,14 +16,14 @@
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
 - `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——四阶段 ctor 加载（fishhooks-first 顺序）、MSHookFunction + fishhook 混合策略、CFRunLoopAddTimer 定时器拦截、CFRunLoopRunSpecific longjmp 备用恢复、ARM64 栈切换退出生存、双通道杀死对抗（CFRunLoop timer + GCD dispatch_after）、与 icbcbypass 的关键差异。
 - `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.2 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、进程存活健康检查、指数退避自动重连、LaunchDaemon 开机持久化、sysctl 孤儿进程检测。
-- `llmdoc/architecture/simtouch-architecture.md`：SimTouch 架构——组件拓扑（SpringBoard Tweak + backboardd BackboardHook + CLI）、_BKHandleIOHIDEventFromSender hook + 事件克隆注入、文件+Darwin notification 跨进程 IPC、录制/回放引擎、边缘手势 mask 位发现。
+- `llmdoc/architecture/simtouch-architecture.md`：SimTouch 架构——双路径设计（HID 事件注入 for 常规触摸 + SpringBoard 私有 API for 系统手势）、_BKHandleIOHIDEventFromSender hook + 事件克隆注入、单次 IPC swipe 轨迹生成、gesture arbiter 投递路径限制、录制/回放引擎。
 
 ## reference/
 
 - `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 - `llmdoc/reference/icbc-detection-vectors.md`：工商银行检测框架（SecureUtilityPlus）、冻结机制（持续 freeze 循环及版本间时序差异）、弹窗退出链路、版本适配记录（3.0.80、3.0.90）与覆盖情况。
 - `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、双通道杀死机制（CFRunLoop timer + GCD dispatch_after）、第二检测路径（hook 完整性）、svc #0x80 不可拦截 syscall、当前覆盖状态。
-- `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、_BKHandleIOHIDEventFromSender hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径）。
+- `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径、单次 IPC swipe 消除合并竞态、gesture arbiter 投递路径限制迫使系统手势走 SpringBoard API、edge mask 诊断用途）。
 
 ## guides/
 
