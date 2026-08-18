@@ -1,101 +1,25 @@
-# STEP ONE IS ALWAYS: READ LLMDOC!
+默认使用简体中文回复；面向用户和维护者的文档也使用简体中文。
 
-Before reading any source code, **ALWAYS check if `llmdoc/` exists** in the project root. If it exists, this is your primary source of truth.
+## 语言约定
 
-**THIS IS NON-NEGOTIABLE.** Every task, every investigation, every code change MUST start with reading the documentation.
+- 日常交流、`llmdoc/`、README、Issue、PR 描述和评论默认使用简体中文。API 名、命令名、文件路径和代码引用保留原文。
+- 使用自然、清楚的现代汉语。句子应说明谁做什么、为什么这样做以及有什么限制，不要连续堆放缩写、名词和内部术语。
+- 中文句子使用全角中文标点。代码、命令、路径、参数和原样引用中的符号保持原样，不把其中的半角符号强行改成全角。
+- 不为省字把完整名词压缩成生硬的单字。例如叙述 TeX box 时写“盒子”，不要写“盒”“父盒”“盒尾”；需要区分层次时写“外层盒子”“嵌套盒子”“盒子末尾”。
+- 有普通说法时，不用生硬直译或流行套话。例如写“实现、连接、检查、决定、比对测试、形式”，不写“实装、真接入、闸门、拍板、对拍、形态”；也不要用“真……”一类说法强行强调。
+- 技术词确有精确定义时可以保留。内部术语或不常见的英文词第一次出现时，应顺手说明它具体指什么，不能只换一个更抽象的词。
+- 代码注释和技术文档优先描述可观察的行为与因果关系，少用比喻和口号式表述。
 
-### Why llmdoc First?
+## 工作流
 
-1. **Efficiency**: Documentation is pre-digested knowledge, faster than parsing code
-2. **Context**: Provides architectural understanding that code alone cannot convey
-3. **Accuracy**: Maintained by developers, reflects intended design not just implementation
+Load the `llmdoc` skill before broad code exploration, planning, document updates, or non-trivial code edits.
 
-## llmdoc Structure
+The main assistant should align with the user before non-trivial plans or edits.
 
-```
-llmdoc/
-├── index.md              # START HERE - Navigation and overview
-├── overview/             # "What is this project?"
-│   └── project-overview.md
-├── architecture/         # "How does it work?" (LLM Retrieval Map)
-│   └── *.md
-├── guides/               # "How do I do X?"
-│   └── *.md
-└── reference/            # "What are the specifics?"
-    └── *.md
-```
+Use available `llmdoc` subagents when they fit the task. Prefer `investigator` for context exploration, current-state research, unfamiliar subsystems, and reusable scratch reports; use `recorder` for stable doc updates, `worker` for scoped implementation, and `reflector` for process lessons.
 
-### Reading Priority
+At the end of a non-trivial task, the main assistant should evaluate whether to ask the user to run `/llmdoc:update`.
 
-1. **Always read `llmdoc/index.md` first** - Contains navigation and document summaries
-2. **Read ALL documents in `llmdoc/overview/`** - Essential project context
-3. **Read relevant `architecture/` docs** - Before modifying related code
-4. **Consult `guides/`** - For step-by-step workflows
-5. **Check `reference/`** - For conventions, data models, API specs
+Treat `.llmdoc-tmp/` as a local temporary context cache only. Validate scratch reports before reuse; tracked `llmdoc/` docs are the project knowledge source.
 
-## Working with llmdoc
-
-### Before Writing Code
-
-```
-1. Check: Does llmdoc/ exist?
-   - YES → Read index.md, then relevant docs
-   - NO  → Proceed with caution, suggest initializing docs
-
-2. Find relevant architecture docs for the area you're modifying
-
-3. Check guides/ for existing workflows
-
-4. Review reference/ for conventions to follow
-```
-
-### After Completing Code Changes
-
-**Documentation updates are NOT automatic.** After completing a task:
-
-1. Identify which concepts/features were affected
-2. Ask the user: "Would you like to update the project documentation?"
-3. If confirmed, update relevant docs in `llmdoc/`:
-   - Modify existing docs to reflect changes
-   - Add new docs if new concepts were introduced
-   - Keep updates minimal and precise
-   - Update `index.md` if document structure changed
-
-### Documentation Update Principles
-
-1. **Minimality**: Use fewest words necessary
-2. **Accuracy**: Based on actual code, not assumptions
-3. **No Code Blocks**: Reference code with `path/file.ext:line` format
-4. **LLM-Friendly**: Write for machine consumption, not human tutorials
-
-## Code Reference Format
-
-When referencing code in documentation or reports:
-
-````
-# Good - Reference format
-`src/auth/jwt.js` (generateToken, verifyToken): Handles JWT creation and validation
-
-# Bad - Pasting code
-```javascript
-function generateToken(payload) {
-  // ... 50 lines of code
-}
-````
-
-## Quick Reference
-
-| Task               | Action                               |
-| ------------------ | ------------------------------------ |
-| Understand project | Read `llmdoc/index.md` → `overview/` |
-| Modify feature X   | Read `architecture/x-*.md` first     |
-| Follow workflow    | Check `guides/`                      |
-| Check conventions  | Read `reference/`                    |
-| After code changes | Offer to update relevant docs        |
-
-## No llmdoc Directory?
-
-If `llmdoc/` doesn't exist:
-
-1. The project hasn't initialized documentation yet
-2. Work carefully, relying on README.md and code comments
+Keep detailed workflow rules, templates, hook behavior, and doc-structure guidance in the `llmdoc` skill.
