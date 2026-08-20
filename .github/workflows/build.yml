@@ -52,6 +52,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Cache patched SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/sdk-cache
+          key: theos-sdk-iPhoneOS16.5
+
       - name: Install Theos
         run: |
           brew install ldid dpkg
@@ -59,13 +65,21 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           # macOS runner 上 Xcode 自带的 iOS SDK 不含私有框架 stub（Preferences、
           # FrontBoardServices 等），链接依赖私有框架的 target 会报 'framework not found'。
-          # 从 theos/sdks 拉取带私有框架 stub 的 patched SDK（只取一个版本以省时）。
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/theos-sdks
-          git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
-          cp -r /tmp/theos-sdks/iPhoneOS16.5.sdk $HOME/theos/sdks/
+          # 从 theos/sdks 拉取带私有框架 stub 的 patched SDK（缓存后跳过下载）。
+          if [ ! -d "$HOME/sdk-cache/iPhoneOS16.5.sdk" ]; then
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/theos-sdks
+            git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
+            mkdir -p "$HOME/sdk-cache"
+            cp -r /tmp/theos-sdks/iPhoneOS16.5.sdk "$HOME/sdk-cache/"
+          fi
+          cp -r "$HOME/sdk-cache/iPhoneOS16.5.sdk" $HOME/theos/sdks/
 
       - name: Build ${{ matrix.tweak }}
         working-directory: ${{ matrix.tweak }}
+        env:
+          # 显式指向带私有框架 stub 的 patched SDK。否则 theos 的 `latest` 会选
+          # Xcode 自带且不含私有框架的更高版本 iOS SDK，链接 Preferences 等失败。
+          SYSROOT: ${{ env.THEOS }}/sdks/iPhoneOS16.5.sdk
         run: |
           make clean
           make FINALPACKAGE=1
