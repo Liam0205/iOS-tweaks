@@ -167,3 +167,5 @@ JGBSDK @0xbc4c 的 `_exit` 是越狱检测命中后的退出点，hook 它或其
 
 **下一轮单一假设（待验证）：**
 两条并行：(1) 对抗侧——用 tweak hook `contentsOfDirectoryAtPath:error:` / `NSDirectoryEnumerator`，过滤掉含我方 dylib/plist 的结果（参考 mybankbypass 的“保留 NSFileManager 目录结果过滤”成功经验），看能否消除这一检测；(2) 定位侧——找该扫描函数入口 + 调用者，追 `w20=1` 到退出决策，确认真实退出原语。
+
+**决策（用户拍板）：先做 A = 闭环验证。** 针对已确认的 `DynamicLibraries` 目录扫描检测写对抗（过滤 `contentsOfDirectoryAtPath:error:` 结果，隐藏我方 dylib/plist 及常见越狱文件），装机跑一次，观察秒退时间是否变化/消除，以此判断该扫描是否秒退主因。若有效则继续逐项；若无效说明秒退主因在别的检测，再回到定位侧。逐项静态摸清（B）暂缓。
