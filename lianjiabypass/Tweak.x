@@ -316,9 +316,22 @@ static void *watchdog_thread(void *arg) {
                                             (thread_state_t)&state, &cnt);
         thread_resume(g_main_mach_thread);
         if (kr == KERN_SUCCESS) {
-            lj_log("WATCHDOG[%d] main thread state:", tick);
+            lj_log("WATCHDOG[%d] main thread backtrace:", tick);
             describe_addr("pc", (uintptr_t)state.__pc);
             describe_addr("lr", (uintptr_t)state.__lr);
+            // 手动走 fp 链回溯（主线程已 suspend，不能用 backtrace()）
+            uintptr_t fp = (uintptr_t)state.__fp;
+            for (int d = 0; d < 20 && fp; d++) {
+                uintptr_t saved_fp = 0, saved_lr = 0;
+                // 读 [fp]=saved_fp, [fp+8]=saved_lr（可能 fault，简单校验）
+                if (fp & 0xf) break;
+                saved_fp = *(uintptr_t *)fp;
+                saved_lr = *(uintptr_t *)(fp + 8);
+                if (!saved_lr) break;
+                describe_addr("  ret", saved_lr);
+                if (saved_fp <= fp) break;  // 栈向上生长，防环
+                fp = saved_fp;
+            }
         } else {
             lj_log("WATCHDOG[%d] thread_get_state failed kr=%d", tick, kr);
         }
@@ -336,7 +349,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.10 (cached vis-map) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.11 (bt unwind) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }

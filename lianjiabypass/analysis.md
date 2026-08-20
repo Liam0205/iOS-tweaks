@@ -318,3 +318,39 @@ v0.0.7 地址范围法失败（`_dyld_get_image_header` 的 base=0x1127c4000 与
 
 **下一轮单一假设（待验证）：**
 修 caller 判定：在 `caller_is_detector` 内加打点，记录每次 dladdr 解析出的 caller 模块名 + 判定结果，确认为何对 JGBSDK 返回假。修正后预期：JGBSDK 调用重排（绕过秒退）、App 调用透传（不冻结）→ 进主界面。
+
+---
+
+## 第 9 轮：完整栈回溯 → 冻结元凶是 a.framework 的 `_isInjectedWithDynamicLibrary`（2026-08-20）
+
+### 假设
+缓存 vis-map 消除 O(n²) 后不再卡 strstr。
+
+### 验证方法
+v0.0.10 缓存 vis-map（visibleIdx→realIdx，count 变化才重建）—— 仍卡 strstr。v0.0.11：看门狗手动走 fp 帧指针链回溯主线程完整调用栈（suspend 态不能用 backtrace()）。
+
+### 观察结果
+主线程完整栈（卡死点）：
+```
+_platform_strstr  (libsystem_platform)
+  ← libsystem_c (strnstr)
+  ← a.framework+0x67d0  _isInjectedWithDynamicLibrary   ★元凶
+  ← a.framework+0x5ef0  skListModel
+  ← LianJiaShell 业务层 (+0x12b6bc4 等，符号被混淆成乱码字符串)
+  ← _dispatch_main_queue_callback_4CF ← CFRunLoopRunSpecific ← UIApplicationMain
+```
+
+### 推论
+
+**已确认（冻结真凶）：**
+- **元凶是 `a.framework`（90KB，第 0 轮误判为“无明显特征小库”）的 `_isInjectedWithDynamicLibrary` 函数**，经 `skListModel` 在**主线程 dispatch main queue 回调**里运行，内部大量 `strstr`。
+- 它经 CFRunLoop→dispatch main queue 周期性执行，每轮做昂贵 strstr 扫描 → 主线程一直忙 → UI 起不来（表现为“冻结”）。
+- `caller_is_detector` 之前只认 JGBSDK/du/senseid，**漏了 a.framework** → 它的 dyld 调用被透传，且它自身的 strstr 检测未被拦。
+- dyld vis-map 缓存本身是对的（消除了 dyld 侧 O(n²)），但没触及 a.framework 的独立 strstr 检测。
+
+**关键洞察：**
+- 检测由多个独立组件叠加：JGBSDK（文件/dylib 检测→秒退）+ **a.framework（注入检测 `_isInjectedWithDynamicLibrary`→主线程忙循环）**。
+- a.framework 有导出符号 `_isInjectedWithDynamicLibrary` / `skListModel`——可直接 hook 该函数返回“未注入”，比拦 dyld 更外科手术。
+
+**下一轮单一假设（待验证）：**
+直接 hook `a.framework` 的 `_isInjectedWithDynamicLibrary`（MSHookFunction 或 fishhook 符号）让其恒返回“未注入/0”，消除主线程 strstr 忙循环。预期：秒退绕过 + 不冻结 + 进链家主界面。
