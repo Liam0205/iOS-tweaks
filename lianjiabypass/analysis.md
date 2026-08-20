@@ -414,3 +414,32 @@ v0.0.13：fishhook exit/_exit/abort/kill + 栈回溯。v0.0.14：+ pthread_kill 
 
 **下一轮单一假设（待验证）：**
 批量 hook a.framework 检测导出符号（`_checkPath`/`_codesignState`/`_commonState`/`_networkState`/`_devicePasscodeSet`/`_dyldEnvironmentVariables`/`_f_open`），先“观察模式”记录各函数返回值 + 调用时机（哪个在 T+5s 附近被调、返回了什么），再逐个强制返回“安全”值。优先反汇编这几个函数确认语义（返回 1=安全 还是 0=安全）。
+
+---
+
+## 第 12 轮：定性退出 = JGBSDK 直接 exit syscall（2026-08-20）
+
+### 假设
+第三层无痕退出走直接 syscall。
+
+### 验证方法
+v0.0.15 禁用看门狗对照（排除自造）→ 仍 T+2~4s 退出。v0.0.16 MSHookFunction 直接 hook exit/_exit/abort（比 fishhook 彻底）→ 仍未命中。capstone 扫描 a/JGBSDK 的 `svc #0x80` + 前置 `mov w16,#N`。
+
+### 观察结果
+- 禁用看门狗后退出**更早**（T+2~4s）→ **退出非我方造成**。
+- MSHook exit/_exit/abort 全就位仍不命中 → 退出不经 libc。
+- **JGBSDK 含 30+ 处 `mov w16,#1; svc #0x80`** —— syscall #1 = Darwin `exit`。**JGBSDK 到处用直接 svc 自杀，完全绕过 libc**，故所有 exit/信号 hook 失效。（另有 w16=0xbc=stat(188)、0xca=sysctl(202) 反调试）。
+- a.framework 仅 4 处 svc（多为 sysctl 类）。
+
+### 推论
+
+**已确认（第三层退出机制）：**
+- 退出由 **JGBSDK 内联的直接 `exit` syscall（svc #0x80, w16=1）** 完成，散布 30+ 处于各检测失败路径。libc 层 hook（fishhook/MSHookFunction）与信号捕获对其**完全无效**。
+- 这是链家检测框架的惯用反 hook 手法（`_commonState` 里的 sysctl 反调试也是直接 svc）。
+
+**对抗路线（两条）：**
+1. **运行时 patch svc**：ctor 里扫描 JGBSDK `__text`，将 `mov w16,#1` 之后的 `svc #0x80` 改为 `nop`（或让 exit syscall 空转）。风险：代码段 RX 需改页权限；可能有 __text 完整性自校验；syscall#1 也可能用于正常退出（需限定仅 JGBSDK）。
+2. **阻止退出决策**：定位 T+2s 触发退出的检测点，让其判定“安全”，使代码走不到 exit 分支。
+
+**下一轮单一假设（待验证）：**
+先走路线 1 的定位版：反汇编 JGBSDK 几个 exit 点（如 0xcba4/0xd180/0xff78）的上游，看是否共享一个“检测失败→exit”封装函数；若有单一封装则 hook 该封装函数直接 return（不 exit）最省事。同时评估运行时 patch 全部 svc#1 为 nop 的可行性（mprotect/vm_protect 改页权限 + 是否触发完整性校验）。
