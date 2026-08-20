@@ -130,3 +130,40 @@ frida-server 17.9.8（设备）+ client（本机 venv，经 SSH 隧道转发 270
 
 **下一轮单一假设（待验证）：**
 放弃裸 Frida，回到 **tweak 注入路线**（attempt 已证明 ElleKit 能进且 `%ctor` 稳定执行、未被立即杀）。用 MSHookFunction 直接 hook `_exit`/`exit`/`abort` 函数实现地址 + 遍历 `LJBRProtectManager` 方法打点（日志写沙箱内 `NSTemporaryDirectory()`），定位真实退出机制。若 tweak 也零命中，则确认退出走内联 `svc`，转向 binary patch 或更上游隐藏检测源。
+
+---
+
+## 第 3 轮：JGBSDK 静态反汇编（2026-08-20，LIEF + capstone）
+
+### 假设
+JGBSDK @0xbc4c 的 `_exit` 是越狱检测命中后的退出点，hook 它或其调用者可阻断秒退。
+
+### 验证方法
+用 LIEF 解析绑定表 + capstone 反汇编。定位 `_exit`（唯一调用点 @0xbc4c）所属函数，解析其调用的 stub（普通 stub + `__objc_stubs` selector），dump `containsString:` 比对的 CFString 常量。
+
+### 观察结果
+- **`_exit` @0xbc4c 是 `___stack_chk_fail` 的死角**：`0xbc48: bl ___stack_chk_fail`（stub 0x27d3ec 已确认）紧接 `0xbc4c: bl _exit`，是编译器栈保护失败处理块，**正常执行永不到达**。这解释了第 1、2 轮 hook @0xbc4c 零命中。
+- 含 `_exit` 的函数（入口约 0xafe8 附近，尾在 0xbc4c）是一个**文件系统扫描检测函数**，返回布尔 `w20`（0=干净 / 1=命中，`0xbc04: mov w20,#1`）：
+  - `[NSFileManager defaultManager]` + `contentsOfDirectoryAtPath:error:` 枚举目录
+  - `countByEnumeratingWithState:objects:count:` 两层嵌套 for-in 遍历目录及子目录
+  - 对每项 `containsString:` 匹配常量
+- **比对常量（@0x28b1xx CFString）**：`'%@%@/DynamicLibraries'`、`'.dylib'`、`'.plist'`、`'lnk'`。
+- stub 身份确认：0x27d3ec=`___stack_chk_fail`、0x27d56c=`_exit`、0x27d7a0=`_objc_release`、0x27d74c=`_objc_enumerationMutation`。
+
+### 推论
+
+**已确认：**
+- JGBSDK 有一个 **MobileSubstrate `DynamicLibraries` 目录扫描检测**：枚举 `.../DynamicLibraries` 目录，对文件名匹配 `.dylib`/`.plist` 判定越狱注入。
+- **这个检测直接命中我们自己的 tweak**：`LianJiaBypass.dylib` + `LianJiaBypass.plist` 就在 `/var/jb/Library/MobileSubstrate/DynamicLibraries/`。装 tweak 反而给检测送把柄。
+- JGBSDK 唯一的 `_exit` 与检测退出无关（是 stack_chk 死角）——**真实秒退不在 JGBSDK 的 `_exit`**，在别处（调用者据 `w20` 决策，或其他检测项/框架）。
+
+**已排除：**
+- “hook JGBSDK @0xbc4c 能阻断退出” —— 否定，那是 stack_chk_fail 死角。
+
+**仍未知：**
+- 这个扫描函数的调用者是谁、`w20=1` 后如何触发退出。
+- 真实秒退的退出原语（仍未定位）。
+- 其他检测项（`JailbrokenCheck` 等）各自的实现。
+
+**下一轮单一假设（待验证）：**
+两条并行：(1) 对抗侧——用 tweak hook `contentsOfDirectoryAtPath:error:` / `NSDirectoryEnumerator`，过滤掉含我方 dylib/plist 的结果（参考 mybankbypass 的“保留 NSFileManager 目录结果过滤”成功经验），看能否消除这一检测；(2) 定位侧——找该扫描函数入口 + 调用者，追 `w20=1` 到退出决策，确认真实退出原语。
