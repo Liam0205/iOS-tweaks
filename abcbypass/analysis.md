@@ -1017,4 +1017,47 @@ BT[14] dyld start + 2528
 3. **直接 hook MbapMPaaS 检测函数**: 根据 backtrace 偏移量找到检测入口，MSHookFunction 使其返回 "clean"
 4. **hook SDK 的 ctor**: 使用 `_dyld_register_func_for_add_image` 在 SDK dylib 加载时立即 hook 其 ctor 内的检测逻辑
 
+---
+
+## 第 13 轮（续）: 2215 设备实测 —— 定位退出源头 + 源头 patch 失败于完整性校验（2026-08-20）
+
+### 基线复现（v0.1.0-116, drain-level longjmp 版）
+- 设备: iPhone 13 Pro / iOS 15.4.1 / 端口 2215。工具: simtouch 自动化截图 + tap。
+- ABC 11.1.0 **存活 >3 分钟**、UI 完整渲染（登录页/首页动画在跑），DIAG 显示 drains 稳定 ~62 次/秒、无 exit 复发、无 "逐渐降级"。
+- **但触摸不可交互**（用户实测: 点登录页返回键后整个 App 不再响应点击，动画仍在）。
+- 根因: T+16.13s 主线程 `exit(0)` 被 drain-level longjmp 中和，但 longjmp 从 `_dispatch_main_queue_callback_4CF` 中途跳出，破坏了主 RunLoop 的事件投递结构 —— drain pump 能让定时器/动画类 block 继续跑（drains 在涨），但新触摸事件无法通过被破坏的 RunLoop 投递。**证实文档记载的 v89-92 "longjmp 后 UI 冻结" 教训: drain-level 只是把破坏点下移，未根治。**
+
+### 退出源头精确定位（backtrace + capstone）
+- 给 `hooked_exit` 加主线程完整 backtrace。抓到那次致命 exit 的调用链:
+  ```
+  dyld start → main → UIApplicationMain → GSEventRunModal → CFRunLoopRunSpecific
+    → _dispatch_main_queue_callback_4CF → libdispatch → MbapMPaaS+0x8db264 → hooked_exit
+  ```
+  即 **SDK 通过 dispatch_async 往主队列投递的检测 block，命中越狱后直接 exit(0)**（不是定时器，走 GCD 主队列）。
+- 反汇编 `MbapMPaaS+0x8db254` 附近，判定结构:
+  ```
+  0x8db254: cmp  w24, #3        ; 检测状态 == 3 (风险/越狱)
+  0x8db258: b.ne #0x8db1bc      ; 否 → 正常路径 (原始 21fbff54 = b.ne)
+  0x8db25c: mov  w0, #0
+  0x8db260: bl   _exit          ; 是 → exit(0)  ← 破坏 RunLoop 的源头
+  0x8db264: bl   ___stack_chk_fail
+  ```
+  经 LIEF 解析 GOT 确认: `0x1049f9234`→`_exit`，`0x1049f84cc`→`___stack_chk_fail`，`0x1049fa248`→`_objc_release`。`0x8db1bc`（b.ne 目标）是无 exit 的正常继续路径。
+
+### 源头 patch 尝试与失败（关键负面结果）
+- 方案: 运行时把 `0x8db258` 的 `b.ne #0x8db1bc` patch 成无条件 `b #0x8db1bc`（`21fbff54`→`d9ffff17`），标准 W^X 流程（vm_protect RW+COPY → 写 → 恢复 RX → sys_icache_invalidate），带原始指令校验。
+- 结果: patch **写入成功**（日志确认 `b.ne -> b`），且**这次启动全程无 EXIT blocked、无 DRAIN ESCAPE**（exit 确实没被调用，源头阻断机制上有效）。
+- **但进程约 T+0.58s 崩溃**: crash log = **SIGILL (Illegal instruction: 4)**，faulting thread 0 = `libobjc lookUpImpOrForward` ← `_objc_msgSend_uncached` ← `MbapMPaaS+0x2fd9570`，经 `dispatch_once_callout` 初始化路径。崩溃点是正常 objc_msgSend（与 patch 的 0x8db258 无直接控制流关联）。
+- **定性: ABC SDK 存在 `__text` 段代码完整性校验**。对主 binary 任何运行时代码修改都会被发现，触发 objc 层 SIGILL。与 **round 13 (v85) patch svc 失败 0.82s 崩溃同源**（时间量级一致）。
+- **对比 lianjiabypass**: JGBSDK 无此完整性校验，`__text` patch（29 处 svc→ret）成功。**ABC 不适用 __text patch 路线**。已禁用 `patch_detection_exit_branch()`，保留代码供参考。
+
+### 新的确定结论
+- 破坏 UI 交互的**唯一源头**已精确定位: `MbapMPaaS+0x8db260` 的 `exit(0)`，由主队列 dispatch block 中 `cmp w24,#3` 判定触发。
+- 源头阻断的正确方向不是改主 binary 代码，而是: **(a) 让 w24 != 3**（hook 计算 w24 的上游检测函数，使其返回非风险值）；或 **(b) 拦截该 dispatch block 本身不让它上主队列执行**（backtrace frame 有 block 函数地址，可在 dispatch_async hook 里按 caller 过滤）；或 **(c) hook 那个包含 0x8db254 判定的函数入口整体 return**（需先定位函数入口，非返回地址）。
+- 完整性校验的存在意味着: 所有绕过必须靠**函数级 hook（MSHookFunction trampoline 在函数入口，改的是执行流不是校验覆盖的指令字节）或数据/状态干预**，不能改 `__text` 指令。
+
+### 下一步
+- 优先方案 (b): 该 exit block 的函数入口地址在 backtrace 里（`MbapMPaaS` frame，dispatch 投递的 block）。在已有的 `dispatch_after`/`dispatch_async` hook 基础上，按 block 函数所属地址范围过滤掉这个检测 block，使其根本不上主队列。风险: 需确认丢弃该 block 不影响正常初始化。
+- 备选 (a): 反汇编 `0x8db254` 所在函数入口，回溯 w24 的来源（哪个检测函数的返回值），MSHookFunction 该函数使其返回 clean。
+
 

@@ -1498,9 +1498,13 @@ static void hookDetectionByOffset(void) {
     // Arm file/dyld/sysctl hooks FIRST (MSHookFunction, not fishhook — avoids GOT modification).
     build_dyld_map();
 
-    // 源头阻断: patch 检测退出分支 (b.ne -> b), 使主线程检测 exit(0) 永不执行。
-    // 优于 longjmp 逃逸 —— 不触发 exit 就不破坏 RunLoop 事件投递, UI 可交互。
-    patch_detection_exit_branch();
+    // 源头阻断尝试: patch 检测退出分支 (b.ne -> b) —— 【已禁用, 失败】
+    // ABC SDK 存在 __text 段代码完整性校验: patch 主 binary 后约 0.58s 触发
+    // SIGILL 崩溃 (libobjc lookUpImpOrForward, 经 dispatch_once 初始化路径)。
+    // 与 round 13 (v85) patch svc 失败 0.82s 崩溃同源。对 ABC 主 binary 的任何
+    // 运行时代码修改都会被完整性校验发现。lianjiabypass 的 JGBSDK 无此校验故
+    // patch 成功, ABC 不适用。保留函数供参考, 不调用。
+    // patch_detection_exit_branch();
 
     abc_log("arming ctor hooks (MSHookFunction — GOT-clean)");
     MSHookFunction((void *)stat, (void *)hooked_stat, (void **)&orig_stat);
