@@ -46,6 +46,7 @@ jobs:
     needs: discover
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
         tweak: ${{ fromJson(needs.discover.outputs.tweaks) }}
     steps:
