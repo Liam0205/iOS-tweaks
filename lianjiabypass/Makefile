@@ -14,5 +14,6 @@ ifeq ($(shell uname),Linux)
 LianJiaBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
 endif
 LianJiaBypass_FRAMEWORKS = Foundation UIKit
+LianJiaBypass_LIBRARIES = substrate
 
 include $(THEOS_MAKE_PATH)/tweak.mk

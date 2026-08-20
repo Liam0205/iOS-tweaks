@@ -354,3 +354,34 @@ _platform_strstr  (libsystem_platform)
 
 **下一轮单一假设（待验证）：**
 直接 hook `a.framework` 的 `_isInjectedWithDynamicLibrary`（MSHookFunction 或 fishhook 符号）让其恒返回“未注入/0”，消除主线程 strstr 忙循环。预期：秒退绕过 + 不冻结 + 进链家主界面。
+
+---
+
+## 第 10 轮：冻结破除 → 暴露第三层“延迟退出”（2026-08-20）
+
+### 假设
+MSHookFunction hook `_isInjectedWithDynamicLibrary` 恒返回 0 → 消除主线程忙循环。
+
+### 验证方法
+v0.0.12：Makefile 加 `LIBRARIES=substrate`；ctor 里 `dlsym(RTLD_DEFAULT,"isInjectedWithDynamicLibrary")` + `MSHookFunction`（框架内部直接调用，fishhook 符号 rebind 无效，必须 MSHookFunction）。看门狗手动 fp 回溯持续观察主线程。
+
+### 观察结果
+- `MSHookFunction ... @0x10daea71c OK`，`_isInjectedWithDynamicLibrary -> forced 0` **仅被调 3 次**（不再忙循环）。
+- **WATCHDOG[2]（T+4s）主线程栈完全正常**：`mach_msg2_trap ← mach_msg ← CFRunLoopRunSpecific ← GSEventRunModal ← UIApplicationMain` —— **主线程健康 idle，冻结彻底破除**。
+- 但进程在 T+4s 后退出（看门狗只到第 2 次，第 3 次没了；ps 无进程）。App 正常运行了约 4s+ 才退。
+
+### 推论
+
+**已确认（累积战果）：**
+- 三层防御逐层剥开：
+  1. **秒退层**（JGBSDK 文件/dylib 检测）— 已破：access/stat 拦截 + dyld vis-map 作用域重排。
+  2. **冻结层**（a.framework `_isInjectedWithDynamicLibrary` 主线程 strstr 忙循环）— **已破**：MSHookFunction 恒返回 0。
+  3. **延迟退出层**（新）— App 正常 idle 运行数秒后被终止。
+- `_isInjectedWithDynamicLibrary` 是框架内部直接调用 → 只能 MSHookFunction，fishhook 对内部直接 bl 无效（重要经验）。
+
+**仍未知：**
+- 第三层退出方式：自杀（exit/abort/SIGKILL）还是 crash？触发者？
+- a.framework 还有 `_checkPath`/`_codesignState`/`_f_open`/`_dyldEnvironmentVariables`/`_devicePasscodeSet` 等一堆检测导出符号，可能接力触发退出。
+
+**下一轮单一假设（待验证）：**
+先定性第三层退出方式：查 crash log（/var/mobile/Library/Logs/CrashReporter 或 os_log）判断是 exit/abort/signal；同时看门狗改为记录退出前最后动作 + hook `exit`/`abort`/`_exit` 打调用栈。据此定位第三层检测源（优先怀疑 a.framework 其余检测导出符号）。

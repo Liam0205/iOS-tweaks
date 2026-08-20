@@ -94,6 +94,7 @@ static _Thread_local int g_reentrant = 0;
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/arm/thread_status.h>
+#import <substrate.h>
 #import "fishhook.h"
 
 // 判定加载镜像名是否为越狱/注入相关（用于隐藏 dylib 列表）
@@ -145,6 +146,14 @@ static int (*orig_access)(const char *, int);
 static int hooked_access(const char *path, int mode) {
     if (is_jb_name_c(path)) { lj_log("access BLOCK: %s", path); errno = ENOENT; return -1; }
     return orig_access(path, mode);
+}
+
+// a.framework（链家自研检测库）的注入检测函数：在主线程 dispatch 回调里
+// 大量 strstr 扫描已加载 dylib，拖死主线程。直接 hook 恒返回“未注入”。
+static int (*orig_isInjected)(void);
+static int hooked_isInjected(void) {
+    lj_log("_isInjectedWithDynamicLibrary -> forced 0");
+    return 0;
 }
 
 // ========== dyld 镜像枚举对抗（作用域限定：只对 JGBSDK 的调用生效）==========
@@ -349,7 +358,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.11 (bt unwind) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.12 (hook isInjected) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -365,7 +374,17 @@ static void *watchdog_thread(void *arg) {
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
     };
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-    lj_log("hooks active rr=%d (global dyld + watchdog)", rr);
+    lj_log("file/dyld hooks active rr=%d", rr);
+
+    // MSHookFunction hook a.framework 的 _isInjectedWithDynamicLibrary（框架内部直接调用，fishhook 无效）
+    void *sym = dlsym(RTLD_DEFAULT, "isInjectedWithDynamicLibrary");
+    if (!sym) sym = dlsym(RTLD_DEFAULT, "_isInjectedWithDynamicLibrary");
+    if (sym) {
+        MSHookFunction(sym, (void *)hooked_isInjected, (void **)&orig_isInjected);
+        lj_log("MSHookFunction _isInjectedWithDynamicLibrary @ %p OK", sym);
+    } else {
+        lj_log("dlsym _isInjectedWithDynamicLibrary NOT FOUND");
+    }
 
     // ctor 在主线程执行，抓主线程 mach port，启动看门狗
     g_main_mach_thread = mach_thread_self();
