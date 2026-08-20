@@ -235,3 +235,31 @@ v0.0.4：最小 4 hook + 全路径 stat 打点。v0.0.5：+ `_dyld_image_count`/
 
 **下一轮单一假设（待验证）：**
 先区分冻结成因：(a) 用 simtouch 确认是否任何检测项残留触发；(b) 抓主线程调用栈（lldb/frida 受 anti-frida 限制，可用 tweak 装 SIGSTOP 观察 or 定时 dump 主线程 backtrace）定位阻塞点；(c) 对照实验——临时收窄 dyld 隐藏范围（只藏自己 dylib 不藏 ellekit），排除 hook 副作用导致镜像索引错乱。
+
+---
+
+## 第 6 轮：dyld 策略对照 —— 重排索引 vs 只改名（2026-08-20）
+
+### 假设
+主线程冻结是 dyld 索引重排的副作用（App/Flutter 按索引访问镜像时错乱），改成“不重排 count/索引、只把越狱 dylib 名字换成系统库名”既能骗过 DylibCheck 又不冻结。
+
+### 验证方法
+v0.0.6：`_dyld_image_count` 原样返回；`_dyld_get_image_name(idx)` 仅当该 idx 是越狱 dylib 时返回 `/usr/lib/system/libsystem_c.dylib`，不改数量/索引。其余对抗不变。
+
+### 观察结果
+- **v0.0.6 秒退恢复**（T+4s 活、T+8s 退）。日志正常到 `stat BLOCK /Applications/Cydia.app`，之后退出。
+- 对照 v0.0.5（重排 count+索引）：秒退绕过但冻结。
+
+### 推论
+
+**已确认：**
+- **DylibCheck 不是（只）按名字匹配**——只改名字骗不过，必须真正减少 `_dyld_image_count` 并重排索引跳过越狱项才能绕过秒退。
+- 因此 v0.0.5 的冻结**极可能就是索引重排副作用**：App/Flutter/系统库某处按 `_dyld_get_image_name(i)` 的原始索引访问镜像，重排后 count 变小、索引错位，导致取到错误镜像或越界，主线程阻塞。
+- 两者构成矛盾：不重排→秒退；重排→冻结。需要更精准的 DylibCheck 对抗，不能靠全局重排。
+
+**仍未知：**
+- DylibCheck 的确切实现（如何用 count/name/索引判定？是否还查 header/`_dyld_get_image_header`？）。
+- 是否有比“全局重排 `_dyld_get_image_name`”更外科手术式的绕过点（如直接 hook JGBSDK 的 DylibCheck 函数返回、或只在 JGBSDK 调用栈内重排）。
+
+**下一轮单一假设（待验证）：**
+静态反汇编 JGBSDK 定位 DylibCheck 函数实现，看它具体读什么（`_dyld_image_count` + `_dyld_get_image_name` + 是否 `_dyld_get_image_header`/`dladdr`/字符串匹配列表）。据此设计外科手术式绕过：优先直接 hook DylibCheck 函数让其返回“未检出”，或仅在检测调用栈内做镜像过滤，避免全局 dyld 重排污染 App 自身逻辑。

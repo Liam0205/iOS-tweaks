@@ -148,28 +148,18 @@ static int hooked_access(const char *path, int mode) {
 static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 
+// 不重排索引/数量（避免扰乱 App 自身按索引访问镜像的逻辑），
+// 只把越狱 dylib 的名字替换成无害系统库名，骗过按名字匹配的 DylibCheck。
 static uint32_t hooked_dyld_image_count(void) {
-    uint32_t count = orig_dyld_image_count();
-    uint32_t hidden = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = orig_dyld_get_image_name(i);
-        if (name && is_jb_dylib(name)) hidden++;
-    }
-    return count - hidden;
+    return orig_dyld_image_count();
 }
 
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
-    uint32_t count = orig_dyld_image_count();
-    uint32_t visibleIdx = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = orig_dyld_get_image_name(i);
-        if (!name) continue;
-        if (!is_jb_dylib(name)) {
-            if (visibleIdx == idx) return name;
-            visibleIdx++;
-        }
+    const char *name = orig_dyld_get_image_name(idx);
+    if (name && is_jb_dylib(name)) {
+        return "/usr/lib/system/libsystem_c.dylib";
     }
-    return orig_dyld_get_image_name(0);
+    return name;
 }
 
 static void *(*orig_dlopen)(const char *, int);
@@ -250,7 +240,7 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.5 (file+dyld hooks) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.6 (dyld no-reindex) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
