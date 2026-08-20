@@ -2,3 +2,4 @@
 .theos/
 packages/
 app-binary/
+frida/logs/
