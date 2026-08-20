@@ -263,3 +263,30 @@ v0.0.6：`_dyld_image_count` 原样返回；`_dyld_get_image_name(idx)` 仅当�
 
 **下一轮单一假设（待验证）：**
 静态反汇编 JGBSDK 定位 DylibCheck 函数实现，看它具体读什么（`_dyld_image_count` + `_dyld_get_image_name` + 是否 `_dyld_get_image_header`/`dladdr`/字符串匹配列表）。据此设计外科手术式绕过：优先直接 hook DylibCheck 函数让其返回“未检出”，或仅在检测调用栈内做镜像过滤，避免全局 dyld 重排污染 App 自身逻辑。
+
+---
+
+## 第 7 轮：dyld 调用点静态分析 → 改用“作用域限定”对抗（2026-08-20）
+
+### 假设
+静态定位 DylibCheck 后可外科手术式绕过。
+
+### 验证方法
+LIEF + capstone 解析 JGBSDK 对 `_dyld_*` 的全部调用点（count×10、get_image_name×7、header×6、slide×5、register_func_for_add_image×1），反汇编聚集区。
+
+### 观察结果
+- `0xc5f8` 函数：给定名字（`libsystem_kernel.dylib`，存于 `__data` 0x299338）遍历镜像找匹配项，校验 Mach-O magic `0xfeedfacf`、解析 `__TEXT` 段算基址范围 —— 是 **hook 完整性检查的前置**（定位 libsystem_kernel 以检查其 syscall 是否被 patch），与 abcbypass “第二检测路径：hook 完整性” 同类，非 DylibCheck 本体。
+- JGBSDK 还用 `_dyld_register_func_for_add_image`（@0x111cc，1 处）——注册镜像加载回调，持续监控新加载的 dylib。
+- dyld 调用点分散在 6+ 个函数（0x80xx、0xc6xx、0xe6xx、0x103xx、0x111xx、0x155xx、0x159xx），逐个反汇编成本高、收益低。
+
+### 推论
+
+**已确认：**
+- JGBSDK 多处、多用途使用 dyld 镜像枚举（找越狱 dylib、hook 完整性、镜像加载监控），不是单一 DylibCheck 函数——逐个 hook 不现实。
+- 全局重排 `_dyld_get_image_name`/`_dyld_image_count`（v0.0.5）能绕过秒退但污染 App 自身按索引访问镜像的逻辑 → 冻结。
+
+**方向调整：**
+放弃“定位单一 DylibCheck”与“全局重排”，改用 **作用域限定对抗**：dyld hook 内用返回地址判断调用来源，仅当调用来自 JGBSDK 模块地址范围内时才隐藏/重排越狱镜像，来自 App/Flutter/系统库的调用一律透传原始结果。这样既骗过 JGBSDK 的所有 dyld 用途，又不扰乱 App 自身。
+
+**下一轮单一假设（待验证）：**
+v0.0.7：dyld hook 加“调用来源 == JGBSDK 模块”判定（`_dyld_get_image_header`/`dladdr` 拿 JGBSDK 基址+大小，比对 `__builtin_return_address(0)`）。命中 JGBSDK 才重排隐藏，否则透传。预期：秒退绕过 + 不冻结、进主界面。

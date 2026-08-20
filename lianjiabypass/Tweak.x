@@ -143,23 +143,66 @@ static int hooked_access(const char *path, int mode) {
     return orig_access(path, mode);
 }
 
-// ========== dyld 镜像枚举对抗（隐藏越狱 dylib，对付 DylibCheck）==========
+// ========== dyld 镜像枚举对抗（作用域限定：只对 JGBSDK 的调用生效）==========
+// 全局重排 _dyld_get_image_name 会污染 App/Flutter 自身按索引访问镜像的逻辑（导致冻结）。
+// 改为：仅当调用来自 JGBSDK 模块地址范围内时，才隐藏/重排越狱镜像；其余透传。
+
+static uintptr_t g_jgb_base = 0;
+static uintptr_t g_jgb_end = 0;
 
 static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 
-// 不重排索引/数量（避免扰乱 App 自身按索引访问镜像的逻辑），
-// 只把越狱 dylib 的名字替换成无害系统库名，骗过按名字匹配的 DylibCheck。
+// 用原始 dyld 函数求 JGBSDK 地址范围（避免走到被 hook 的版本导致递归）
+static void compute_jgb_range(void) {
+    uint32_t (*cnt)(void) = orig_dyld_image_count ? orig_dyld_image_count : _dyld_image_count;
+    const char *(*getn)(uint32_t) = orig_dyld_get_image_name ? orig_dyld_get_image_name : _dyld_get_image_name;
+    uint32_t n = cnt();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = getn(i);
+        if (nm && strstr(nm, "JGBSDK")) {
+            const struct mach_header *h = _dyld_get_image_header(i);
+            g_jgb_base = (uintptr_t)h;
+            g_jgb_end = g_jgb_base + 0x400000;  // JGBSDK __TEXT ~2.6MB，取 4MB 上界
+            return;
+        }
+    }
+}
+
+static inline int caller_is_jgb(void *ret) {
+    if (!g_jgb_base) compute_jgb_range();  // 懒计算（JGBSDK 可能在 ctor 后才加载）
+    uintptr_t a = (uintptr_t)ret;
+    return (g_jgb_base && a >= g_jgb_base && a < g_jgb_end) ? 1 : 0;
+}
+
 static uint32_t hooked_dyld_image_count(void) {
-    return orig_dyld_image_count();
+    uint32_t count = orig_dyld_image_count();
+    if (!caller_is_jgb(__builtin_return_address(0))) return count;
+    // JGBSDK 调用：扣掉越狱镜像数
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (name && is_jb_dylib(name)) hidden++;
+    }
+    return count - hidden;
 }
 
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
-    const char *name = orig_dyld_get_image_name(idx);
-    if (name && is_jb_dylib(name)) {
-        return "/usr/lib/system/libsystem_c.dylib";
+    if (!caller_is_jgb(__builtin_return_address(0))) {
+        return orig_dyld_get_image_name(idx);  // App 自身：原样，保持索引
     }
-    return name;
+    // JGBSDK 调用：重排跳过越狱镜像
+    uint32_t count = orig_dyld_image_count();
+    uint32_t visibleIdx = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (!name) continue;
+        if (!is_jb_dylib(name)) {
+            if (visibleIdx == idx) return name;
+            visibleIdx++;
+        }
+    }
+    return orig_dyld_get_image_name(0);
 }
 
 static void *(*orig_dlopen)(const char *, int);
@@ -240,7 +283,7 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.6 (dyld no-reindex) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.7 (scoped dyld) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -256,5 +299,6 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
     };
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-    lj_log("hooks active rr=%d (stat/lstat/access/opendir/dyld*/dlopen/dladdr)", rr);
+    compute_jgb_range();  // rebind 后主动求 JGBSDK 范围（此时 orig_ 已填充）
+    lj_log("hooks active rr=%d jgb_base=0x%lx (scoped dyld)", rr, (unsigned long)g_jgb_base);
 }
