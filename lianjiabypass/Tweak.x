@@ -170,40 +170,51 @@ static inline int caller_is_detector(void *ret) {
             hit = 1;
         }
     }
-    if (g_det_diag < 30) {
-        const char *b = fname ? strrchr(fname, '/') : NULL;
-        lj_log("caller_is_detector ret=%p mod=%s hit=%d",
-               ret, fname ? (b ? b + 1 : fname) : "NULL", hit);
-        g_det_diag++;
-    }
     return hit;
+}
+
+// 缓存“可见镜像”映射：visibleIdx -> 原始 idx，避免每次调用 O(n×strstr) 重排。
+// JGBSDK 常在紧循环里逐个 get_image_name(idx)，若每次重排则整体 O(n^2)，卡死主线程。
+#define LJ_MAX_IMAGES 2048
+static uint32_t g_vis_map[LJ_MAX_IMAGES];   // visibleIdx -> real idx
+static uint32_t g_vis_count = 0;            // 可见镜像数
+static uint32_t g_vis_cached_total = 0;     // 构建缓存时的原始 count（用作失效判断）
+static pthread_mutex_t g_vis_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void rebuild_vis_map_locked(uint32_t total) {
+    g_vis_count = 0;
+    for (uint32_t i = 0; i < total && g_vis_count < LJ_MAX_IMAGES; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (name && is_jb_dylib(name)) continue;  // 跳过越狱镜像
+        g_vis_map[g_vis_count++] = i;
+    }
+    g_vis_cached_total = total;
+}
+
+// 确保缓存对当前 total 有效（count 变化则重建）
+static void ensure_vis_map(uint32_t total) {
+    if (g_vis_cached_total == total && g_vis_count > 0) return;
+    pthread_mutex_lock(&g_vis_lock);
+    if (g_vis_cached_total != total || g_vis_count == 0) {
+        rebuild_vis_map_locked(total);
+    }
+    pthread_mutex_unlock(&g_vis_lock);
 }
 
 static uint32_t hooked_dyld_image_count(void) {
     uint32_t count = orig_dyld_image_count();
     if (!caller_is_detector(__builtin_return_address(0))) return count;
-    uint32_t hidden = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = orig_dyld_get_image_name(i);
-        if (name && is_jb_dylib(name)) hidden++;
-    }
-    return count - hidden;
+    ensure_vis_map(count);
+    return g_vis_count;
 }
 
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
     if (!caller_is_detector(__builtin_return_address(0))) {
-        return orig_dyld_get_image_name(idx);
+        return orig_dyld_get_image_name(idx);  // App/Flutter：O(1) 透传
     }
     uint32_t count = orig_dyld_image_count();
-    uint32_t visibleIdx = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = orig_dyld_get_image_name(i);
-        if (!name) continue;
-        if (!is_jb_dylib(name)) {
-            if (visibleIdx == idx) return name;
-            visibleIdx++;
-        }
-    }
+    ensure_vis_map(count);
+    if (idx < g_vis_count) return orig_dyld_get_image_name(g_vis_map[idx]);
     return orig_dyld_get_image_name(0);
 }
 
@@ -325,7 +336,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.9 (watchdog dump) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.10 (cached vis-map) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
