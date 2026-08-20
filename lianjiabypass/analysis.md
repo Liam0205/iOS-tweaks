@@ -475,3 +475,32 @@ v0.0.17：ctor 扫描 JGBSDK __text，匹配 svc(0xd4001001)+前置 mov w16,#1(0
 
 **下一轮单一假设（待验证）：**
 修 patch：vm_protect 改 RWX 写入后**立即恢复 `VM_PROT_READ|VM_PROT_EXECUTE`**（或用 MSHookMemory/substrate 的内存写接口，它自动处理权限与 icache）。优先改用 substrate 提供的代码改写方式。预期消除 KERN_PROTECTION_FAILURE；再看 0x8BADF00D 是否仍在（若在则查高 CPU 源）。
+
+---
+
+## 第 14 轮：闭环达成 —— 链家进入主界面稳定运行（2026-08-20）✅
+
+### 假设
+修正 W^X 权限流程后消除 KERN_PROTECTION_FAILURE，App 稳定运行。
+
+### 验证方法
+v0.0.19：patch 流程改为标准 W^X —— `vm_protect RW(优先 COPY，回退 RW)` → 写 `ret` → **`vm_protect 恢复 R+X`** → `sys_icache_invalidate`。
+
+### 观察结果
+- `patch: neutralized 29 JGBSDK exit syscalls (failed=0 ...)` —— 全部成功，无失败。
+- 进程**存活 >30s 无退出、无冻结**（etime 持续增长 00:06→00:37）。
+- 截图确认**完整进入链家主界面**：二手房/新房/租房/装修/找经纪人等功能齐全，行情播报在线数据正常加载（挂牌均价 51680、新增 771 套、看房 4911 人），底部导航完整。
+
+### 结论（完整对抗方案）
+链家 com.exmart.HomeLink 9.86.91 三层越狱检测，最终绕过组合：
+1. **文件检测层（秒退）**：fishhook `stat/lstat/access/opendir` + `is_jb_name_c` 拦截越狱路径（/Applications/Cydia.app、/var/jb、TweakInject/*.plist 等）返回 ENOENT。
+2. **dyld 镜像枚举层**：fishhook `_dyld_image_count`/`_dyld_get_image_name`，**dladdr 作用域限定**（仅对 JGBSDK/du/a 检测框架调用重排隐藏越狱镜像）+ **vis-map 缓存**（消除 O(n²) strstr，防主线程卡死）。
+3. **注入检测层（主线程忙循环冻结）**：MSHookFunction `a.framework` 的 `_isInjectedWithDynamicLibrary` 恒返回 0（框架内部直接调用，fishhook 无效）。
+4. **自杀退出层（直接 syscall）**：JGBSDK 内联 29 处 `mov w16,#1; svc #0x80`(exit)，libc/信号 hook 全部无效 → **运行时 patch**：扫描 JGBSDK __text 将 exit 的 svc 就地改 `ret`（标准 W^X 权限流程 + icache 失效）。
+
+### 关键经验（已沉淀）
+- 冻结 ≠ 检测惩罚：先怀疑自己的 hook 是否 O(n²)/慢路径拖死主线程（看门狗 fp 回溯定位）。
+- 框架内部直接调用只能 MSHookFunction，fishhook 仅改跨镜像 GOT。
+- 检测框架惯用直接 svc（exit/sysctl/stat）绕过 libc hook → 需静态扫描 svc + 运行时 patch。
+- arm64 iOS 强制 W^X：改代码必须 RW→写→恢复 RX→刷 icache，漏恢复 RX 会 KERN_PROTECTION_FAILURE。
+- 看门狗 fp 帧指针链回溯 + crash log 的 termination/faultingThread 字段是定位无痕退出的利器（0x8BADF00D=启动超时、EXC_BAD_ACCESS 地址落在哪个段）。

@@ -462,29 +462,31 @@ static int patch_jgb_exit_syscalls(void) {
 
     uint32_t *code = (uint32_t *)text_start;
     uint32_t count = (uint32_t)(text_size / 4);
-    int patched = 0;
+    int patched = 0, failed = 0;
     for (uint32_t i = 1; i < count; i++) {
         if (code[i] == 0xd4001001 /* svc #0x80 */ &&
             code[i - 1] == 0x52800030 /* mov w16,#1 (exit) */) {
+            // arm64 iOS 强制 W^X：不能 RWX。标准流程 = 改 RW → 写 → 改回 RX → 刷 icache。
             void *pg = (void *)((uintptr_t)&code[i] & ~0x3fffUL);
-            // 改页为可写（RWX）
-            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)pg, 0x4000,
-                                          FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            size_t plen = 0x4000;
+            // 若跨页（svc 在页首）需覆盖前一页起始，这里 svc 4 字节对齐、单页足够
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)pg, plen,
+                                          FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
             if (kr != KERN_SUCCESS) {
-                kr = vm_protect(mach_task_self(), (vm_address_t)pg, 0x4000, FALSE,
-                                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                kr = vm_protect(mach_task_self(), (vm_address_t)pg, plen, FALSE,
+                                VM_PROT_READ | VM_PROT_WRITE);
             }
-            if (kr == KERN_SUCCESS) {
-                code[i] = 0xd65f03c0;  // ret
-                sys_icache_invalidate(&code[i], 4);
-                patched++;
-            } else {
-                lj_log("patch: vm_protect failed @%p kr=%d", (void *)&code[i], kr);
-            }
+            if (kr != KERN_SUCCESS) { failed++; continue; }
+            code[i] = 0xd65f03c0;  // ret
+            // 恢复可执行权限（关键：不恢复会导致执行该页时 KERN_PROTECTION_FAILURE）
+            vm_protect(mach_task_self(), (vm_address_t)pg, plen, FALSE,
+                       VM_PROT_READ | VM_PROT_EXECUTE);
+            sys_icache_invalidate(&code[i], 4);
+            patched++;
         }
     }
-    lj_log("patch: neutralized %d JGBSDK exit syscalls (text=0x%lx size=0x%lx)",
-           patched, (unsigned long)text_start, (unsigned long)text_size);
+    lj_log("patch: neutralized %d JGBSDK exit syscalls (failed=%d text=0x%lx size=0x%lx)",
+           patched, failed, (unsigned long)text_start, (unsigned long)text_size);
     return patched;
 }
 
@@ -498,7 +500,7 @@ static int patch_jgb_exit_syscalls(void) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.18 (patch+watchdog) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.19 (patch WX-fixed) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
