@@ -61,16 +61,40 @@ def on_msg(msg, data):
 def on_log(level, text):
     out(text)
 
-out('=== attempt %d / bundle %s / dur %ds ===' % (ATTEMPT, BUNDLE, DUR))
-out('spawning ' + BUNDLE)
-pid = DEVICE.spawn([BUNDLE])
-session = DEVICE.attach(pid)
-script = session.create_script(src)
-script.on('message', on_msg)
-script.set_log_handler(on_log)
-script.load()
-DEVICE.resume(pid)
-out('resumed pid %d — collecting %ds' % (pid, DUR))
+MODE = sys.argv[2] if len(sys.argv) > 2 else 'spawn'
+out('=== attempt %d / bundle %s / mode %s / dur %ds ===' % (ATTEMPT, BUNDLE, MODE, DUR))
+
+if MODE == 'attach':
+    # 等 App 自己启动后再 attach（对照：排除 frida spawn 早期被反调试抓）
+    out('waiting for %s to appear...' % BUNDLE)
+    pid = None
+    for _ in range(50):
+        for p in DEVICE.enumerate_processes():
+            if p.name in ('LianJiaShell', '链家'):
+                pid = p.pid; break
+        if pid:
+            break
+        time.sleep(0.1)
+    if not pid:
+        out('[driver] target not running — 请先手动启动 App，或用 spawn 模式')
+        _logf.close(); sys.exit(1)
+    out('attaching to pid %d' % pid)
+    session = DEVICE.attach(pid)
+    script = session.create_script(src)
+    script.on('message', on_msg)
+    script.set_log_handler(on_log)
+    script.load()
+    out('attached, collecting %ds' % DUR)
+else:
+    out('spawning ' + BUNDLE)
+    pid = DEVICE.spawn([BUNDLE])
+    session = DEVICE.attach(pid)
+    script = session.create_script(src)
+    script.on('message', on_msg)
+    script.set_log_handler(on_log)
+    script.load()
+    DEVICE.resume(pid)
+    out('resumed pid %d — collecting %ds' % (pid, DUR))
 
 t0 = time.time()
 while time.time() - t0 < DUR:
