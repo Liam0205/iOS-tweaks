@@ -39,6 +39,12 @@ jobs:
           brew install ldid dpkg librsvg
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          # macOS runner 上 Xcode 自带的 iOS SDK 不含私有框架 stub（Preferences、
+          # FrontBoardServices 等），链接依赖私有框架的 target 会报 'framework not found'。
+          # 从 theos/sdks 拉取带私有框架 stub 的 patched SDK（只取一个版本以省时）。
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/theos-sdks
+          git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
+          cp -r /tmp/theos-sdks/iPhoneOS16.5.sdk $HOME/theos/sdks/
 
       - name: Build
         working-directory: ${{ steps.meta.outputs.tweak }}
