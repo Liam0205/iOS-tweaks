@@ -21,31 +21,39 @@
 static char g_log_path[512];
 static CFAbsoluteTime g_start;
 
+// 用底层 open/write（不经被 hook 的 fopen），避免与 fopen hook 递归
 static void lj_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lj_log(const char *fmt, ...) {
 #if LJ_DEBUG_LOG
-    FILE *f = fopen(g_log_path, "a");
-    if (!f) return;
+    static _Thread_local int in_log = 0;
+    if (in_log) return;   // 重入保护
+    in_log = 1;
+    char buf[1024];
     double elapsed = CFAbsoluteTimeGetCurrent() - g_start;
-    fprintf(f, "[%6.2f] ", elapsed);
+    int n = snprintf(buf, sizeof(buf), "[%6.2f] ", elapsed);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    n += vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
     va_end(ap);
-    fprintf(f, "\n");
-    fclose(f);
+    if (n < (int)sizeof(buf) - 1) { buf[n++] = '\n'; }
+    int fd = open(g_log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd >= 0) { write(fd, buf, n); close(fd); }
+    in_log = 0;
 #endif
 }
 
 // ========== 越狱路径/文件判定 ==========
 
+// 明确的越狱特征子串（用于 C 层文件 hook，不含泛化的 .dylib/.plist 以免误伤）
 static const char *jb_substrings[] = {
     "substrate", "Substrate", "cydia", "Cydia",
     "frida", "jailbreak", "cycript", "MobileSubstrate",
     "TweakInject", "ellekit", "libhooker", "substitute",
     "SBSettings", "pspawn", "libsubstitute", "rocketbootstrap",
-    "LianJiaBypass", "lianjiabypass",
-    ".dylib", ".plist",  // DynamicLibraries 目录里所有 tweak 产物
+    "LianJiaBypass", "lianjiabypass", "/var/jb",
+    "Sileo.app", "Zebra.app", "Filza.app",
+    "/var/lib/apt", "/var/lib/dpkg", "/var/lib/cydia",
+    "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/etc/apt",
     NULL
 };
 
@@ -54,6 +62,14 @@ static int is_jb_name_c(const char *name) {
     for (int i = 0; jb_substrings[i]; i++) {
         if (strstr(name, jb_substrings[i])) return 1;
     }
+    return 0;
+}
+
+// 目录枚举结果过滤专用：额外含 .dylib/.plist（仅在 DynamicLibraries 类目录里用）
+static int is_jb_dylib_name(const char *name) {
+    if (!name) return 0;
+    if (is_jb_name_c(name)) return 1;
+    if (strstr(name, ".dylib") || strstr(name, ".plist")) return 1;
     return 0;
 }
 
@@ -67,27 +83,52 @@ static int is_dylib_dir(const char *path) {
 
 static _Thread_local int g_reentrant = 0;
 
-// ========== 底层目录枚举打点（observe-only，定位检测到底走哪条路）==========
+// ========== C 层文件检测对抗 + 打点 ==========
+// 命中越狱路径：先打日志（定位哪些检测真实触发），再返回“不存在”（对抗）
 #import <dirent.h>
+#import <fcntl.h>
+#import <errno.h>
 #import "fishhook.h"
 
 static DIR *(*orig_opendir)(const char *);
 static DIR *hooked_opendir(const char *name) {
-    if (name && (strstr(name, "DynamicLibraries") || strstr(name, "MobileSubstrate")
-                 || strstr(name, "Library") || strstr(name, "/var/jb"))) {
-        lj_log("opendir: %s", name);
-    }
+    if (is_jb_name_c(name)) { lj_log("opendir BLOCK: %s", name); errno = ENOENT; return NULL; }
     return orig_opendir(name);
 }
 
 static int (*orig_stat)(const char *, struct stat *);
 static int hooked_stat(const char *path, struct stat *buf) {
-    if (path && (strstr(path, "DynamicLibraries") || strstr(path, "substrate")
-                 || strstr(path, "cydia") || strstr(path, "Cydia")
-                 || strstr(path, "/var/jb"))) {
-        lj_log("stat: %s", path);
-    }
+    if (is_jb_name_c(path)) { lj_log("stat BLOCK: %s", path); errno = ENOENT; return -1; }
     return orig_stat(path, buf);
+}
+
+static int (*orig_lstat)(const char *, struct stat *);
+static int hooked_lstat(const char *path, struct stat *buf) {
+    if (is_jb_name_c(path)) { lj_log("lstat BLOCK: %s", path); errno = ENOENT; return -1; }
+    return orig_lstat(path, buf);
+}
+
+static int (*orig_access)(const char *, int);
+static int hooked_access(const char *path, int mode) {
+    if (is_jb_name_c(path)) { lj_log("access BLOCK: %s", path); errno = ENOENT; return -1; }
+    return orig_access(path, mode);
+}
+
+static int (*orig_open)(const char *, int, ...);
+static int hooked_open(const char *path, int flags, ...) {
+    if (is_jb_name_c(path)) { lj_log("open BLOCK: %s", path); errno = ENOENT; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args);
+        return orig_open(path, flags, mode);
+    }
+    return orig_open(path, flags);
+}
+
+static FILE *(*orig_fopen)(const char *, const char *);
+static FILE *hooked_fopen(const char *path, const char *mode) {
+    if (is_jb_name_c(path)) { lj_log("fopen BLOCK: %s", path); errno = ENOENT; return NULL; }
+    return orig_fopen(path, mode);
 }
 
 // ========== Hook NSFileManager 目录枚举 ==========
@@ -107,17 +148,8 @@ static int hooked_stat(const char *path, struct stat *buf) {
     int removed = 0;
     for (NSString *item in contents) {
         const char *cname = item.UTF8String;
-        // 在 DynamicLibraries 类目录里，按越狱子串 + .dylib/.plist 过滤；
-        // 其他目录只按明确越狱子串过滤（不动普通 .plist）
-        BOOL drop = is_jb_name_c(cname);
-        if (!dylibDir) {
-            // 非 tweak 目录：不因 .dylib/.plist 后缀丢弃普通文件
-            if (drop && (strstr(cname, ".dylib") || strstr(cname, ".plist"))
-                && !strstr(cname, "substrate") && !strstr(cname, "Substrate")
-                && !strstr(cname, "LianJiaBypass") && !strstr(cname, "ellekit")) {
-                drop = NO;
-            }
-        }
+        // DynamicLibraries 类目录：连 .dylib/.plist 一起过滤；其他目录只过滤明确越狱项
+        BOOL drop = dylibDir ? is_jb_dylib_name(cname) : is_jb_name_c(cname);
         if (drop) { removed++; continue; }
         [filtered addObject:item];
     }
@@ -160,16 +192,23 @@ static int hooked_stat(const char *path, struct stat *buf) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.2 (dir-filter) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.3 (C-file-hooks) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
-    // 底层 opendir/stat 打点，定位检测扫描路径
+    // C 层文件检测对抗 + 打点
     struct rebinding rebs[] = {
         {"opendir", (void *)hooked_opendir, (void **)&orig_opendir},
         {"stat",    (void *)hooked_stat,    (void **)&orig_stat},
+        {"lstat",   (void *)hooked_lstat,   (void **)&orig_lstat},
+        {"access",  (void *)hooked_access,  (void **)&orig_access},
+        {"open",    (void *)hooked_open,    (void **)&orig_open},
+        {"fopen",   (void *)hooked_fopen,   (void **)&orig_fopen},
     };
-    rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
+    // 诊断：rebind 前后各写一行（直接 fopen，此刻若 fopen 已 hook 也会走 orig）
+    { FILE *ff = fopen(g_log_path, "a"); if (ff) { fprintf(ff, "[dbg] before rebind\n"); fclose(ff); } }
+    int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
+    { FILE *ff = fopen(g_log_path, "a"); if (ff) { fprintf(ff, "[dbg] after rebind rr=%d\n", rr); fclose(ff); } }
 
-    lj_log("NSFileManager dir-filter + opendir/stat probe hooks active");
+    lj_log("C-layer file hooks + NSFileManager dir-filter active");
 }

@@ -169,3 +169,35 @@ JGBSDK @0xbc4c 的 `_exit` 是越狱检测命中后的退出点，hook 它或其
 两条并行：(1) 对抗侧——用 tweak hook `contentsOfDirectoryAtPath:error:` / `NSDirectoryEnumerator`，过滤掉含我方 dylib/plist 的结果（参考 mybankbypass 的“保留 NSFileManager 目录结果过滤”成功经验），看能否消除这一检测；(2) 定位侧——找该扫描函数入口 + 调用者，追 `w20=1` 到退出决策，确认真实退出原语。
 
 **决策（用户拍板）：先做 A = 闭环验证。** 针对已确认的 `DynamicLibraries` 目录扫描检测写对抗（过滤 `contentsOfDirectoryAtPath:error:` 结果，隐藏我方 dylib/plist 及常见越狱文件），装机跑一次，观察秒退时间是否变化/消除，以此判断该扫描是否秒退主因。若有效则继续逐项；若无效说明秒退主因在别的检测，再回到定位侧。逐项静态摸清（B）暂缓。
+
+---
+
+## 第 4 轮：A 闭环验证 — tweak 对抗（2026-08-20）
+
+### 假设
+过滤 `contentsOfDirectoryAtPath:` 目录枚举结果隐藏 tweak，能消除/推迟秒退。
+
+### 验证方法
+v0.0.2：`%hook NSFileManager contentsOfDirectoryAtPath:error:` 过滤越狱项 + fishhook `opendir`/`stat` 打点。v0.0.3：扩展 C 层 hook 到 opendir/stat/lstat/access/open/fopen（命中越狱路径打日志 + 返回 ENOENT）。日志写沙箱 `NSTemporaryDirectory()`，用底层 open/write 避免与 fopen hook 递归。
+
+### 观察结果
+- **v0.0.2**：注入成功，但 `DIR FILTER` **从未打印**——`contentsOfDirectoryAtPath:` 未被调用。秒退依旧（~5-6s）。fishhook `stat` 命中 **1 条：`stat: /Applications/Cydia.app`**（在 1.15s），之后无更多打点，进程 5-6s 退出。
+- **v0.0.3（首版）**：hook `fopen` 与日志函数 `lj_log`（用 fopen）递归 → 进程 ~3s 秒崩，日志只有 INIT 行。改 lj_log 用底层 open/write + 重入保护后修复。
+- **v0.0.3（修复递归后）**：进程恢复 5-6s 退出，但日志仍只有 INIT + `[dbg] before rebind`，**`[dbg] after rebind` 未打印 → `rebind_symbols` 卡住/崩溃**（进程其余线程仍活，仅 ctor 线程卡）。
+
+### 推论
+
+**已确认：**
+- 检测**不走** `NSFileManager contentsOfDirectoryAtPath:`（ObjC 目录枚举）——第 3 轮反汇编看到的那个目录扫描函数本轮未执行，或走了别的路径。
+- 检测**确实做 `stat` 扫描已知越狱路径**（至少 `stat /Applications/Cydia.app`），但仅 1 条命中——fishhook 对 `stat` 的导入表改绑只覆盖了部分调用方（那条可能来自主程序/数盟，JGBSDK 内部 stat 走已解析地址，fishhook 拦不到）。
+- **fishhook 同时 rebind opendir/stat/lstat/access/open/fopen 6 个符号会卡死 ctor 线程**（iOS 16.3.1 / ElleKit 环境）。v0.0.2 只 rebind opendir+stat 能跑，加 open/fopen 后卡——疑似 fishhook 对 variadic `open` 或与 ElleKit 交互的问题（呼应 abcbypass 的 fishhook 约束教训 [[abcbypass-round1-9]]）。
+
+**已排除：**
+- “目录枚举 ObjC hook 能覆盖检测” —— 否定，检测不走该 ObjC 方法。
+
+**仍未知：**
+- 秒退主因检测项 + 真实退出原语（仍未定位）。
+- fishhook 卡死的确切触发符号（open? fopen? 数量?）。
+
+**下一轮单一假设（待验证）：**
+最小变量法：C 层只 rebind `stat`+`lstat`+`access`（去掉 open/fopen 排除 fishhook 卡死），扩大 `stat` 打点为**全路径记录**（不止越狱路径），看检测在 Cydia.app 之后还 stat 了哪些路径、退出前最后一个文件检测是什么。据此定位秒退主因。若 fishhook 仍不稳，改用 MSHookFunction 直接 hook `stat` 函数地址。
