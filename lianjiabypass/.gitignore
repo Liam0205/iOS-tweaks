@@ -1,0 +1,4 @@
+.venv/
+.theos/
+packages/
+app-binary/

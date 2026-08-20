@@ -1,0 +1,99 @@
+# 链家越狱检测绕过 — 实验记录
+
+目标 App：链家 iOS，bundle id `com.exmart.HomeLink`，版本 9.86.91（CFBundleVersion 9.86.91.0）
+设备：iPhone 14 Pro Max / iOS 16.3.1 / Dopamine 2.x（SSH 隧道端口 2216，mobile@localhost）
+本地分析目录：`lianjiabypass/`（app-binary/ tmp/ frida/）
+越狱表现：启动秒退
+
+链家与贝壳找房同属贝壳集团，URL scheme 含 `lianjia` / `lianjiabeikeft` / `beikejinggong`，共用同一套安全 SDK（JGBSDK）。摸清链家后方案可复用到贝壳。
+
+---
+
+## 第 0 轮：静态侦察（2026-08-20）
+
+### 假设
+链家秒退由某个第三方安全/风控 SDK 的越狱检测触发，检测面和退出链路可通过静态分析定位。
+
+### 验证方法
+从设备拉取主 binary（222MB）+ 可疑框架（`a` / `du` / `JGBSDK`）到本地，用 `file` / `strings` / `nm` 分析身份、检测特征、退出符号、ObjC 方法结构。
+
+### 观察结果
+
+**框架身份：**
+- `du.framework`（676KB）= 数盟（Shuzilm / 数字联盟）设备指纹 SDK。路径 `/Users/shuzilm/.../dna_iOS/du/`，类 `DUNetwork`。含 `/Applications/Cydia.app`、`MobileSubstrate.dylib`、`sysctl` 特征——采集设备指纹（含越狱信号），但通常只采集上报，不直接杀进程。
+- `a.framework`（90KB）= 无明显检测特征的小工具/加密库，暂不重点。
+- `JGBSDK.framework`（3MB）= **越狱检测核心引擎**。@rpath `JGBSDK.framework/JGBSDK`，动态库，非静态链入主程序。疑似贝壳自研“精工”安全 SDK（URL scheme `beikejinggong`）。
+
+**JGBSDK 检测清单（XxxCheck selector）：**
+`JailbrokenCheck`、`DylibCheck` / `checkDylib`、`detectDebugger`、`ProxyCheck`、`VPNCheck` / `shareJGBVPNCheck`、`AppInfoCheck`、`ScreenRecordCheck`、`ScreenShotCheck`、`AirPlayCheck`、`VirtualPositionCheck`、`TextIntegrityCheck`。
+
+**JGBSDK 越狱检测特征串：**
+`/Applications/Cydia.app`、`CydiaSubstrate.framework`、`/Library/MobileSubstrate/DynamicLibraries/`、`.../xCon.dylib`、`/Library/MobileSubstrate/MobileSubstrate.dylib`、`/private/detect_log.txt`、`/private/var/tmp/cydia.log`、`your app hooked by Frida`。
+
+**用户可见提示串：**
+"Your application is running under a jailbreak environment. We recommend that you exit the operation or operate in a non-jailbreak environment."（另有网络代理风险提示）。
+
+**关键类与回调：**
+- `LJBRProtectManager`（链家/贝壳统一保护管理器，主 binary 也引用它）
+- `JGBProtect` / `JGBIntercept`
+- 回调 `receiveProtectEventWithCode:reason:`——JGBSDK 把检测结果报给业务层。
+- 弹窗逻辑：UIAlertView / UIAlertController（`alertControllerWithTitle:message:preferredStyle:`）。
+
+**退出/自保护相关导入符号：**
+- `_exit`（JGBSDK 直接导入）
+- `_vm_protect`（可能有代码段完整性自保护）
+- `CFRunLoopObserverCreateWithHandler` / `CFRunLoopPerformBlock` / `dispatch_source_set_event_handler`——检测可能延迟或周期性触发，不止启动一次。
+
+### 推论
+
+**已确认：**
+- 越狱检测本体在独立动态库 `JGBSDK.framework`，未静态链入主 binary，对抗面清晰。
+- 检测项目众多，其中 `JailbrokenCheck` + `DylibCheck` + `detectDebugger` 是越狱环境直接命中项。
+- 存在业务层回调 `receiveProtectEventWithCode:reason:` 给 `LJBRProtectManager`。
+
+**仍未知（下一轮要回答）：**
+- 秒退到底是 JGBSDK 内部直接 `_exit()`，还是回调 `LJBRProtectManager` 后由业务层退出？（决定 hook 点选在 SDK 检测函数、回调、还是 `_exit`）
+- 退出前是否弹窗？秒退时序（立即 / 数秒）？有无 crash log、什么信号？
+- `_vm_protect` 是否意味着 SDK 有代码完整性自校验（影响能否用 MSHookFunction）？
+
+**下一轮单一假设（待验证）：**
+装空 tweak（仅 `%ctor` crash tag）确认能注入 `com.exmart.HomeLink`；再对 `_exit` / `abort` 布最小 hook + 打点，判断秒退是否经过标准 libc `_exit` 路径，以及是否由 JGBSDK 触发。
+
+---
+
+## 第 1 轮：确认注入 + 观察退出机制（2026-08-20）
+
+### 假设
+链家能被 ElleKit 注入；秒退经过标准 libc `_exit` 路径，可用 fishhook 观察到调用点。
+
+### 验证方法
+探测版 tweak：`%ctor` 打点确认注入；fishhook rebind `exit`/`_exit`/`abort`/`kill`（observe-only，打回溯栈）；记录 JGBSDK/du/a/senseid 模块加载、`LJBRProtectManager`/`JGBProtect` 类是否存在。
+
+**踩坑（已沉淀记忆 [[feedback_tweak_log_path]]）：** 日志先写 `/var/jb/tmp/` 再写 `/tmp/` 都失败——普通 App 沙箱两者都无写权限，日志静默为空，误判为“没注入”。改用 `NSTemporaryDirectory()`（沙箱内 Data 容器 tmp/）后正常。链家 Data 容器：`/var/mobile/Containers/Data/Application/FF131465-0653-49BB-AAC5-AE54C31453D0/`。
+
+### 观察结果
+- **注入成功**：`%ctor` 在 0.00s 执行，日志正常写入沙箱内。
+- 0.08s 时 `JGBSDK` / `a` / `du` / `senseid_ids` 四框架均已加载。
+- `LJBRProtectManager` 类 **PRESENT**；`JGBProtect` 类 **absent**。
+- `receiveProtectEventWithCode:reason:` **不是 LJBRProtectManager 的实例方法**（selector not found）——可能是类方法或在其他类上。
+- 日志停在 `ctor done`，**exit/_exit/abort/kill 四个 fishhook 全部未命中**。
+- App 在启动后约 5-6 秒退出。
+- **无 crash report**（CrashReporter 目录无 LianJiaShell 相关条目）。
+
+### 推论
+
+**已确认：**
+- ElleKit 能注入链家，tweak 在 `%ctor` 阶段稳定执行。
+- 检测框架（JGBSDK + 数盟 du + senseid）在启动早期即加载。
+- 秒退 **不经过 fishhook 拦截的 libc 退出符号**，且 **不产生 crash report**。
+
+**已排除：**
+- “秒退走可被 fishhook 拦截的 exit/_exit/abort/kill 导入” —— 否定。fishhook 只改本 tweak 之外调用方的导入绑定；JGBSDK 内部那唯一一处 `bl _exit`（静态分析 @0xbc4c）走的是自身已解析 stub，fishhook 拦不到其他镜像的内部调用。
+
+**仍未知（下一轮要回答）：**
+- 退出到底是：(a) JGBSDK 内部 `_exit` 直接调用（需 MSHookFunction 直接 hook 函数地址，而非 fishhook 导入表）；(b) raw syscall `svc` 退出；(c) 别的干净退出路径。
+- `receiveProtectEventWithCode:reason:` 真正宿主类是谁？检测结果回调链路。
+- 退出前是否弹越狱提示窗（观察期没截到 UI）。
+
+**下一轮单一假设（待验证）：**
+用 MSHookFunction 直接 hook `_exit`/`exit` 的函数实现地址（而非 fishhook 导入表），确认 JGBSDK 内部 `_exit` 调用是否命中；同时 hook `LJBRProtectManager` 全部方法（用 runtime 遍历 method list 打点），定位检测判定与退出触发的确切调用链。

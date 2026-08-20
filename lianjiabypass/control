@@ -1,0 +1,9 @@
+Package: page.0x01.lianjiabypass
+Name: LianJiaBypass-链家反检测-rootless
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: 绕过链家（贝壳）App 的越狱环境检测，使其在越狱设备上正常运行。适用于 rootless 越狱（Dopamine 等）。
+Maintainer: Liam
+Author: Liam
+Section: 反检测
+Depends: mobilesubstrate (>= 0.9.5000)
