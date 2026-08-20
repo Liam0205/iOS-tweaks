@@ -96,6 +96,8 @@ static _Thread_local int g_reentrant = 0;
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/arm/thread_status.h>
+#import <mach/vm_map.h>
+#import <libkern/OSCacheControl.h>
 #import <substrate.h>
 #import "fishhook.h"
 
@@ -418,6 +420,74 @@ static void *watchdog_thread(void *arg) {
     return NULL;
 }
 
+// ========== 运行时 patch：中和 JGBSDK 内联的直接 exit syscall ==========
+// JGBSDK 散布 30+ 处 `mov x0,#1; mov w16,#1; svc #0x80`（exit(1)），绕过 libc。
+// 策略：扫描 JGBSDK __text，将 exit 序列的 `svc #0x80` 就地改为 `ret`，
+// 使检测失败分支不再自杀而是返回调用者。仅限 JGBSDK 模块，避免误伤。
+// 指令编码（小端）：mov w16,#1 = 0x52800030；svc #0x80 = 0xd4001001；ret = 0xd65f03c0
+static int patch_jgb_exit_syscalls(void) {
+    uint32_t n = _dyld_image_count();
+    const struct mach_header_64 *mh = NULL;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "JGBSDK")) {
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+    if (!mh) { lj_log("patch: JGBSDK not found"); return -1; }
+
+    // 遍历 load commands 找 __TEXT,__text 范围
+    uintptr_t text_start = 0, text_size = 0;
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+            if (strcmp(sc->segname, "__TEXT") == 0) {
+                const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+                for (uint32_t s = 0; s < sc->nsects; s++) {
+                    if (strcmp(sect[s].sectname, "__text") == 0) {
+                        text_start = sect[s].addr + slide;
+                        text_size = sect[s].size;
+                    }
+                }
+            }
+        }
+        p += lc->cmdsize;
+    }
+    if (!text_start) { lj_log("patch: __text not found"); return -2; }
+
+    uint32_t *code = (uint32_t *)text_start;
+    uint32_t count = (uint32_t)(text_size / 4);
+    int patched = 0;
+    for (uint32_t i = 1; i < count; i++) {
+        if (code[i] == 0xd4001001 /* svc #0x80 */ &&
+            code[i - 1] == 0x52800030 /* mov w16,#1 (exit) */) {
+            void *pg = (void *)((uintptr_t)&code[i] & ~0x3fffUL);
+            // 改页为可写（RWX）
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)pg, 0x4000,
+                                          FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            if (kr != KERN_SUCCESS) {
+                kr = vm_protect(mach_task_self(), (vm_address_t)pg, 0x4000, FALSE,
+                                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            }
+            if (kr == KERN_SUCCESS) {
+                code[i] = 0xd65f03c0;  // ret
+                sys_icache_invalidate(&code[i], 4);
+                patched++;
+            } else {
+                lj_log("patch: vm_protect failed @%p kr=%d", (void *)&code[i], kr);
+            }
+        }
+    }
+    lj_log("patch: neutralized %d JGBSDK exit syscalls (text=0x%lx size=0x%lx)",
+           patched, (unsigned long)text_start, (unsigned long)text_size);
+    return patched;
+}
+
 // ========== ctor ==========
 
 %ctor {
@@ -428,7 +498,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.16 (MSHook exit family) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.17 (patch exit svc) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -469,6 +539,7 @@ static void *watchdog_thread(void *arg) {
     lj_log("MSHook exit=%p _exit=%p abort=%p __pthread_kill=%p", p_exit, p__exit, p_abort, p_pk);
 
     install_signal_probes();
+    patch_jgb_exit_syscalls();  // 中和 JGBSDK 内联 exit syscall
 
     // 对照实验：禁用看门狗（排除 thread_suspend 主线程触发系统 watchdog 强杀的可能）
     g_main_mach_thread = mach_thread_self();
