@@ -443,3 +443,35 @@ v0.0.15 禁用看门狗对照（排除自造）→ 仍 T+2~4s 退出。v0.0.16 M
 
 **下一轮单一假设（待验证）：**
 先走路线 1 的定位版：反汇编 JGBSDK 几个 exit 点（如 0xcba4/0xd180/0xff78）的上游，看是否共享一个“检测失败→exit”封装函数；若有单一封装则 hook 该封装函数直接 return（不 exit）最省事。同时评估运行时 patch 全部 svc#1 为 nop 的可行性（mprotect/vm_protect 改页权限 + 是否触发完整性校验）。
+
+---
+
+## 第 13 轮：patch exit svc 成功但引入 vm_protect 权限 bug（2026-08-20）
+
+### 假设
+运行时把 JGBSDK 的 29 处 `mov w16,#1; svc #0x80` 的 svc 改为 `ret`，检测失败分支不再自杀。
+
+### 验证方法
+v0.0.17：ctor 扫描 JGBSDK __text，匹配 svc(0xd4001001)+前置 mov w16,#1(0x52800030)，vm_protect 改 RWX 后写 ret(0xd65f03c0)。v0.0.18 + 看门狗观察退出。读 crash log。
+
+### 观察结果
+- `patch: neutralized 29 JGBSDK exit syscalls` —— 33 处 svc#0x80 中，29 处 exit 全部 patch（另 4 处 = stat/open/read/close，非 exit；已确认无遗漏 exit）。a/du 框架无 exit svc。
+- 存活 **2s → 14s → 19s** 显著延长，但仍崩。
+- crash log 关键：
+  - `EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE at 0x111dc81cc`，该地址在 **JGBSDK __TEXT 的一段 `rw-`（不可执行）区域**。
+  - faultingThread 栈实为**我的 SIGBUS(信号10) handler** 在跑（`_sigtramp → LianJiaBypass.dylib → open`），崩在 dyld `runAllInitializersForMain / load_images` 阶段。
+  - termination：`FRONTBOARD 0x8BADF00D process-launch watchdog transgression: exhausted 20.00s`，CPU 49.4s/42%。
+
+### 推论
+
+**已确认（我方 patch 的 bug）：**
+- **vm_protect 权限 bug**：改页权限时 RWX 失败 → fallback `VM_PROT_COPY` 使页变 `rw-`（不可执行）；patch 后**未恢复 r-x**。dyld 继续执行 JGBSDK 自身 initializer 到该页 → `KERN_PROTECTION_FAILURE` 崩溃。
+- exit svc patch 本身有效（存活大幅延长证明 exit 分支确实被中和）。
+- 另有 `0x8BADF00D` 启动看门狗 20s 超时 + 高 CPU —— 启动阶段有重活/忙循环（疑似残留检测忙转），即使不崩也会被 FrontBoard 杀。
+
+**仍未知：**
+- 修正权限后能否稳定存活。
+- 高 CPU（49s）来源：是 patch 扫描（O(text) 一次性，应不至于）还是残留检测忙循环。
+
+**下一轮单一假设（待验证）：**
+修 patch：vm_protect 改 RWX 写入后**立即恢复 `VM_PROT_READ|VM_PROT_EXECUTE`**（或用 MSHookMemory/substrate 的内存写接口，它自动处理权限与 icache）。优先改用 substrate 提供的代码改写方式。预期消除 KERN_PROTECTION_FAILURE；再看 0x8BADF00D 是否仍在（若在则查高 CPU 源）。

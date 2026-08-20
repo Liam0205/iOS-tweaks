@@ -498,7 +498,7 @@ static int patch_jgb_exit_syscalls(void) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.17 (patch exit svc) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.18 (patch+watchdog) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -541,8 +541,7 @@ static int patch_jgb_exit_syscalls(void) {
     install_signal_probes();
     patch_jgb_exit_syscalls();  // 中和 JGBSDK 内联 exit syscall
 
-    // 对照实验：禁用看门狗（排除 thread_suspend 主线程触发系统 watchdog 强杀的可能）
+    // 重新启用看门狗，观察 T+14s 退出前主线程状态
     g_main_mach_thread = mach_thread_self();
-    (void)watchdog_thread;
-    // pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
+    pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
 }
