@@ -156,21 +156,32 @@ static const char *(*orig_dyld_get_image_name)(uint32_t);
 
 // 用 dladdr 判断返回地址所属模块是否为需要欺骗的检测框架
 // （地址范围法不可靠：_dyld_get_image_header 的 base 与实际执行段地址不一致）
+static int g_det_diag = 0;
 static inline int caller_is_detector(void *ret) {
     Dl_info info;
+    int hit = 0;
+    const char *fname = NULL;
     if (dladdr(ret, &info) && info.dli_fname) {
-        if (strstr(info.dli_fname, "JGBSDK") ||
-            strstr(info.dli_fname, "/du.framework/") ||
-            strstr(info.dli_fname, "senseid")) {
-            return 1;
+        fname = info.dli_fname;
+        if (strstr(fname, "JGBSDK") ||
+            strstr(fname, "/du.framework/") ||
+            strstr(fname, "senseid") ||
+            strstr(fname, "/a.framework/")) {
+            hit = 1;
         }
     }
-    return 0;
+    if (g_det_diag < 30) {
+        const char *b = fname ? strrchr(fname, '/') : NULL;
+        lj_log("caller_is_detector ret=%p mod=%s hit=%d",
+               ret, fname ? (b ? b + 1 : fname) : "NULL", hit);
+        g_det_diag++;
+    }
+    return hit;
 }
 
 static uint32_t hooked_dyld_image_count(void) {
     uint32_t count = orig_dyld_image_count();
-    // 诊断期：全局重排（确保进入“绕过秒退但冻结”状态以便观察冻结点）
+    if (!caller_is_detector(__builtin_return_address(0))) return count;
     uint32_t hidden = 0;
     for (uint32_t i = 0; i < count; i++) {
         const char *name = orig_dyld_get_image_name(i);
@@ -180,7 +191,9 @@ static uint32_t hooked_dyld_image_count(void) {
 }
 
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
-    // 诊断期：全局重排
+    if (!caller_is_detector(__builtin_return_address(0))) {
+        return orig_dyld_get_image_name(idx);
+    }
     uint32_t count = orig_dyld_image_count();
     uint32_t visibleIdx = 0;
     for (uint32_t i = 0; i < count; i++) {
