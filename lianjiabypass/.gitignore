@@ -3,3 +3,4 @@
 packages/
 app-binary/
 frida/logs/
+tmp/

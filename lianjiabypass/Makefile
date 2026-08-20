@@ -1,4 +1,4 @@
-INSTALL_TARGET_PROCESSES = LianJiaShell
+INSTALL_TARGET_PROCESSES = LianJiaShell LJShell
 
 ARCHS = arm64
 TARGET := iphone:clang:latest:15.0
