@@ -1060,4 +1060,46 @@ BT[14] dyld start + 2528
 - 优先方案 (b): 该 exit block 的函数入口地址在 backtrace 里（`MbapMPaaS` frame，dispatch 投递的 block）。在已有的 `dispatch_after`/`dispatch_async` hook 基础上，按 block 函数所属地址范围过滤掉这个检测 block，使其根本不上主队列。风险: 需确认丢弃该 block 不影响正常初始化。
 - 备选 (a): 反汇编 `0x8db254` 所在函数入口，回溯 w24 的来源（哪个检测函数的返回值），MSHookFunction 该函数使其返回 clean。
 
+---
+
+## 第 14 轮: 推翻"RunLoop 破坏"假说 + 确认多重时序敏感检测（2026-08-20）
+
+### 方案 b 实测: 丢弃检测 block 成功阻止 exit, 但 UI 仍完全不可交互
+- `DETECT BLOCK DROPPED #1`, `EXIT blocked=0 / DRAIN ESCAPE=0`, 进程健康存活 >30s。
+- **用户实测: 登录页所有元素(勾选圈/输入框/注册登录按钮/返回键)全部无反应。**
+
+### 关键诊断: 加 UI 状态诊断 timer (每 3s dump)
+- **主 RunLoop 完全健康**: UIDIAG 每 3s 精准触发 (1.82→4.76→7.76…)。
+- **UI 对象状态完全正常**: `ignoringEvents=0`, keyWindow `userInteractionEnabled=1`,
+  `hidden=0 alpha=1.00`, 仅 1 个 window (level=0), rootVC=`DFNavigationController`。
+  **无遮罩、无 ignoreInteraction、无异常层级。**
+- **⇒ 推翻 v89-92 及本轮早期假说: UI 冻结与 longjmp / RunLoop 破坏无关。**
+  方案 b 从未触发 longjmp, RunLoop 始终正常, UI 依旧死 —— 冻结另有原因。
+
+### sendEvent: hook 证明触摸能到达 App
+- 注入 tap(490,1075) → App `sendEvent:` 收到 `phase=0 (Began) at (163,358) view=UIView`,
+  `phase=3 (Ended) view=nil`。坐标 490/3≈163 (px→pt), **命中正确, hit-test 到 UIView**。
+- **⇒ 触摸事件通路完全正常, 能进入 App 并 hit-test 到视图。封锁不在系统层、不在 hit-test。**
+
+### 决定性认知: 多重、时序敏感的分布式检测
+- 加 UIControl `sendAction:`/`beginTracking` hook 后, 换一次运行 **App 在 T+0.71s 就挂**:
+  日志止于 `objc_exception_throw: DTRpcException — 取消请求`, UIDIAG(1s)都没起来。
+- crash log: **EXC_BAD_ACCESS / SIGSEGV, PAC failure** (KERN_INVALID_ADDRESS at
+  0xe2e3...pointer authentication failure), 后台线程经 libdispatch block, 栈全是
+  MbapMPaaS 内部 (无 ABCBypass 帧)。疑 SDK 主动用坏 PAC 指针触发崩溃作为反注入响应。
+- **多次运行触发的检测各不相同**: exit(0) / DTRpcException / PAC-fail SIGSEGV。
+  说明 ABC 有一套**分布式、时序敏感的检测网络**, 单点阻断 exit 不足以恢复功能。
+
+### 修正后的问题定性
+- 触摸能到达、能 hit-test, 但**登录页控件无响应** —— 最可能是: 检测命中后 SDK 走了
+  **降级/半初始化分支**, `DFNavigationController` 装载的登录页控件没有绑定
+  target-action / 业务逻辑未启动 (而非触摸被拦)。即 exit 只是检测后果之一,
+  真正问题是**检测导致 App 未进入正常业务初始化路径**。
+- 阻断 exit 让进程"活着"但停在僵尸登录页, 不等于绕过成功。
+
+### 待用户决策的方向 (见对话)
+1. 深挖 w24 检测源头, 让所有检测判定返回 clean, 使 SDK 走完整正常初始化路径 (方案 a 强化版)。
+2. 用 Frida 动态插桩实时追踪检测调用链 / 定位降级分支 (需设备装 frida-server)。
+3. 评估该 App 反调试强度, 判断投入产出比后再决定是否继续。
+
 

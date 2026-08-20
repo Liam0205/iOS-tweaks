@@ -843,6 +843,39 @@ static void force_reenable_ui(CFRunLoopTimerRef timer, void *info) {
         [[UIApplication sharedApplication] endIgnoringInteractionEvents];
 }
 
+// ========== UI 交互状态诊断 (查触摸为何落不下去) ==========
+static volatile int g_uidiag_n = 0;
+static void ui_diag_cb(CFRunLoopTimerRef timer, void *info) {
+    g_uidiag_n++;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) { abc_log("UIDIAG[%d]: sharedApplication=nil", g_uidiag_n); return; }
+    BOOL ignoring = [app isIgnoringInteractionEvents];
+    NSArray *wins = [app windows];
+    UIWindow *key = [app keyWindow];
+    abc_log("UIDIAG[%d]: ignoringEvents=%d windows=%lu key=%p keyUIE=%d keyHidden=%d",
+            g_uidiag_n, ignoring, (unsigned long)wins.count, key,
+            key ? key.userInteractionEnabled : -1,
+            key ? key.hidden : -1);
+    int idx = 0;
+    for (UIWindow *w in wins) {
+        Class rc = w.rootViewController ? [w.rootViewController class] : nil;
+        abc_log("  win[%d] %p level=%.1f hidden=%d UIE=%d alpha=%.2f rootVC=%s topSub=%lu",
+                idx++, w, (double)w.windowLevel, w.hidden, w.userInteractionEnabled,
+                w.alpha, rc ? class_getName(rc) : "nil",
+                (unsigned long)w.subviews.count);
+    }
+    // 主线程心跳: 此回调本身在主 RunLoop 触发, 能打印即证明主 RunLoop 活着
+}
+
+static void install_ui_diag_timer(void) {
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 1.0, 3.0, 0, 0,
+        ui_diag_cb, NULL);
+    CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    CFRelease(t);
+    abc_log("UI DIAG timer installed (3s, main RunLoop)");
+}
+
 static void install_ui_recovery_timer(void) {
     CFRunLoopTimerContext ctx = {0};
     CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
@@ -1269,6 +1302,22 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
 %end
 
 %hook UIApplication
+- (void)sendEvent:(UIEvent *)event {
+    // 诊断: 触摸事件是否到达 App? 到达则说明封锁在 hit-test/gesture 层, 否则在系统层
+    static int n = 0;
+    if (event.type == UIEventTypeTouches) {
+        NSSet *touches = [event allTouches];
+        UITouch *t = [touches anyObject];
+        if (t && n < 40) {
+            n++;
+            CGPoint p = [t locationInView:nil];
+            abc_log("SENDEVENT #%d: touch phase=%ld at (%.0f,%.0f) view=%s", n,
+                    (long)t.phase, p.x, p.y,
+                    t.view ? class_getName([t.view class]) : "nil");
+        }
+    }
+    %orig;
+}
 - (BOOL)canOpenURL:(NSURL *)url {
     NSString *s = url.scheme.lowercaseString;
     if ([s isEqualToString:@"cydia"] || [s isEqualToString:@"sileo"] ||
@@ -1289,6 +1338,21 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
     }
     abc_log("_terminateWithStatus:%d allowed (%.1fs after launch, likely lifecycle)", status, elapsed);
     %orig;
+}
+%end
+
+%hook UIControl
+- (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
+    abc_log("UICONTROL sendAction: %s -> %s (control=%s)",
+            action ? sel_getName(action) : "nil",
+            target ? class_getName([target class]) : "nil",
+            class_getName([self class]));
+    %orig;
+}
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    BOOL r = %orig;
+    abc_log("UICONTROL beginTracking control=%s -> %d", class_getName([self class]), r);
+    return r;
 }
 %end
 
@@ -1605,6 +1669,8 @@ static void hookDetectionByOffset(void) {
         MSHookFunction((void *)dispatch_sync_f, (void *)hooked_dispatch_sync_f, (void **)&orig_dispatch_sync_f);
         // dispatch_after already hooked in ctor
         abc_log("dispatch hooks armed (async/sync — after already in ctor)");
+
+        install_ui_diag_timer();
 
         abc_log("all hooks armed (GOT-clean — zero rebind_symbols)");
     });
