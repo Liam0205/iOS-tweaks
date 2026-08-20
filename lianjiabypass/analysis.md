@@ -385,3 +385,32 @@ v0.0.12：Makefile 加 `LIBRARIES=substrate`；ctor 里 `dlsym(RTLD_DEFAULT,"isI
 
 **下一轮单一假设（待验证）：**
 先定性第三层退出方式：查 crash log（/var/mobile/Library/Logs/CrashReporter 或 os_log）判断是 exit/abort/signal；同时看门狗改为记录退出前最后动作 + hook `exit`/`abort`/`_exit` 打调用栈。据此定位第三层检测源（优先怀疑 a.framework 其余检测导出符号）。
+
+---
+
+## 第 11 轮：第三层退出方式定性 —— 无痕退出（2026-08-20）
+
+### 假设
+第三层退出走 exit/abort/kill/pthread_kill 或可捕获信号。
+
+### 验证方法
+v0.0.13：fishhook exit/_exit/abort/kill + 栈回溯。v0.0.14：+ pthread_kill hook + sigaction 捕获 SIGABRT/TERM/TRAP/SEGV/BUS/ILL/SYS/XCPU + 看门狗每秒存活打点。
+
+### 观察结果
+- 进程活到 **T+5.04s（WATCHDOG[5]）** 后消失。
+- **无任何命中**：exit/_exit/abort/kill/pthread_kill 均未触发，8 种终止信号处理器均未触发。
+- **无新 crash log**（v0.0.12/13/14 三次退出，CrashReporter 里最新仍是 14:53 的旧记录）。主线程退出前一直健康 idle（mach_msg）。
+
+### 推论
+
+**已确认：**
+- 第三层是**无痕退出**：不走 libc exit 符号、不发可捕获信号、不产生 crash 报告、主线程健康。
+- 可能方式：(a) `exit_group`/`task_terminate` 等直接系统调用（汇编 svc，绕过 libc 符号）；(b) 私有 API 主动 suspend/回桌面被系统正常回收（截图确为回到桌面）；(c) 系统 SIGKILL（不可捕获，但通常留 jetsam/cpu_resource log —— 本次无）。
+- 最可能：a.framework 其余检测（`_checkPath`/`_codesignState`/`_commonState`/`_networkState`/`_devicePasscodeSet`/`_dyldEnvironmentVariables`/`_f_open`）在 isInjected 之后接力判定“环境不安全”→ 触发无痕退出。
+
+**仍未知：**
+- 具体退出调用（哪个 syscall/私有 API）。
+- 哪个检测函数是退出决策源。
+
+**下一轮单一假设（待验证）：**
+批量 hook a.framework 检测导出符号（`_checkPath`/`_codesignState`/`_commonState`/`_networkState`/`_devicePasscodeSet`/`_dyldEnvironmentVariables`/`_f_open`），先“观察模式”记录各函数返回值 + 调用时机（哪个在 T+5s 附近被调、返回了什么），再逐个强制返回“安全”值。优先反汇编这几个函数确认语义（返回 1=安全 还是 0=安全）。

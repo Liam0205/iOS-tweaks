@@ -91,6 +91,8 @@ static _Thread_local int g_reentrant = 0;
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <pthread.h>
+#import <signal.h>
+#import <string.h>
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/arm/thread_status.h>
@@ -198,6 +200,29 @@ static int hooked_kill(pid_t pid, int sig) {
         dump_caller_bt("kill");
     }
     return orig_kill(pid, sig);
+}
+static int (*orig_pthread_kill)(pthread_t, int);
+static int hooked_pthread_kill(pthread_t t, int sig) {
+    lj_log("!!! pthread_kill(sig=%d)", sig);
+    dump_caller_bt("pthread_kill");
+    return orig_pthread_kill(t, sig);
+}
+
+// 信号处理器：捕获终止类信号，记录信号号 + 触发点（SIGKILL/SIGSTOP 不可捕获）
+static void term_signal_handler(int sig, siginfo_t *info, void *uctx) {
+    lj_log("!!! SIGNAL %d received (code=%d)", sig, info ? info->si_code : -1);
+    dump_caller_bt("signal");
+}
+static void install_signal_probes(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = term_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = {SIGABRT, SIGTERM, SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGSYS, SIGXCPU};
+    for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
 }
 
 // ========== dyld 镜像枚举对抗（作用域限定：只对 JGBSDK 的调用生效）==========
@@ -359,8 +384,9 @@ static void describe_addr(const char *tag, uintptr_t addr) {
 }
 
 static void *watchdog_thread(void *arg) {
-    for (int tick = 1; tick <= 8; tick++) {
-        sleep(2);
+    for (int tick = 1; tick <= 20; tick++) {
+        sleep(1);
+        lj_log("WATCHDOG[%d] alive check", tick);
         if (!g_main_mach_thread) continue;
         arm_thread_state64_t state;
         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
@@ -402,7 +428,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.13 (trace exit) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.14 (signal+pthread_kill probe) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -420,6 +446,7 @@ static void *watchdog_thread(void *arg) {
         {"_exit",                 (void *)hooked__exit,            (void **)&orig__exit},
         {"abort",                 (void *)hooked_abort,            (void **)&orig_abort},
         {"kill",                  (void *)hooked_kill,             (void **)&orig_kill},
+        {"pthread_kill",          (void *)hooked_pthread_kill,     (void **)&orig_pthread_kill},
     };
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
     lj_log("file/dyld hooks active rr=%d", rr);
@@ -433,6 +460,8 @@ static void *watchdog_thread(void *arg) {
     } else {
         lj_log("dlsym _isInjectedWithDynamicLibrary NOT FOUND");
     }
+
+    install_signal_probes();
 
     // ctor 在主线程执行，抓主线程 mach port，启动看门狗
     g_main_mach_thread = mach_thread_self();
