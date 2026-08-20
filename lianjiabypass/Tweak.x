@@ -156,6 +156,50 @@ static int hooked_isInjected(void) {
     return 0;
 }
 
+// 用 __builtin_frame_address 走 fp 链回溯当前调用栈（用于 exit/abort 拦截时定位调用者）
+static void describe_addr(const char *tag, uintptr_t addr);  // fwd decl（定义在看门狗节）
+static void dump_caller_bt(const char *tag) {
+    lj_log("=== %s CALLER BACKTRACE ===", tag);
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    for (int d = 0; d < 24 && fp; d++) {
+        if (fp & 0xf) break;
+        uintptr_t saved_fp = *(uintptr_t *)fp;
+        uintptr_t saved_lr = *(uintptr_t *)(fp + 8);
+        if (!saved_lr) break;
+        describe_addr("  ret", saved_lr);
+        if (saved_fp <= fp) break;
+        fp = saved_fp;
+    }
+}
+
+// 退出类函数拦截：定位第三层“延迟退出”的触发者（先只观察不阻断）
+static void (*orig_exit)(int);
+static void hooked_exit(int code) {
+    lj_log("!!! exit(%d) called", code);
+    dump_caller_bt("exit");
+    orig_exit(code);
+}
+static void (*orig__exit)(int);
+static void hooked__exit(int code) {
+    lj_log("!!! _exit(%d) called", code);
+    dump_caller_bt("_exit");
+    orig__exit(code);
+}
+static void (*orig_abort)(void);
+static void hooked_abort(void) {
+    lj_log("!!! abort() called");
+    dump_caller_bt("abort");
+    orig_abort();
+}
+static int (*orig_kill)(pid_t, int);
+static int hooked_kill(pid_t pid, int sig) {
+    if (pid == getpid() || pid == 0) {
+        lj_log("!!! kill(self, %d) called", sig);
+        dump_caller_bt("kill");
+    }
+    return orig_kill(pid, sig);
+}
+
 // ========== dyld 镜像枚举对抗（作用域限定：只对 JGBSDK 的调用生效）==========
 // 全局重排 _dyld_get_image_name 会污染 App/Flutter 自身按索引访问镜像的逻辑（导致冻结）。
 // 改为：仅当调用来自 JGBSDK 模块地址范围内时，才隐藏/重排越狱镜像；其余透传。
@@ -358,7 +402,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.12 (hook isInjected) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.13 (trace exit) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -372,6 +416,10 @@ static void *watchdog_thread(void *arg) {
         {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
         {"dlopen",                (void *)hooked_dlopen,           (void **)&orig_dlopen},
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
+        {"exit",                  (void *)hooked_exit,             (void **)&orig_exit},
+        {"_exit",                 (void *)hooked__exit,            (void **)&orig__exit},
+        {"abort",                 (void *)hooked_abort,            (void **)&orig_abort},
+        {"kill",                  (void *)hooked_kill,             (void **)&orig_kill},
     };
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
     lj_log("file/dyld hooks active rr=%d", rr);
