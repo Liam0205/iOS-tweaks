@@ -861,6 +861,22 @@ static void hooked_exit(int code) {
             caller, dli.dli_fname ?: "?",
             (long)((uintptr_t)caller - (uintptr_t)dli.dli_fbase));
 
+    // 诊断: 主线程 exit 时抓完整调用栈, 定位检测判定链上游 (源头阻断依据)
+    if (pthread_main_np()) {
+        void *bt[32];
+        int n = backtrace(bt, 32);
+        abc_log("  === EXIT BACKTRACE (%d frames) ===", n);
+        for (int i = 0; i < n; i++) {
+            Dl_info fi = {0};
+            dladdr(bt[i], &fi);
+            const char *fn = fi.dli_fname ? strrchr(fi.dli_fname, '/') : NULL;
+            fn = fn ? fn + 1 : (fi.dli_fname ?: "?");
+            abc_log("    [%2d] %p  %s+0x%lx  %s", i, bt[i], fn,
+                    (long)((uintptr_t)bt[i] - (uintptr_t)fi.dli_fbase),
+                    fi.dli_sname ?: "");
+        }
+    }
+
     if (pthread_main_np()) {
         if (g_drain_jmp_ready) {
             abc_log("  longjmp to drain level (clean path)");
