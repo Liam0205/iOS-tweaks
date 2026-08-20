@@ -1,27 +1,44 @@
-// LianJiaBypass v0.0.2 — A 闭环验证：对抗 DynamicLibraries 目录扫描检测
-// 目标 App：链家 com.exmart.HomeLink 9.86.91（Flutter + JGBSDK 检测引擎）
-// 第 3 轮静态分析确认：JGBSDK 用 NSFileManager 枚举 .../DynamicLibraries，
-// 对文件名匹配 .dylib/.plist 判定越狱注入 —— 直接命中我方 tweak。
-// 本轮策略（参考 mybankbypass）：过滤目录枚举结果，隐藏越狱相关项。
+// LianJiaBypass — 绕过链家/贝壳系 App 的越狱检测
+// 目标 App：链家 com.exmart.HomeLink、贝壳找房 com.lianjia.beike
+//   （Flutter + JGBSDK 检测引擎 + a.framework 自研检测库，两 App 共用同一套检测）
+//
+// 四层对抗（详见 analysis.md 完整分析过程）：
+//  1. 文件检测层：hook stat/lstat/access/opendir/dlopen，拦截越狱路径返回 ENOENT。
+//  2. dyld 镜像枚举层：hook _dyld_image_count/_dyld_get_image_name，
+//     作用域限定（仅对检测框架的调用）重排隐藏越狱镜像 + vis-map 缓存（防 O(n^2) 卡死）。
+//  3. 注入检测层：MSHookFunction a.framework 的 _isInjectedWithDynamicLibrary 恒返回 0。
+//  4. 自杀退出层：JGBSDK 内联 29 处 `mov w16,#1; svc #0x80`(exit) 绕过 libc，
+//     运行时 patch 将这些 svc 就地改为 ret。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <string.h>
 #import <sys/stat.h>
+#import <dirent.h>
+#import <fcntl.h>
+#import <errno.h>
+#import <dlfcn.h>
+#import <pthread.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <libkern/OSCacheControl.h>
+#import <substrate.h>
+#import "fishhook.h"
 
-#define LJ_DEBUG_LOG 1
+// 调试日志开关：发布版设为 0（关闭日志写入，零开销）
+#define LJ_DEBUG_LOG 0
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 
-// ========== Logging（写沙箱内 NSTemporaryDirectory）==========
+// ========== 日志（可选，写沙箱内 NSTemporaryDirectory）==========
 
 static char g_log_path[512];
 static CFAbsoluteTime g_start;
 
-// 用底层 open/write（不经被 hook 的 fopen），避免与 fopen hook 递归
 static void lj_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lj_log(const char *fmt, ...) {
 #if LJ_DEBUG_LOG
@@ -81,26 +98,6 @@ static int is_dylib_dir(const char *path) {
         || strstr(path, "TweakInject") ? 1 : 0;
 }
 
-static _Thread_local int g_reentrant = 0;
-
-// ========== C 层文件检测对抗 + 打点 ==========
-// 命中越狱路径：先打日志（定位哪些检测真实触发），再返回“不存在”（对抗）
-#import <dirent.h>
-#import <fcntl.h>
-#import <errno.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <pthread.h>
-#import <signal.h>
-#import <string.h>
-#import <mach/mach.h>
-#import <mach/thread_act.h>
-#import <mach/arm/thread_status.h>
-#import <mach/vm_map.h>
-#import <libkern/OSCacheControl.h>
-#import <substrate.h>
-#import "fishhook.h"
-
 // 判定加载镜像名是否为越狱/注入相关（用于隐藏 dylib 列表）
 static int is_jb_dylib(const char *name) {
     if (!name) return 0;
@@ -117,144 +114,81 @@ static int is_jb_dylib(const char *name) {
     return 0;
 }
 
+static _Thread_local int g_reentrant = 0;
+
+// ========== 层 1：C 层文件检测对抗 ==========
+
 static DIR *(*orig_opendir)(const char *);
 static DIR *hooked_opendir(const char *name) {
-    if (is_jb_name_c(name)) { lj_log("opendir BLOCK: %s", name); errno = ENOENT; return NULL; }
+    if (is_jb_name_c(name)) { errno = ENOENT; return NULL; }
     return orig_opendir(name);
 }
 
-#define LJ_TRACE_ALL_STAT 0   // 诊断：记录所有 /Applications 和可疑系统路径的 stat（噪音大，默认关）
-
 static int (*orig_stat)(const char *, struct stat *);
 static int hooked_stat(const char *path, struct stat *buf) {
-    if (is_jb_name_c(path)) { lj_log("stat BLOCK: %s", path); errno = ENOENT; return -1; }
-#if LJ_TRACE_ALL_STAT
-    // 打点：应用/系统级敏感路径（越狱检测常查这些），不含 App 自身沙箱高频路径
-    if (path && (strstr(path, "/Applications/") || strstr(path, "/usr/") ||
-                 strstr(path, "/bin/") || strstr(path, "/etc/") ||
-                 strstr(path, "/Library/") || path[0] == '/' ) &&
-        !strstr(path, "/Containers/") && !strstr(path, ".app/")) {
-        lj_log("stat: %s", path);
-    }
-#endif
+    if (is_jb_name_c(path)) { errno = ENOENT; return -1; }
     return orig_stat(path, buf);
 }
 
 static int (*orig_lstat)(const char *, struct stat *);
 static int hooked_lstat(const char *path, struct stat *buf) {
-    if (is_jb_name_c(path)) { lj_log("lstat BLOCK: %s", path); errno = ENOENT; return -1; }
+    if (is_jb_name_c(path)) { errno = ENOENT; return -1; }
     return orig_lstat(path, buf);
 }
 
 static int (*orig_access)(const char *, int);
 static int hooked_access(const char *path, int mode) {
-    if (is_jb_name_c(path)) { lj_log("access BLOCK: %s", path); errno = ENOENT; return -1; }
+    if (is_jb_name_c(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
 }
 
-// a.framework（链家自研检测库）的注入检测函数：在主线程 dispatch 回调里
-// 大量 strstr 扫描已加载 dylib，拖死主线程。直接 hook 恒返回“未注入”。
+static void *(*orig_dlopen)(const char *, int);
+static void *hooked_dlopen(const char *path, int mode) {
+    if (path && is_jb_name_c(path)) { return NULL; }
+    return orig_dlopen(path, mode);
+}
+
+static int (*orig_dladdr)(const void *, Dl_info *);
+static int hooked_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (ret && info && info->dli_fname && is_jb_dylib(info->dli_fname)) {
+        info->dli_fname = "/usr/lib/system/libsystem_c.dylib";
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return ret;
+}
+
+// ========== 层 3：a.framework 注入检测函数 ==========
+// _isInjectedWithDynamicLibrary 在主线程 dispatch 回调里大量 strstr 扫描已加载 dylib，
+// 拖死主线程。直接 hook 恒返回“未注入”。（框架内部直接调用，只能用 MSHookFunction）
 static int (*orig_isInjected)(void);
 static int hooked_isInjected(void) {
-    lj_log("_isInjectedWithDynamicLibrary -> forced 0");
     return 0;
 }
 
-// 用 __builtin_frame_address 走 fp 链回溯当前调用栈（用于 exit/abort 拦截时定位调用者）
-static void describe_addr(const char *tag, uintptr_t addr);  // fwd decl（定义在看门狗节）
-static void dump_caller_bt(const char *tag) {
-    lj_log("=== %s CALLER BACKTRACE ===", tag);
-    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
-    for (int d = 0; d < 24 && fp; d++) {
-        if (fp & 0xf) break;
-        uintptr_t saved_fp = *(uintptr_t *)fp;
-        uintptr_t saved_lr = *(uintptr_t *)(fp + 8);
-        if (!saved_lr) break;
-        describe_addr("  ret", saved_lr);
-        if (saved_fp <= fp) break;
-        fp = saved_fp;
-    }
-}
-
-// 退出类函数拦截：定位第三层“延迟退出”的触发者（先只观察不阻断）
-static void (*orig_exit)(int);
-static void hooked_exit(int code) {
-    lj_log("!!! exit(%d) called", code);
-    dump_caller_bt("exit");
-    orig_exit(code);
-}
-static void (*orig__exit)(int);
-static void hooked__exit(int code) {
-    lj_log("!!! _exit(%d) called", code);
-    dump_caller_bt("_exit");
-    orig__exit(code);
-}
-static void (*orig_abort)(void);
-static void hooked_abort(void) {
-    lj_log("!!! abort() called");
-    dump_caller_bt("abort");
-    orig_abort();
-}
-static int (*orig_kill)(pid_t, int);
-static int hooked_kill(pid_t pid, int sig) {
-    if (pid == getpid() || pid == 0) {
-        lj_log("!!! kill(self, %d) called", sig);
-        dump_caller_bt("kill");
-    }
-    return orig_kill(pid, sig);
-}
-static int (*orig_pthread_kill)(pthread_t, int);
-static int hooked_pthread_kill(pthread_t t, int sig) {
-    lj_log("!!! pthread_kill(sig=%d)", sig);
-    dump_caller_bt("pthread_kill");
-    return orig_pthread_kill(t, sig);
-}
-
-// 信号处理器：捕获终止类信号，记录信号号 + 触发点（SIGKILL/SIGSTOP 不可捕获）
-static void term_signal_handler(int sig, siginfo_t *info, void *uctx) {
-    lj_log("!!! SIGNAL %d received (code=%d)", sig, info ? info->si_code : -1);
-    dump_caller_bt("signal");
-}
-static void install_signal_probes(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = term_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    int sigs[] = {SIGABRT, SIGTERM, SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGSYS, SIGXCPU};
-    for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) {
-        sigaction(sigs[i], &sa, NULL);
-    }
-}
-
-// ========== dyld 镜像枚举对抗（作用域限定：只对 JGBSDK 的调用生效）==========
-// 全局重排 _dyld_get_image_name 会污染 App/Flutter 自身按索引访问镜像的逻辑（导致冻结）。
-// 改为：仅当调用来自 JGBSDK 模块地址范围内时，才隐藏/重排越狱镜像；其余透传。
+// ========== 层 2：dyld 镜像枚举对抗（作用域限定，只对检测框架生效）==========
+// 全局重排 _dyld_get_image_name 会污染 App/Flutter 自身按索引访问镜像的逻辑（导致冻结），
+// 故用 dladdr 判断调用来源：仅当来自检测框架时才隐藏/重排越狱镜像，其余透传。
 
 static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 
-// 用 dladdr 判断返回地址所属模块是否为需要欺骗的检测框架
-// （地址范围法不可靠：_dyld_get_image_header 的 base 与实际执行段地址不一致）
-static int g_det_diag = 0;
+// 判断返回地址所属模块是否为需要欺骗的检测框架
 static inline int caller_is_detector(void *ret) {
     Dl_info info;
-    int hit = 0;
-    const char *fname = NULL;
     if (dladdr(ret, &info) && info.dli_fname) {
-        fname = info.dli_fname;
-        if (strstr(fname, "JGBSDK") ||
-            strstr(fname, "/du.framework/") ||
-            strstr(fname, "senseid") ||
-            strstr(fname, "/a.framework/")) {
-            hit = 1;
+        const char *f = info.dli_fname;
+        if (strstr(f, "JGBSDK") || strstr(f, "/du.framework/") ||
+            strstr(f, "senseid") || strstr(f, "/a.framework/")) {
+            return 1;
         }
     }
-    return hit;
+    return 0;
 }
 
 // 缓存“可见镜像”映射：visibleIdx -> 原始 idx，避免每次调用 O(n×strstr) 重排。
-// JGBSDK 常在紧循环里逐个 get_image_name(idx)，若每次重排则整体 O(n^2)，卡死主线程。
+// 检测框架常在紧循环里逐个 get_image_name(idx)，若每次重排则整体 O(n^2)，卡死主线程。
 #define LJ_MAX_IMAGES 2048
 static uint32_t g_vis_map[LJ_MAX_IMAGES];   // visibleIdx -> real idx
 static uint32_t g_vis_count = 0;            // 可见镜像数
@@ -271,7 +205,6 @@ static void rebuild_vis_map_locked(uint32_t total) {
     g_vis_cached_total = total;
 }
 
-// 确保缓存对当前 total 有效（count 变化则重建）
 static void ensure_vis_map(uint32_t total) {
     if (g_vis_cached_total == total && g_vis_count > 0) return;
     pthread_mutex_lock(&g_vis_lock);
@@ -298,23 +231,6 @@ static const char *hooked_dyld_get_image_name(uint32_t idx) {
     return orig_dyld_get_image_name(0);
 }
 
-static void *(*orig_dlopen)(const char *, int);
-static void *hooked_dlopen(const char *path, int mode) {
-    if (path && is_jb_name_c(path)) { lj_log("dlopen BLOCK: %s", path); return NULL; }
-    return orig_dlopen(path, mode);
-}
-
-static int (*orig_dladdr)(const void *, Dl_info *);
-static int hooked_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr(addr, info);
-    if (ret && info && info->dli_fname && is_jb_dylib(info->dli_fname)) {
-        info->dli_fname = "/usr/lib/system/libsystem_c.dylib";
-        info->dli_sname = NULL;
-        info->dli_saddr = NULL;
-    }
-    return ret;
-}
-
 // ========== Hook NSFileManager 目录枚举 ==========
 
 %hook NSFileManager
@@ -329,16 +245,12 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     const char *cpath = path.UTF8String;
     BOOL dylibDir = is_dylib_dir(cpath);
     NSMutableArray *filtered = [NSMutableArray array];
-    int removed = 0;
     for (NSString *item in contents) {
         const char *cname = item.UTF8String;
         // DynamicLibraries 类目录：连 .dylib/.plist 一起过滤；其他目录只过滤明确越狱项
         BOOL drop = dylibDir ? is_jb_dylib_name(cname) : is_jb_name_c(cname);
-        if (drop) { removed++; continue; }
+        if (drop) continue;
         [filtered addObject:item];
-    }
-    if (removed > 0) {
-        lj_log("DIR FILTER: %s — removed %d jb items", cpath ? cpath : "?", removed);
     }
     return filtered;
 }
@@ -352,78 +264,19 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     if (!contents) return contents;
 
     NSMutableArray *filtered = [NSMutableArray array];
-    int removed = 0;
     for (NSURL *u in contents) {
         const char *cpath = u.path.UTF8String;
-        if (is_jb_name_c(cpath)) { removed++; continue; }
+        if (is_jb_name_c(cpath)) continue;
         [filtered addObject:u];
-    }
-    if (removed > 0) {
-        lj_log("DIR-URL FILTER: removed %d jb items", removed);
     }
     return filtered;
 }
 
 %end
 
-// ========== 看门狗：定时 dump 主线程 PC/LR 所属模块，定位冻结点 ==========
-
-static pthread_t g_main_thread_p;
-static mach_port_t g_main_mach_thread;
-
-static void describe_addr(const char *tag, uintptr_t addr) {
-    addr &= 0x0000007FFFFFFFFFULL;  // strip PAC
-    Dl_info info;
-    if (dladdr((void *)addr, &info) && info.dli_fname) {
-        const char *base = strrchr(info.dli_fname, '/');
-        uintptr_t off = addr - (uintptr_t)info.dli_fbase;
-        lj_log("  %s=%p mod=%s+0x%lx sym=%s", tag, (void *)addr,
-               base ? base + 1 : info.dli_fname, (unsigned long)off,
-               info.dli_sname ? info.dli_sname : "?");
-    } else {
-        lj_log("  %s=%p mod=? ", tag, (void *)addr);
-    }
-}
-
-static void *watchdog_thread(void *arg) {
-    for (int tick = 1; tick <= 20; tick++) {
-        sleep(1);
-        lj_log("WATCHDOG[%d] alive check", tick);
-        if (!g_main_mach_thread) continue;
-        arm_thread_state64_t state;
-        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-        thread_suspend(g_main_mach_thread);
-        kern_return_t kr = thread_get_state(g_main_mach_thread, ARM_THREAD_STATE64,
-                                            (thread_state_t)&state, &cnt);
-        thread_resume(g_main_mach_thread);
-        if (kr == KERN_SUCCESS) {
-            lj_log("WATCHDOG[%d] main thread backtrace:", tick);
-            describe_addr("pc", (uintptr_t)state.__pc);
-            describe_addr("lr", (uintptr_t)state.__lr);
-            // 手动走 fp 链回溯（主线程已 suspend，不能用 backtrace()）
-            uintptr_t fp = (uintptr_t)state.__fp;
-            for (int d = 0; d < 20 && fp; d++) {
-                uintptr_t saved_fp = 0, saved_lr = 0;
-                // 读 [fp]=saved_fp, [fp+8]=saved_lr（可能 fault，简单校验）
-                if (fp & 0xf) break;
-                saved_fp = *(uintptr_t *)fp;
-                saved_lr = *(uintptr_t *)(fp + 8);
-                if (!saved_lr) break;
-                describe_addr("  ret", saved_lr);
-                if (saved_fp <= fp) break;  // 栈向上生长，防环
-                fp = saved_fp;
-            }
-        } else {
-            lj_log("WATCHDOG[%d] thread_get_state failed kr=%d", tick, kr);
-        }
-    }
-    return NULL;
-}
-
-// ========== 运行时 patch：中和 JGBSDK 内联的直接 exit syscall ==========
-// JGBSDK 散布 30+ 处 `mov x0,#1; mov w16,#1; svc #0x80`（exit(1)），绕过 libc。
-// 策略：扫描 JGBSDK __text，将 exit 序列的 `svc #0x80` 就地改为 `ret`，
-// 使检测失败分支不再自杀而是返回调用者。仅限 JGBSDK 模块，避免误伤。
+// ========== 层 4：运行时 patch JGBSDK 内联的直接 exit syscall ==========
+// JGBSDK 散布 29 处 `mov w16,#1; svc #0x80`（exit(1)），绕过 libc（fishhook/信号均无效）。
+// 扫描 JGBSDK __text，将 exit 序列的 `svc #0x80` 就地改为 `ret`，使检测失败分支返回而非自杀。
 // 指令编码（小端）：mov w16,#1 = 0x52800030；svc #0x80 = 0xd4001001；ret = 0xd65f03c0
 static int patch_jgb_exit_syscalls(void) {
     uint32_t n = _dyld_image_count();
@@ -466,10 +319,9 @@ static int patch_jgb_exit_syscalls(void) {
     for (uint32_t i = 1; i < count; i++) {
         if (code[i] == 0xd4001001 /* svc #0x80 */ &&
             code[i - 1] == 0x52800030 /* mov w16,#1 (exit) */) {
-            // arm64 iOS 强制 W^X：不能 RWX。标准流程 = 改 RW → 写 → 改回 RX → 刷 icache。
+            // arm64 iOS 强制 W^X：改 RW → 写 → 恢复 RX → 刷 icache
             void *pg = (void *)((uintptr_t)&code[i] & ~0x3fffUL);
             size_t plen = 0x4000;
-            // 若跨页（svc 在页首）需覆盖前一页起始，这里 svc 4 字节对齐、单页足够
             kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)pg, plen,
                                           FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
             if (kr != KERN_SUCCESS) {
@@ -478,15 +330,13 @@ static int patch_jgb_exit_syscalls(void) {
             }
             if (kr != KERN_SUCCESS) { failed++; continue; }
             code[i] = 0xd65f03c0;  // ret
-            // 恢复可执行权限（关键：不恢复会导致执行该页时 KERN_PROTECTION_FAILURE）
             vm_protect(mach_task_self(), (vm_address_t)pg, plen, FALSE,
                        VM_PROT_READ | VM_PROT_EXECUTE);
             sys_icache_invalidate(&code[i], 4);
             patched++;
         }
     }
-    lj_log("patch: neutralized %d JGBSDK exit syscalls (failed=%d text=0x%lx size=0x%lx)",
-           patched, failed, (unsigned long)text_start, (unsigned long)text_size);
+    lj_log("patch: neutralized %d JGBSDK exit syscalls (failed=%d)", patched, failed);
     return patched;
 }
 
@@ -494,17 +344,16 @@ static int patch_jgb_exit_syscalls(void) {
 
 %ctor {
     g_start = CFAbsoluteTimeGetCurrent();
+#if LJ_DEBUG_LOG
     NSString *dir = NSTemporaryDirectory();
     snprintf(g_log_path, sizeof(g_log_path), "%s/lianjiabypass.log",
              dir ? dir.UTF8String : "/tmp");
-    FILE *f = fopen(g_log_path, "w");
-    if (f) {
-        NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.19 (patch WX-fixed) / LianJia %s ctor started, pid=%d\n",
-                appVer ? appVer.UTF8String : "?", getpid());
-        fclose(f);
-    }
-    // C 层文件检测对抗 + dyld 镜像枚举对抗（不含 open/fopen，避开 fishhook 卡死）
+    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    lj_log("[INIT] LianJiaBypass / App %s pid=%d",
+           appVer ? appVer.UTF8String : "?", getpid());
+#endif
+
+    // 层 1 + 层 2：fishhook 文件检测 + dyld 镜像枚举
     struct rebinding rebs[] = {
         {"opendir",               (void *)hooked_opendir,          (void **)&orig_opendir},
         {"stat",                  (void *)hooked_stat,             (void **)&orig_stat},
@@ -514,36 +363,16 @@ static int patch_jgb_exit_syscalls(void) {
         {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
         {"dlopen",                (void *)hooked_dlopen,           (void **)&orig_dlopen},
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
-        {"kill",                  (void *)hooked_kill,             (void **)&orig_kill},
-        {"pthread_kill",          (void *)hooked_pthread_kill,     (void **)&orig_pthread_kill},
     };
-    int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-    lj_log("file/dyld hooks active rr=%d", rr);
+    rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
 
-    // MSHookFunction hook a.framework 的 _isInjectedWithDynamicLibrary（框架内部直接调用，fishhook 无效）
+    // 层 3：MSHookFunction a.framework 的 _isInjectedWithDynamicLibrary
     void *sym = dlsym(RTLD_DEFAULT, "isInjectedWithDynamicLibrary");
     if (!sym) sym = dlsym(RTLD_DEFAULT, "_isInjectedWithDynamicLibrary");
     if (sym) {
         MSHookFunction(sym, (void *)hooked_isInjected, (void **)&orig_isInjected);
-        lj_log("MSHookFunction _isInjectedWithDynamicLibrary @ %p OK", sym);
-    } else {
-        lj_log("dlsym _isInjectedWithDynamicLibrary NOT FOUND");
     }
 
-    // MSHookFunction 直接 hook libc exit 系列（比 fishhook 彻底：拦所有调用者，含 dyld cache 内部）
-    void *p_exit = dlsym(RTLD_DEFAULT, "exit");
-    void *p__exit = dlsym(RTLD_DEFAULT, "_exit");
-    void *p_abort = dlsym(RTLD_DEFAULT, "abort");
-    void *p_pk = dlsym(RTLD_DEFAULT, "__pthread_kill");
-    if (p_exit)  MSHookFunction(p_exit,  (void *)hooked_exit,  (void **)&orig_exit);
-    if (p__exit) MSHookFunction(p__exit, (void *)hooked__exit, (void **)&orig__exit);
-    if (p_abort) MSHookFunction(p_abort, (void *)hooked_abort, (void **)&orig_abort);
-    lj_log("MSHook exit=%p _exit=%p abort=%p __pthread_kill=%p", p_exit, p__exit, p_abort, p_pk);
-
-    install_signal_probes();
-    patch_jgb_exit_syscalls();  // 中和 JGBSDK 内联 exit syscall
-
-    // 重新启用看门狗，观察 T+14s 退出前主线程状态
-    g_main_mach_thread = mach_thread_self();
-    pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
+    // 层 4：中和 JGBSDK 内联 exit syscall
+    patch_jgb_exit_syscalls();
 }
