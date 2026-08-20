@@ -49,7 +49,8 @@ if os.path.exists(BRIDGE):
         '})();\n'
     )
 
-with open(os.path.join(HERE, 'probe.js')) as f:
+SCRIPT = os.environ.get('PROBE', 'probe.js')
+with open(os.path.join(HERE, SCRIPT)) as f:
     src = bridge_src + f.read()
 
 def on_msg(msg, data):

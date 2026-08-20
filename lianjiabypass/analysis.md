@@ -97,3 +97,36 @@
 
 **下一轮单一假设（待验证）：**
 用 MSHookFunction 直接 hook `_exit`/`exit` 的函数实现地址（而非 fishhook 导入表），确认 JGBSDK 内部 `_exit` 调用是否命中；同时 hook `LJBRProtectManager` 全部方法（用 runtime 遍历 method list 打点），定位检测判定与退出触发的确切调用链。
+
+---
+
+## 第 2 轮：Frida 动态 trace 尝试（2026-08-20，attempt 1-7）
+
+### 假设
+用 Frida spawn + Interceptor hook 全部退出原语 + JGBSDK 检测函数，一轮抓全退出机制与检测链。
+
+### 验证方法
+frida-server 17.9.8（设备）+ client（本机 venv，经 SSH 隧道转发 27042）。probe.js：hook exit/_exit/_Exit/abort/pthread_exit/raise/kill/pthread_kill/thread_terminate/task_terminate/libsystem_kernel!syscall/objc_exception_throw + JGB 内部 exit-site @0xbc4c；probe_min.js：hook open/openat/stat/access/objc_msgSend 验证 Interceptor 是否生效。日志带 attempt 编号写入 `frida/logs/attempt-NNN.log`。
+
+### 观察结果
+- **attempt 1-3（spawn）**：脚本能加载（打印 hooked 日志），但 App **+0.7~0.9s 退出，所有退出/终止 hook 零命中**。
+- **attempt 4-5（attach 运行中进程）**：session 能建立，但 `create_script` 报 `ProtocolError`（先疑版本，client 17.17→降到 17.9.8 匹配 server 仍失败）。
+- **attempt 6-7（spawn，重启 server + 新隧道后）**：`script.load()` 报 `TransportError: connection closed`。
+- **对照（spawn 系统 App com.apple.Preferences）**：spawn→attach→load→脚本正常执行打印，**完全正常**。
+- 环境插曲：frida-server 跑了半个月状态漂移 + SSH 隧道死连接，重启 server（launchctl bootout/bootstrap）+ 重建隧道后 `frida-ps`/spawn 系统 App 恢复正常。设备本地 `python3 socket` 测 27042 一直 OPEN，故障在隧道与会话层。
+
+### 推论
+
+**已确认：**
+- Frida spawn + 脚本注入机制本身可用（Preferences 对照通过）。
+- 对链家：spawn 时 `script.load()` 连接被关闭、attach 时 `create_script` 失败、spawn 能加载时也在 <1s 零命中退出——**三种表现都指向 JGBSDK 的 anti-frida**（binary 内有 `your app hooked by Frida` 字符串佐证）。JGBSDK 检测到 frida 后主动破坏 frida 会话/提前退出，走的路径绕过所有已 hook 的退出原语（疑似内联 `svc`，与 abcbypass 的 `svc #0x80 不可拦截` 同类）。
+
+**已排除：**
+- “用 Frida 动态 trace 链家退出链路” —— 被 anti-frida 挡住，本路线不可行（至少裸 frida 不行）。
+
+**仍未知：**
+- 反 frida 与无 frida 时的真实秒退（5-6s）是否同一退出路径。
+- 检测判定链、退出原语具体是什么。
+
+**下一轮单一假设（待验证）：**
+放弃裸 Frida，回到 **tweak 注入路线**（attempt 已证明 ElleKit 能进且 `%ctor` 稳定执行、未被立即杀）。用 MSHookFunction 直接 hook `_exit`/`exit`/`abort` 函数实现地址 + 遍历 `LJBRProtectManager` 方法打点（日志写沙箱内 `NSTemporaryDirectory()`），定位真实退出机制。若 tweak 也零命中，则确认退出走内联 `svc`，转向 binary patch 或更上游隐藏检测源。
