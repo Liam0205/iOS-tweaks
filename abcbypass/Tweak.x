@@ -14,6 +14,7 @@
 #import <malloc/malloc.h>
 #import <execinfo.h>
 #import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
 #import <mach/thread_act.h>
 #import <mach/arm/thread_status.h>
 #import "fishhook.h"
@@ -1320,6 +1321,65 @@ static const char kABCSuppressedKey;
 }
 %end
 
+// ========== 源头阻断: patch 检测退出分支 ==========
+//
+// 定位依据 (2215 backtrace + capstone 反汇编 ABC 11.1.0):
+//   主线程经 dispatch_async 投递的检测 block 命中越狱后直接 exit(0):
+//     0x8db254: cmp  w24, #3          ; 检测状态 == 3 (风险/越狱)
+//     0x8db258: b.ne #0x8db1bc        ; 否 -> 正常路径 (原始 21fbff54)
+//     0x8db25c: mov  w0, #0
+//     0x8db260: bl   _exit            ; 是 -> exit(0)  <== 破坏 RunLoop 的源头
+//   把 0x8db258 的条件跳转改为无条件跳转 (b #0x8db1bc, 字节 d9ffff17),
+//   使 exit 分支永不执行 —— 从源头避免 exit, 无需 longjmp, RunLoop 不被破坏。
+#define EXIT_BRANCH_OFFSET 0x8db258
+static const uint32_t EXIT_BRANCH_ORIG = 0x54fffb21; // b.ne #0x8db1bc
+static const uint32_t EXIT_BRANCH_PATCH = 0x17ffffd9; // b   #0x8db1bc
+
+static int patch_detection_exit_branch(void) {
+    const struct mach_header *mbap = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "MbapMPaaS")) {
+            mbap = _dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (!mbap) {
+        abc_log("PATCH: MbapMPaaS not found — exit-branch patch skipped");
+        return -1;
+    }
+    uint32_t *target = (uint32_t *)((uintptr_t)mbap + EXIT_BRANCH_OFFSET);
+
+    // 校验原始指令, 防止版本漂移误改
+    if (*target != EXIT_BRANCH_ORIG) {
+        abc_log("PATCH: unexpected instr @MbapMPaaS+0x%X = 0x%08x (expect 0x%08x) — SKIP",
+                EXIT_BRANCH_OFFSET, *target, EXIT_BRANCH_ORIG);
+        return -2;
+    }
+
+    // 标准 W^X: RW (优先 COPY 私有化页) -> 写 -> 恢复 R+X -> 刷 icache
+    kern_return_t kr;
+    vm_address_t page = (vm_address_t)target & ~(vm_page_size - 1);
+    kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE);
+    }
+    if (kr != KERN_SUCCESS) {
+        abc_log("PATCH: vm_protect RW failed kr=%d — SKIP", kr);
+        return -3;
+    }
+    *target = EXIT_BRANCH_PATCH;
+    vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate(target, 4);
+
+    abc_log("PATCH: MbapMPaaS+0x%X b.ne -> b (exit branch neutralized at source, 0x%08x)",
+            EXIT_BRANCH_OFFSET, *target);
+    return 0;
+}
+
 // ========== Binary offset hook for detection function ==========
 
 #define DETECTION_OFFSET_1 0x8DC910  // MbapMPaaS: triggers jailbreak alert (ABC 11.1.0)
@@ -1438,10 +1498,9 @@ static void hookDetectionByOffset(void) {
     // Arm file/dyld/sysctl hooks FIRST (MSHookFunction, not fishhook — avoids GOT modification).
     build_dyld_map();
 
-    // Hook detection function at known binary offset BEFORE it can trigger
-    // DISABLED: +0x8DC910 is a return address (mid-function), not an entry point.
-    // MSHookFunction can't safely relocate instructions there.
-    // hookDetectionByOffset();
+    // 源头阻断: patch 检测退出分支 (b.ne -> b), 使主线程检测 exit(0) 永不执行。
+    // 优于 longjmp 逃逸 —— 不触发 exit 就不破坏 RunLoop 事件投递, UI 可交互。
+    patch_detection_exit_branch();
 
     abc_log("arming ctor hooks (MSHookFunction — GOT-clean)");
     MSHookFunction((void *)stat, (void *)hooked_stat, (void **)&orig_stat);
