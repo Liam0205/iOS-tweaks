@@ -622,14 +622,20 @@ static void registerCommands(void) {
                 method = @"SpringBoard";
             }
             if (!success) {
-                LSApplicationWorkspace *ws = [LSApplicationWorkspace defaultWorkspace];
+                // 运行时取类，避免 _OBJC_CLASS_$_LSApplicationWorkspace 链接期引用
+                // （否则需链接 MobileCoreServices，而 macOS SDK 缺该私有框架 stub）
+                Class LSWorkspaceCls = objc_getClass("LSApplicationWorkspace");
+                LSApplicationWorkspace *ws = [LSWorkspaceCls defaultWorkspace];
                 if (ws && [ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
                     success = [ws openApplicationWithBundleID:bundleID];
                     method = @"LSWorkspace";
                 }
             }
             if (!success) {
-                FBSSystemService *fbs = [FBSSystemService sharedService];
+                // 运行时取类，避免 _OBJC_CLASS_$_FBSSystemService 链接期引用
+                // （否则需链接 FrontBoardServices，而 macOS SDK 缺该私有框架 stub）
+                Class FBSCls = objc_getClass("FBSSystemService");
+                FBSSystemService *fbs = [FBSCls sharedService];
                 if (fbs && [fbs respondsToSelector:@selector(openApplication:options:withResult:)]) {
                     [fbs openApplication:bundleID options:@{} withResult:nil];
                     success = YES;

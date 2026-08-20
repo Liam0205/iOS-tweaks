@@ -28,7 +28,7 @@ jobs:
     outputs:
       tweaks: ${{ steps.find.outputs.tweaks }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Find tweak directories
         id: find
         run: |
@@ -50,7 +50,7 @@ jobs:
       matrix:
         tweak: ${{ fromJson(needs.discover.outputs.tweaks) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Theos
         run: |
@@ -66,7 +66,7 @@ jobs:
           make package FINALPACKAGE=1
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.tweak }}-deb
           path: ${{ matrix.tweak }}/packages/*.deb
