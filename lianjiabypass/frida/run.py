@@ -27,8 +27,30 @@ DEVICE = frida.get_device_manager().add_remote_device('127.0.0.1:27042')
 BUNDLE = 'com.exmart.HomeLink'
 DUR = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 
+# frida 17 不再自动注入 ObjC bridge。前置 frida_tools 自带的 objc bridge，
+# 用 CommonJS 包装暴露为 globalThis.ObjC（probe.js 只读 globalThis.ObjC，不调 require）
+import frida_tools
+BRIDGE = os.path.join(os.path.dirname(frida_tools.__file__), 'bridges', 'objc.js')
+bridge_src = ''
+if os.path.exists(BRIDGE):
+    with open(BRIDGE) as bf:
+        bmod = bf.read()
+    bridge_src = (
+        'var __ObjC_ready = (function(){\n'
+        '  try {\n'
+        '    var module = { exports: {} }; var exports = module.exports;\n'
+        '    var require = function(){ return {}; };\n'
+        + bmod +
+        '\n    var b = module.exports;\n'
+        '    var obj = (b && b.available !== undefined) ? b : (b && b.default) ? b.default : b;\n'
+        '    globalThis.ObjC = obj;\n'
+        '    return true;\n'
+        '  } catch (e) { console.log("[bridge] load failed: " + e); return false; }\n'
+        '})();\n'
+    )
+
 with open(os.path.join(HERE, 'probe.js')) as f:
-    src = f.read()
+    src = bridge_src + f.read()
 
 def on_msg(msg, data):
     if msg['type'] == 'send':

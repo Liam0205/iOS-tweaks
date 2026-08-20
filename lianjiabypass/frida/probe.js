@@ -3,13 +3,8 @@
 // 目标：链家 com.exmart.HomeLink / JGBSDK
 
 // frida 17 起 ObjC/Swift bridge 不再全局注入，需显式 require
+// ObjC bridge 由 driver（run.py）前置注入到 globalThis.ObjC；没有就跳过 ObjC 部分
 var ObjC = (typeof globalThis !== 'undefined') ? globalThis.ObjC : undefined;
-if (!ObjC || !ObjC.available) {
-  try {
-    ObjC = require('frida-objc-bridge');
-    if (typeof globalThis !== 'undefined') { globalThis.ObjC = ObjC; }
-  } catch (e) {}
-}
 
 function ts() { return (Date.now() % 100000) / 1000.0; }
 function log(m) { console.log('[' + ts().toFixed(3) + '] ' + m); }
@@ -44,32 +39,63 @@ function bt(ctx) {
   } catch (e) { return '<bt failed: ' + e + '>'; }
 }
 
-// ========== 1) 退出路径：libc + syscall 层 ==========
-['exit', '_exit', 'abort', '__exit', 'exit_group'].forEach(function (name) {
+// ========== 1) 退出路径：libc + pthread + mach + syscall 全覆盖 ==========
+// 单参数退出/终止原语
+['exit', '_exit', '_Exit', 'abort', '__exit', 'exit_group',
+ 'pthread_exit', 'raise', '__assert_rtn', 'exit_with_message'
+].forEach(function (name) {
   var p = findExport(null, name);
   if (!p) { return; }
   Interceptor.attach(p, {
     onEnter: function (args) {
-      log('EXIT >>> ' + name + '(' + args[0].toInt32() + ') tid=' + this.threadId);
+      log('EXIT >>> ' + name + '(' + args[0] + ') tid=' + this.threadId);
       log('  backtrace:\n    ' + bt(this.context));
     }
   });
   log('hooked exit path: ' + name + ' @ ' + p);
 });
 
-// raw syscall SYS_exit(1) / SYS_exit_group 通过 svc —— hook libsystem_kernel 的 syscall wrapper
+// kill / pthread_kill / thread_terminate（带信号/线程参数）
+[['kill', 2], ['__kill', 2], ['pthread_kill', 2],
+ ['__pthread_kill', 2], ['thread_terminate', 1], ['task_terminate', 1]
+].forEach(function (pair) {
+  var name = pair[0];
+  var p = findExport(null, name);
+  if (!p) { return; }
+  Interceptor.attach(p, {
+    onEnter: function (args) {
+      log('TERM >>> ' + name + '(a0=' + args[0] + ', a1=' + args[1] + ') tid=' + this.threadId);
+      log('  backtrace:\n    ' + bt(this.context));
+    }
+  });
+  log('hooked term path: ' + name + ' @ ' + p);
+});
+
+// raw syscall wrapper —— 抓 svc 走的 exit(1)/exit_group(169)/kill(37)
 var syscallP = findExport("libsystem_kernel.dylib", "syscall");
 if (syscallP) {
   Interceptor.attach(syscallP, {
     onEnter: function (args) {
       var n = args[0].toInt32();
-      if (n === 1 || n === 169) { // SYS_exit=1
-        log('SYSCALL exit >>> num=' + n + ' tid=' + this.threadId);
+      if (n === 1 || n === 169 || n === 37) {
+        log('SYSCALL >>> num=' + n + ' tid=' + this.threadId);
         log('  backtrace:\n    ' + bt(this.context));
       }
     }
   });
   log('hooked libsystem_kernel!syscall');
+}
+
+// ObjC 异常抛出（可能被反调试分支用来触发 crash）
+var throwP = findExport(null, 'objc_exception_throw');
+if (throwP) {
+  Interceptor.attach(throwP, {
+    onEnter: function (args) {
+      log('OBJC_THROW >>> ' + args[0] + ' tid=' + this.threadId);
+      log('  backtrace:\n    ' + bt(this.context));
+    }
+  });
+  log('hooked objc_exception_throw');
 }
 
 // ========== 2) JGBSDK 检测函数 ==========
