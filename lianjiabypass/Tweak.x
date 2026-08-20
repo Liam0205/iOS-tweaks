@@ -428,7 +428,7 @@ static void *watchdog_thread(void *arg) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.14 (signal+pthread_kill probe) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.16 (MSHook exit family) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -442,9 +442,6 @@ static void *watchdog_thread(void *arg) {
         {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
         {"dlopen",                (void *)hooked_dlopen,           (void **)&orig_dlopen},
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
-        {"exit",                  (void *)hooked_exit,             (void **)&orig_exit},
-        {"_exit",                 (void *)hooked__exit,            (void **)&orig__exit},
-        {"abort",                 (void *)hooked_abort,            (void **)&orig_abort},
         {"kill",                  (void *)hooked_kill,             (void **)&orig_kill},
         {"pthread_kill",          (void *)hooked_pthread_kill,     (void **)&orig_pthread_kill},
     };
@@ -461,9 +458,20 @@ static void *watchdog_thread(void *arg) {
         lj_log("dlsym _isInjectedWithDynamicLibrary NOT FOUND");
     }
 
+    // MSHookFunction 直接 hook libc exit 系列（比 fishhook 彻底：拦所有调用者，含 dyld cache 内部）
+    void *p_exit = dlsym(RTLD_DEFAULT, "exit");
+    void *p__exit = dlsym(RTLD_DEFAULT, "_exit");
+    void *p_abort = dlsym(RTLD_DEFAULT, "abort");
+    void *p_pk = dlsym(RTLD_DEFAULT, "__pthread_kill");
+    if (p_exit)  MSHookFunction(p_exit,  (void *)hooked_exit,  (void **)&orig_exit);
+    if (p__exit) MSHookFunction(p__exit, (void *)hooked__exit, (void **)&orig__exit);
+    if (p_abort) MSHookFunction(p_abort, (void *)hooked_abort, (void **)&orig_abort);
+    lj_log("MSHook exit=%p _exit=%p abort=%p __pthread_kill=%p", p_exit, p__exit, p_abort, p_pk);
+
     install_signal_probes();
 
-    // ctor 在主线程执行，抓主线程 mach port，启动看门狗
+    // 对照实验：禁用看门狗（排除 thread_suspend 主线程触发系统 watchdog 强杀的可能）
     g_main_mach_thread = mach_thread_self();
-    pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
+    (void)watchdog_thread;
+    // pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
 }
