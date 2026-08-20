@@ -1,5 +1,8 @@
 {
   "permissions": {
-    "defaultMode": "auto"
+    "defaultMode": "bypassPermissions"
+  },
+  "enabledPlugins": {
+    "llmdoc@llmdoc-cc-plugin": true
   }
 }

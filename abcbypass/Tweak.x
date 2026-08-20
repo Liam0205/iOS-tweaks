@@ -413,13 +413,91 @@ static void invalidate_sdk_timers(void) {
 
 // ========== Dispatch drain hook (clean exit neutralization) ==========
 
+// libdispatch TSD: slot 20 = __PTK_LIBDISPATCH_KEY0 = dispatch_queue_key
+// After longjmp from drain, this TSD points to a dead stack frame (dispatch_thread_frame_s).
+// Must clear it before re-entering drain, or GCD traverses garbage pointers and crashes.
+#define DISPATCH_QUEUE_TSD_SLOT 20
+
+static inline void clear_dispatch_tsd(void) {
+#if defined(__arm64__) || defined(__aarch64__)
+    uint64_t tsd_base;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r" (tsd_base));
+    tsd_base &= ~0x7ULL;
+    ((void **)tsd_base)[DISPATCH_QUEUE_TSD_SLOT] = NULL;
+#endif
+}
+
 static jmp_buf g_drain_jmp;
 static volatile int g_drain_jmp_ready = 0;
 static volatile int g_drain_exit_count = 0;
+static volatile int g_diag_timer_installed = 0;
+static volatile int g_drain_pump_installed = 0;
+static volatile int g_drain_call_count = 0;
+
+static void drain_diag_timer_cb(CFRunLoopTimerRef timer, void *info) {
+    static int tick = 0;
+    tick++;
+
+    int drain_now = g_drain_call_count;
+
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+    int total = 0, suspended = 0, running = 0;
+    if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+        total = count;
+        mach_port_t self_thread = mach_thread_self();
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            thread_basic_info_data_t tinfo;
+            mach_msg_type_number_t tinfo_count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&tinfo, &tinfo_count) == KERN_SUCCESS) {
+                if (tinfo.suspend_count > 0) suspended++;
+                else running++;
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+        mach_port_deallocate(mach_task_self(), self_thread);
+    }
+
+    abc_log("DIAG[%d]: threads=%d(run=%d,susp=%d) drains=%d pump=%d exit_blocked=%d exit_count=%d",
+            tick, total, running, suspended, drain_now, g_drain_pump_installed, g_exit_blocked, g_drain_exit_count);
+}
+
+static void install_diag_timer(void) {
+    if (g_diag_timer_installed) return;
+    g_diag_timer_installed = 1;
+    CFRunLoopTimerContext ctx = {0};
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 5.0, 5.0, 0, 0,
+        drain_diag_timer_cb, &ctx);
+    orig_CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    CFRelease(t);
+    abc_log("DIAG timer installed (5s interval)");
+}
 
 static void (*orig_dispatch_drain)(void *);
+static void hooked_dispatch_drain(void *context);
+
+static void drain_pump_cb(CFRunLoopTimerRef timer, void *info) {
+    clear_dispatch_tsd();
+    hooked_dispatch_drain(NULL);
+}
+
+static void install_drain_pump(void) {
+    if (g_drain_pump_installed) return;
+    g_drain_pump_installed = 1;
+    CFRunLoopTimerContext ctx = {0};
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.016, 0.016, 0, 0,
+        drain_pump_cb, &ctx);
+    orig_CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    CFRelease(t);
+    abc_log("DRAIN PUMP installed (16ms interval) — main queue will be manually drained");
+}
+
 static void hooked_dispatch_drain(void *context) {
     if (pthread_main_np()) {
+        g_drain_call_count++;
         int val = setjmp(g_drain_jmp);
         if (val == 0) {
             g_drain_jmp_ready = 1;
@@ -428,7 +506,11 @@ static void hooked_dispatch_drain(void *context) {
         } else {
             g_drain_jmp_ready = 0;
             g_drain_exit_count++;
-            abc_log("DRAIN ESCAPE #%d: exit(%d) neutralized — app state clean, no blocking needed", g_drain_exit_count, val);
+            clear_dispatch_tsd();
+            abc_log("DRAIN ESCAPE #%d: exit(%d) neutralized — TSD cleared, installing drain pump", g_drain_exit_count, val);
+            invalidate_sdk_timers();
+            install_drain_pump();
+            install_diag_timer();
         }
     } else {
         orig_dispatch_drain(context);
@@ -1270,7 +1352,7 @@ static void hookDetectionByOffset(void) {
 #if ABC_DEBUG_LOG
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-114 / ABC %s ctor started\n",
+        fprintf(f, "[  0.00] [INIT] ABCBypass v0.1.0-116 / ABC %s ctor started\n",
                 appVer ? appVer.UTF8String : "?");
         fclose(f);
     }
