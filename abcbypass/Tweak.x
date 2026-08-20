@@ -1296,7 +1296,8 @@ static const char kABCSuppressedKey;
 
 %hook NSProcessInfo
 - (NSDictionary *)environment {
-    NSMutableDictionary *env = [%orig mutableCopy];
+    NSDictionary *orig = %orig;
+    NSMutableDictionary *env = [orig mutableCopy];
     [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [env removeObjectForKey:@"_MSSafeMode"];
     return env;

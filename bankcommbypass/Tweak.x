@@ -547,7 +547,8 @@ static void hookSecureUtilityPlus(void) {
 %hook NSProcessInfo
 
 - (NSDictionary *)environment {
-    NSMutableDictionary *env = [%orig mutableCopy];
+    NSDictionary *orig = %orig;
+    NSMutableDictionary *env = [orig mutableCopy];
     [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [env removeObjectForKey:@"_MSSafeMode"];
     [env removeObjectForKey:@"_SafeMode"];

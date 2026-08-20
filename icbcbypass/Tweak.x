@@ -852,7 +852,8 @@ static int g_app_send_event_count = 0;
 
 %hook NSProcessInfo
 - (NSDictionary *)environment {
-    NSMutableDictionary *env = [%orig mutableCopy];
+    NSDictionary *orig = %orig;
+    NSMutableDictionary *env = [orig mutableCopy];
     [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [env removeObjectForKey:@"DYLD_LIBRARY_PATH"];
     [env removeObjectForKey:@"DYLD_FRAMEWORK_PATH"];

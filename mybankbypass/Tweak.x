@@ -193,7 +193,8 @@ static int is_jb_dylib(const char *name) {
 %hook NSProcessInfo
 
 - (NSDictionary *)environment {
-    NSMutableDictionary *env = [%orig mutableCopy];
+    NSDictionary *orig = %orig;
+    NSMutableDictionary *env = [orig mutableCopy];
     [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [env removeObjectForKey:@"DYLD_LIBRARY_PATH"];
     [env removeObjectForKey:@"DYLD_FRAMEWORK_PATH"];
