@@ -290,3 +290,31 @@ LIEF + capstone 解析 JGBSDK 对 `_dyld_*` 的全部调用点（count×10、get
 
 **下一轮单一假设（待验证）：**
 v0.0.7：dyld hook 加“调用来源 == JGBSDK 模块”判定（`_dyld_get_image_header`/`dladdr` 拿 JGBSDK 基址+大小，比对 `__builtin_return_address(0)`）。命中 JGBSDK 才重排隐藏，否则透传。预期：秒退绕过 + 不冻结、进主界面。
+
+---
+
+## 第 8 轮：看门狗抓主线程栈 → 冻结真因是我方 hook 太慢（2026-08-20）
+
+### 假设
+冻结是绕过秒退后的第二层防御（主线程冻结惩罚）。
+
+### 验证方法
+v0.0.7 地址范围法失败（`_dyld_get_image_header` 的 base=0x1127c4000 与实际执行地址 0x111dd0638 不符，范围判断错）。v0.0.8 改 dladdr 判 caller 模块 → 仍秒退。v0.0.9：全局重排（进入冻结态）+ 看门狗线程每 2s `thread_suspend` 主线程 `thread_get_state` dump PC/LR 所属模块。
+
+### 观察结果
+- 诊断版确认 `_dyld_get_image_name` 调用者 dladdr 显示 = **JGBSDK**（ret=0x111dd0638/0x111dd99c8）。
+- **看门狗 8 次采样，主线程 PC 恒定在 `libsystem_platform.dylib` 的 `_platform_strstr` / `_platform_strlen`** —— 主线程不是挂起等待，而是**在疯狂跑字符串匹配**（CPU 0% 是采样假象）。
+
+### 推论
+
+**已确认（冻结真因，颠覆前几轮假设）：**
+- **冻结不是检测惩罚，是我方 hook 太慢**。`hooked_dyld_get_image_name` 全局重排：每次调用都 `for i in 0..count { is_jb_dylib(name) }`，`is_jb_dylib` 内含十几个 `strstr`。Flutter 启动时海量调用 `_dyld_get_image_name`（枚举镜像），每次触发 O(n×strstr) → 主线程卡死在 strstr。
+- 这解释了“凡能绕过秒退的版本都冻结”：全局重排既骗过 DylibCheck 又拖垮主线程。
+- **v0.0.8 作用域限定方向正确**（App 调用透传就不慢、不冻结），秒退是因为 `caller_is_detector` 对 JGBSDK 的判定实际返回了假 → JGBSDK 调用被透传、DylibCheck 生效。需修 caller 判定。
+
+**关键约束（新）：**
+- dyld hook 必须作用域限定（只对检测框架生效）+ 快速路径（App 调用零开销透传），否则拖死主线程。
+- `__builtin_return_address(0)` + dladdr 判 caller：诊断版能显示 JGBSDK，但 `caller_is_detector` 失效——待查两者差异（可能 fishhook trampoline 影响返回地址，或 dladdr 对 stub 地址解析不同）。
+
+**下一轮单一假设（待验证）：**
+修 caller 判定：在 `caller_is_detector` 内加打点，记录每次 dladdr 解析出的 caller 模块名 + 判定结果，确认为何对 JGBSDK 返回假。修正后预期：JGBSDK 调用重排（绕过秒退）、App 调用透传（不冻结）→ 进主界面。

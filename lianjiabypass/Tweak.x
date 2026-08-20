@@ -90,6 +90,10 @@ static _Thread_local int g_reentrant = 0;
 #import <errno.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <pthread.h>
+#import <mach/mach.h>
+#import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
 #import "fishhook.h"
 
 // 判定加载镜像名是否为越狱/注入相关（用于隐藏 dylib 列表）
@@ -166,7 +170,7 @@ static inline int caller_is_detector(void *ret) {
 
 static uint32_t hooked_dyld_image_count(void) {
     uint32_t count = orig_dyld_image_count();
-    if (!caller_is_detector(__builtin_return_address(0))) return count;
+    // 诊断期：全局重排（确保进入“绕过秒退但冻结”状态以便观察冻结点）
     uint32_t hidden = 0;
     for (uint32_t i = 0; i < count; i++) {
         const char *name = orig_dyld_get_image_name(i);
@@ -176,10 +180,7 @@ static uint32_t hooked_dyld_image_count(void) {
 }
 
 static const char *hooked_dyld_get_image_name(uint32_t idx) {
-    if (!caller_is_detector(__builtin_return_address(0))) {
-        return orig_dyld_get_image_name(idx);  // App/Flutter：原样，保持索引不污染
-    }
-    // 检测框架调用：重排跳过越狱镜像
+    // 诊断期：全局重排
     uint32_t count = orig_dyld_image_count();
     uint32_t visibleIdx = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -261,6 +262,46 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
 
 %end
 
+// ========== 看门狗：定时 dump 主线程 PC/LR 所属模块，定位冻结点 ==========
+
+static pthread_t g_main_thread_p;
+static mach_port_t g_main_mach_thread;
+
+static void describe_addr(const char *tag, uintptr_t addr) {
+    addr &= 0x0000007FFFFFFFFFULL;  // strip PAC
+    Dl_info info;
+    if (dladdr((void *)addr, &info) && info.dli_fname) {
+        const char *base = strrchr(info.dli_fname, '/');
+        uintptr_t off = addr - (uintptr_t)info.dli_fbase;
+        lj_log("  %s=%p mod=%s+0x%lx sym=%s", tag, (void *)addr,
+               base ? base + 1 : info.dli_fname, (unsigned long)off,
+               info.dli_sname ? info.dli_sname : "?");
+    } else {
+        lj_log("  %s=%p mod=? ", tag, (void *)addr);
+    }
+}
+
+static void *watchdog_thread(void *arg) {
+    for (int tick = 1; tick <= 8; tick++) {
+        sleep(2);
+        if (!g_main_mach_thread) continue;
+        arm_thread_state64_t state;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        thread_suspend(g_main_mach_thread);
+        kern_return_t kr = thread_get_state(g_main_mach_thread, ARM_THREAD_STATE64,
+                                            (thread_state_t)&state, &cnt);
+        thread_resume(g_main_mach_thread);
+        if (kr == KERN_SUCCESS) {
+            lj_log("WATCHDOG[%d] main thread state:", tick);
+            describe_addr("pc", (uintptr_t)state.__pc);
+            describe_addr("lr", (uintptr_t)state.__lr);
+        } else {
+            lj_log("WATCHDOG[%d] thread_get_state failed kr=%d", tick, kr);
+        }
+    }
+    return NULL;
+}
+
 // ========== ctor ==========
 
 %ctor {
@@ -271,7 +312,7 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.8 (scoped dyld dladdr) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.9 (watchdog dump) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
@@ -287,5 +328,9 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
         {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
     };
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-    lj_log("hooks active rr=%d (scoped dyld via dladdr)", rr);
+    lj_log("hooks active rr=%d (global dyld + watchdog)", rr);
+
+    // ctor 在主线程执行，抓主线程 mach port，启动看门狗
+    g_main_mach_thread = mach_thread_self();
+    pthread_create(&g_main_thread_p, NULL, watchdog_thread, NULL);
 }
