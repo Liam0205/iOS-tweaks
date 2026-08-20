@@ -354,6 +354,8 @@ static void hooked_objc_exception_throw(id exception) {
 }
 
 // ========== Forward declarations for counters used in trampoline heartbeat ==========
+static uintptr_t g_detect_block_invoke;      // 检测退出 block invoke 地址 (ctor 中解析)
+static volatile int g_detect_block_dropped;  // 已丢弃的检测 block 计数
 static volatile int g_dispatch_redirect_count;
 static volatile int g_dispatch_sync_inline;
 static volatile int g_dispatch_sync_dropped;
@@ -935,6 +937,17 @@ static int block_invoke_in_shared_cache(dispatch_block_t block);
 
 static void (*orig_dispatch_async)(dispatch_queue_t, dispatch_block_t);
 static void hooked_dispatch_async(dispatch_queue_t queue, dispatch_block_t block) {
+    // 源头阻断: 丢弃检测退出 block (invoke == 含 exit 判定的函数入口)。
+    // 从启动即生效, 不依赖 g_exit_blocked, 使 exit(0) 判定永不上主队列执行。
+    if (g_detect_block_invoke && block) {
+        uintptr_t inv = PAC_STRIP(*(uintptr_t *)((uint8_t *)(__bridge void *)block + 16));
+        if (inv == g_detect_block_invoke) {
+            g_detect_block_dropped++;
+            abc_log("DETECT BLOCK DROPPED #%d (invoke=%p) — exit judgement suppressed at source",
+                    g_detect_block_dropped, (void *)inv);
+            return;
+        }
+    }
     if (g_exit_blocked && queue == dispatch_get_main_queue()) {
         if (!block_invoke_in_shared_cache(block)) {
             g_dispatch_async_dropped++;
@@ -1335,6 +1348,13 @@ static const char kABCSuppressedKey;
 static const uint32_t EXIT_BRANCH_ORIG = 0x54fffb21; // b.ne #0x8db1bc
 static const uint32_t EXIT_BRANCH_PATCH = 0x17ffffd9; // b   #0x8db1bc
 
+// 检测退出 block 的 invoke 函数入口 (含 cmp w24,#3 -> exit 判定的函数)。
+// 该 block 经 dispatch_async 投到主队列, drain 时执行 -> 命中越狱 -> exit(0)。
+// 数据级过滤: 匹配 block invoke == g_detect_block_invoke 则丢弃, 不改 __text
+// (规避 ABC SDK 的代码完整性校验)。
+#define DETECT_BLOCK_INVOKE_OFFSET 0x8dad68
+// g_detect_block_invoke / g_detect_block_dropped 在文件前部声明 (dispatch_async hook 需用)
+
 static int patch_detection_exit_branch(void) {
     const struct mach_header *mbap = NULL;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -1505,6 +1525,18 @@ static void hookDetectionByOffset(void) {
     // 运行时代码修改都会被完整性校验发现。lianjiabypass 的 JGBSDK 无此校验故
     // patch 成功, ABC 不适用。保留函数供参考, 不调用。
     // patch_detection_exit_branch();
+
+    // 源头阻断 (方案 b): 记录检测退出 block 的 invoke 地址, 在 dispatch_async
+    // hook 里丢弃它, 使检测判定/exit 根本不执行。数据级过滤, 不改 __text。
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "MbapMPaaS")) {
+            g_detect_block_invoke = (uintptr_t)_dyld_get_image_header(i) + DETECT_BLOCK_INVOKE_OFFSET;
+            abc_log("DETECT BLOCK invoke = %p (MbapMPaaS+0x%X)",
+                    (void *)g_detect_block_invoke, DETECT_BLOCK_INVOKE_OFFSET);
+            break;
+        }
+    }
 
     abc_log("arming ctor hooks (MSHookFunction — GOT-clean)");
     MSHookFunction((void *)stat, (void *)hooked_stat, (void **)&orig_stat);
