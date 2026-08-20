@@ -201,3 +201,37 @@ v0.0.2：`%hook NSFileManager contentsOfDirectoryAtPath:error:` 过滤越狱项 
 
 **下一轮单一假设（待验证）：**
 最小变量法：C 层只 rebind `stat`+`lstat`+`access`（去掉 open/fopen 排除 fishhook 卡死），扩大 `stat` 打点为**全路径记录**（不止越狱路径），看检测在 Cydia.app 之后还 stat 了哪些路径、退出前最后一个文件检测是什么。据此定位秒退主因。若 fishhook 仍不稳，改用 MSHookFunction 直接 hook `stat` 函数地址。
+
+---
+
+## 第 5 轮：秒退绕过成功 → 暴露第二层“主线程冻结”（2026-08-20）
+
+### 假设
+最小 hook 集（stat/lstat/access/opendir，去掉 open/fopen）能稳定 rebind；补 dyld 镜像枚举对抗（隐藏越狱 dylib）可覆盖 DylibCheck。
+
+### 验证方法
+v0.0.4：最小 4 hook + 全路径 stat 打点。v0.0.5：+ `_dyld_image_count`/`_dyld_get_image_name`/`dlopen`/`dladdr`（过滤越狱镜像）。装机观察存活 + simtouch 截图看界面。
+
+### 观察结果
+- **v0.0.4**：`rebind_symbols` 返回 **rr=0**（成功）——确认 open/fopen 是第 4 轮卡死元凶。`access` **大量命中**：检测通过 `access()` 遍历 `/var/jb/usr/lib/TweakInject/*.plist`（一份已知 tweak plist 黑名单，~38 项），逐个探测。`stat /Applications/Cydia.app` 命中。全部 BLOCK 后仍秒退（日志止于 1.18s 的 `/var/mobile/Containers` 正常 stat）。
+- **v0.0.5（加 dyld 对抗）**：**秒退消除！进程存活 >30s**。确认 **DylibCheck（遍历 `_dyld_get_image_name` 找越狱 dylib）是秒退主因之一**——之前一直扫到我方 `LianJiaBypass.dylib` 和 ElleKit。
+- **但**：simtouch 截图显示 App **卡在启动闪屏页**（绿色 logo + “连接每个家的故事”），间隔 40s 两张截图画面无变化，**CPU 0.0%** → **主线程被挂起阻塞**，不是加载慢，进不去主界面。
+
+### 推论
+
+**已确认（秒退层，已解决）：**
+- 链家启动秒退由多路文件/镜像检测叠加触发，对抗组合拳（缺一仍退）：
+  1. `access` 拦截 `/var/jb/usr/lib/TweakInject/*.plist` 黑名单扫描
+  2. `stat` 拦截 `/Applications/Cydia.app` 等越狱路径
+  3. **`_dyld_get_image_name`/`_dyld_image_count` 隐藏越狱 dylib（DylibCheck，决定性）**
+- fishhook 在本环境可稳定 rebind stat/lstat/access/opendir/dyld*/dlopen/dladdr（8 符号 rr=0）；**open/fopen 不可加入**（卡死 ctor）。
+
+**新问题（第二层）：**
+- 秒退绕过后，App 卡在闪屏、主线程挂起（CPU 0%）。类似 icbcbypass 的“主线程冻结”防御，或我方 hook 副作用（dyld 隐藏改变镜像索引可能扰乱 App 自身逻辑）。
+
+**仍未知：**
+- 冻结是检测触发的惩罚，还是 hook 副作用？
+- 主线程阻塞在哪个调用（等锁/等信号/等网络/死循环 sleep）？
+
+**下一轮单一假设（待验证）：**
+先区分冻结成因：(a) 用 simtouch 确认是否任何检测项残留触发；(b) 抓主线程调用栈（lldb/frida 受 anti-frida 限制，可用 tweak 装 SIGSTOP 观察 or 定时 dump 主线程 backtrace）定位阻塞点；(c) 对照实验——临时收窄 dyld 隐藏范围（只藏自己 dylib 不藏 ellekit），排除 hook 副作用导致镜像索引错乱。

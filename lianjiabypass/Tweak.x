@@ -88,7 +88,25 @@ static _Thread_local int g_reentrant = 0;
 #import <dirent.h>
 #import <fcntl.h>
 #import <errno.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import "fishhook.h"
+
+// 判定加载镜像名是否为越狱/注入相关（用于隐藏 dylib 列表）
+static int is_jb_dylib(const char *name) {
+    if (!name) return 0;
+    if (strstr(name, "substrate") || strstr(name, "Substrate") ||
+        strstr(name, "substitute") || strstr(name, "Substitute") ||
+        strstr(name, "frida") || strstr(name, "cycript") ||
+        strstr(name, "libhooker") || strstr(name, "MobileSubstrate") ||
+        strstr(name, "TweakInject") || strstr(name, "ellekit") || strstr(name, "ElleKit") ||
+        strstr(name, "pspawn") || strstr(name, "rocketbootstrap") ||
+        strstr(name, "LianJiaBypass") || strstr(name, "lianjiabypass") ||
+        strstr(name, "/var/jb/")) {
+        return 1;
+    }
+    return 0;
+}
 
 static DIR *(*orig_opendir)(const char *);
 static DIR *hooked_opendir(const char *name) {
@@ -96,9 +114,20 @@ static DIR *hooked_opendir(const char *name) {
     return orig_opendir(name);
 }
 
+#define LJ_TRACE_ALL_STAT 0   // 诊断：记录所有 /Applications 和可疑系统路径的 stat（噪音大，默认关）
+
 static int (*orig_stat)(const char *, struct stat *);
 static int hooked_stat(const char *path, struct stat *buf) {
     if (is_jb_name_c(path)) { lj_log("stat BLOCK: %s", path); errno = ENOENT; return -1; }
+#if LJ_TRACE_ALL_STAT
+    // 打点：应用/系统级敏感路径（越狱检测常查这些），不含 App 自身沙箱高频路径
+    if (path && (strstr(path, "/Applications/") || strstr(path, "/usr/") ||
+                 strstr(path, "/bin/") || strstr(path, "/etc/") ||
+                 strstr(path, "/Library/") || path[0] == '/' ) &&
+        !strstr(path, "/Containers/") && !strstr(path, ".app/")) {
+        lj_log("stat: %s", path);
+    }
+#endif
     return orig_stat(path, buf);
 }
 
@@ -114,21 +143,50 @@ static int hooked_access(const char *path, int mode) {
     return orig_access(path, mode);
 }
 
-static int (*orig_open)(const char *, int, ...);
-static int hooked_open(const char *path, int flags, ...) {
-    if (is_jb_name_c(path)) { lj_log("open BLOCK: %s", path); errno = ENOENT; return -1; }
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args);
-        return orig_open(path, flags, mode);
+// ========== dyld 镜像枚举对抗（隐藏越狱 dylib，对付 DylibCheck）==========
+
+static uint32_t (*orig_dyld_image_count)(void);
+static const char *(*orig_dyld_get_image_name)(uint32_t);
+
+static uint32_t hooked_dyld_image_count(void) {
+    uint32_t count = orig_dyld_image_count();
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (name && is_jb_dylib(name)) hidden++;
     }
-    return orig_open(path, flags);
+    return count - hidden;
 }
 
-static FILE *(*orig_fopen)(const char *, const char *);
-static FILE *hooked_fopen(const char *path, const char *mode) {
-    if (is_jb_name_c(path)) { lj_log("fopen BLOCK: %s", path); errno = ENOENT; return NULL; }
-    return orig_fopen(path, mode);
+static const char *hooked_dyld_get_image_name(uint32_t idx) {
+    uint32_t count = orig_dyld_image_count();
+    uint32_t visibleIdx = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (!name) continue;
+        if (!is_jb_dylib(name)) {
+            if (visibleIdx == idx) return name;
+            visibleIdx++;
+        }
+    }
+    return orig_dyld_get_image_name(0);
+}
+
+static void *(*orig_dlopen)(const char *, int);
+static void *hooked_dlopen(const char *path, int mode) {
+    if (path && is_jb_name_c(path)) { lj_log("dlopen BLOCK: %s", path); return NULL; }
+    return orig_dlopen(path, mode);
+}
+
+static int (*orig_dladdr)(const void *, Dl_info *);
+static int hooked_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (ret && info && info->dli_fname && is_jb_dylib(info->dli_fname)) {
+        info->dli_fname = "/usr/lib/system/libsystem_c.dylib";
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return ret;
 }
 
 // ========== Hook NSFileManager 目录枚举 ==========
@@ -192,23 +250,21 @@ static FILE *hooked_fopen(const char *path, const char *mode) {
     FILE *f = fopen(g_log_path, "w");
     if (f) {
         NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.3 (C-file-hooks) / LianJia %s ctor started, pid=%d\n",
+        fprintf(f, "[  0.00] [INIT] LianJiaBypass v0.0.5 (file+dyld hooks) / LianJia %s ctor started, pid=%d\n",
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
-    // C 层文件检测对抗 + 打点
+    // C 层文件检测对抗 + dyld 镜像枚举对抗（不含 open/fopen，避开 fishhook 卡死）
     struct rebinding rebs[] = {
-        {"opendir", (void *)hooked_opendir, (void **)&orig_opendir},
-        {"stat",    (void *)hooked_stat,    (void **)&orig_stat},
-        {"lstat",   (void *)hooked_lstat,   (void **)&orig_lstat},
-        {"access",  (void *)hooked_access,  (void **)&orig_access},
-        {"open",    (void *)hooked_open,    (void **)&orig_open},
-        {"fopen",   (void *)hooked_fopen,   (void **)&orig_fopen},
+        {"opendir",               (void *)hooked_opendir,          (void **)&orig_opendir},
+        {"stat",                  (void *)hooked_stat,             (void **)&orig_stat},
+        {"lstat",                 (void *)hooked_lstat,            (void **)&orig_lstat},
+        {"access",                (void *)hooked_access,           (void **)&orig_access},
+        {"_dyld_image_count",     (void *)hooked_dyld_image_count, (void **)&orig_dyld_image_count},
+        {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
+        {"dlopen",                (void *)hooked_dlopen,           (void **)&orig_dlopen},
+        {"dladdr",                (void *)hooked_dladdr,           (void **)&orig_dladdr},
     };
-    // 诊断：rebind 前后各写一行（直接 fopen，此刻若 fopen 已 hook 也会走 orig）
-    { FILE *ff = fopen(g_log_path, "a"); if (ff) { fprintf(ff, "[dbg] before rebind\n"); fclose(ff); } }
     int rr = rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-    { FILE *ff = fopen(g_log_path, "a"); if (ff) { fprintf(ff, "[dbg] after rebind rr=%d\n", rr); fclose(ff); } }
-
-    lj_log("C-layer file hooks + NSFileManager dir-filter active");
+    lj_log("hooks active rr=%d (stat/lstat/access/opendir/dyld*/dlopen/dladdr)", rr);
 }
