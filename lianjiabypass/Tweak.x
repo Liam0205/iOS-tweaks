@@ -8,6 +8,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <string.h>
+#import <sys/stat.h>
 
 #define LJ_DEBUG_LOG 1
 
@@ -65,6 +66,29 @@ static int is_dylib_dir(const char *path) {
 }
 
 static _Thread_local int g_reentrant = 0;
+
+// ========== 底层目录枚举打点（observe-only，定位检测到底走哪条路）==========
+#import <dirent.h>
+#import "fishhook.h"
+
+static DIR *(*orig_opendir)(const char *);
+static DIR *hooked_opendir(const char *name) {
+    if (name && (strstr(name, "DynamicLibraries") || strstr(name, "MobileSubstrate")
+                 || strstr(name, "Library") || strstr(name, "/var/jb"))) {
+        lj_log("opendir: %s", name);
+    }
+    return orig_opendir(name);
+}
+
+static int (*orig_stat)(const char *, struct stat *);
+static int hooked_stat(const char *path, struct stat *buf) {
+    if (path && (strstr(path, "DynamicLibraries") || strstr(path, "substrate")
+                 || strstr(path, "cydia") || strstr(path, "Cydia")
+                 || strstr(path, "/var/jb"))) {
+        lj_log("stat: %s", path);
+    }
+    return orig_stat(path, buf);
+}
 
 // ========== Hook NSFileManager 目录枚举 ==========
 
@@ -140,5 +164,12 @@ static _Thread_local int g_reentrant = 0;
                 appVer ? appVer.UTF8String : "?", getpid());
         fclose(f);
     }
-    lj_log("NSFileManager dir-filter hooks active");
+    // 底层 opendir/stat 打点，定位检测扫描路径
+    struct rebinding rebs[] = {
+        {"opendir", (void *)hooked_opendir, (void **)&orig_opendir},
+        {"stat",    (void *)hooked_stat,    (void **)&orig_stat},
+    };
+    rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
+
+    lj_log("NSFileManager dir-filter + opendir/stat probe hooks active");
 }

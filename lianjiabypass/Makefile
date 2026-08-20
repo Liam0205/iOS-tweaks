@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = LianJiaBypass
 
-LianJiaBypass_FILES = Tweak.x
+LianJiaBypass_FILES = Tweak.x fishhook.c
 LianJiaBypass_CFLAGS = -fobjc-arc
 ifeq ($(shell uname),Linux)
 LianJiaBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
