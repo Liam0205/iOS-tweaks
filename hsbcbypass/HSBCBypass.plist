@@ -1,0 +1,8 @@
+{
+    Filter = {
+        Bundles = (
+            "cn.com.hsbc.hsbcchina",
+            "hk.com.hsbc.hsbchkmobilebanking"
+        );
+    };
+}

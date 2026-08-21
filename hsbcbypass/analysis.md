@@ -121,8 +121,50 @@ RASPFramework 揭示的检测→响应模型（strings）：
   tweak 注入这两个 App（推测上一轮排查时手动设的）。这既意味着裸跑环境更干净，也意味着
   **将来 hsbcbypass 要能注入，必须先在 Choicy 放开或加白名单**。
 
-### 下一步（需用户设备端配合）
+## Round 0 结论（2026-08-21，探针版实测）
 
-由于 SSH 观测三件套都不可靠，需用户在设备上**亲手点图标**启动汇丰中国 / 香港，直接肉眼观察
-原始越狱响应：是弹窗（"检测到越狱"类）？还是秒退 / 卡住 / 白屏 / 正常进入？据此确认
-"Swift/ObjC 层策略退出"新假设的真实退出方式，再决定 hook 层。
+用户在 Choicy 中把汇丰的 `tweakInjectionDisabled` 关掉（放开注入）后，亲手点图标启动汇丰
+中国：**确认闪退**（不是弹窗、不是卡住）。据此布设探针版 tweak 实测：
+
+### 探针 tweak（纯观测，已部署到设备）
+
+- 包名 `page.0x01.hsbcbypass` 0.0.1，filter 两个汇丰 bundle id。
+- hook 五条退出路径 `exit`/`_exit`/`abort`/`kill`/`pthread_kill`，命中即把调用栈写入
+  App 沙盒 `NSTemporaryDirectory()/hsbc_probe.log`（本设备无 `log`/syslog 工具，靠文件回捞）。
+
+### 实测结果 —— 退出机制确认
+
+探针日志只有注入成功记录，**五条 libc 退出路径一条都没命中**：
+```
+探针注入成功: pid=17707 bundle=cn.com.hsbc.hsbcchina
+退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill)
+探针注入成功: pid=17708 bundle=cn.com.hsbc.hsbcchina   ← 启动了两次/有子进程
+```
+⇒ **退出不走 libc**，印证历史结论：OneSpan 用 **raw syscall（`svc #0x80` 直接
+`SYS_exit`/`exit_group`）** 结束进程，用户态 hook libc 抓不到退出动作，也不产生 crash log。
+
+⇒ 但注入本身成功了（Choicy 放开后通道通），且**注入没能阻止闪退**——说明单纯注入不触发
+额外自检崩溃，闪退纯粹是越狱检测判定为真后的响应。
+
+### 关键情报 —— hook 候选层（从 RASPFramework 符号提取）
+
+退出动作（raw syscall）无法 hook，但触发它的**决策点在 Swift 层**。`RASPFramework` 是
+HSBC 自研 Swift 包装（VIPER 架构），符号里锁定两类可下手点：
+
+**源头层（让检测返回 false）**：
+- `jailbreak6statusySb_tF` —— 返回 `Bool` 的越狱状态方法
+- `isJailbroken`
+- `XChinaJourney.DeviceInfoConfiguration(deviceUUID:isJailbroken:isRooted:)`
+
+**决策层（让响应流程走"接受"分支）**：
+- `RASPFramework.acceptJailbroken(track:)` —— 接受越狱的容忍入口
+- `UntrustedDeviceInteractor`/`Presenter`/`Router`/`ViewController` —— 整套"不受信设备"
+  响应流程；`SetupSecureModelStrategy`
+
+### 下一步
+
+1. 脱壳主二进制 + 用 Mach-O 工具（设备端 nm/otool 或 macOS）解析 `jailbreak6status`/
+   `acceptJailbroken` 的符号地址（Linux nm 不认 Mach-O）。
+2. 扩展探针：hook 这些 Swift 方法确认哪个是判定源头，优先在**源头层**改返回值（最稳，
+   类似 abcbypass 的 `initRiskManage` 思路）。
+3. 汇丰香港（232MB，含 `.appex`）单独验证是否同一套 RASPFramework。
