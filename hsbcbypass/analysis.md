@@ -1445,3 +1445,31 @@ mov/movk/cmp/csel/branch,操作数是具体整数就解析分支,遇未知就停
 0x712e10 nop patch 从"机理正确候选"升级为"**对 dispatcher 离线双重验证成立**"。
 剩余唯一不确定 = 设备实测整条 +load 是否真跑完(dispatcher 只是其一环)。
 一条命令待验:`./patchtest.sh 712e10 1f2003d5 25`。
+
+## Round 44（2026-08-21,caller 层分析 —— clean 使 caller 执行 guarded body,非跳过)
+
+### 关键语义澄清:clean(w0=0)让 caller 跑"更多"代码,不是更少
+caller 0x5d8758:`bl 0x712668`(dispatcher)→ `tbnz w0,#0,0x5d87e0`(0x5d87a4):
+- **w0=1(越狱)→ 跳到 0x5d87e0**,跳过 guarded body,直接 stack-check + ret。
+- **w0=0(clean,我 patch 后)→ 不跳, 落入 guarded body 0x5d87a8-0x5d87dc**:
+  - 0x5d87ac ldr x19=[0x849000+0x3b0];0x5d87b4 `bl 0xe4634`;0x5d87d4 `blr x8`
+    (x8=x19-[0x838138], associated-object 键控 computed call, 同 +load 早期模式);
+    0x5d87dc `bl 0x93900`(析构)。
+⇒ guarded body 是**正常设备执行的真实初始化**(越狱时被跳过)。我的 patch 让 app 做
+  "正常设备该做的事",语义正确。
+
+### guarded body 无自旋风险(静态可判部分)
+- 0xe4634 = 正常返回函数(0xe46dc 明确 ret,无自循环),构造对象 + 记账后返回。
+- ⇒ guarded body 本身不是 spin 源(至少 0xe4634 这条不是)。
+
+### 残余不确定(仅设备可判)
+- 0x5d87d4 的 `blr x8` 是 associated-object 键控间接调用,**静态解析不出目标**(同加密表家族)。
+  正常设备上它正常返回;我们环境下是否一致 = 设备实测。
+- 且 dispatcher 只是 +load 巨型函数(0x439f68-0x443a7c)中一环;整条 +load 跑完与否仍需实测。
+
+### 净结论(诚实)
+- Round43 已证:dispatcher 层 clean 路径纯寄存器到达 ret,patch 对 dispatcher 成立。
+- Round44 补充:clean 让 caller 执行 guarded body(正常 init),0xe4634 会返回不自旋;
+  但 body 内 computed blr + 整条 +load 的收敛只能设备验。
+- **静态分析到此完备**。patch 机理正确、单一用途、dispatcher 层双验证、caller 语义正确。
+  唯一验证手段 = `./patchtest.sh 712e10 1f2003d5 25`(设备)。
