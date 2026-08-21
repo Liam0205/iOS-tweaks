@@ -753,3 +753,33 @@ syscall 号:`0x21`(33=access,查越狱文件存在)、`0x9d`(157)、`0xca`(202=s
 - 更高效:用 tweak(能注入)hook TMXProfiling 的 svc wrapper 地址 + 各 SDK 检测入口,
   运行时记录谁被调用、时序,而非逐个 patch 盲试。
 - 或抓一份无 tweak 的完整裸崩溃日志(线程更全)看哪个 framework 在退出线程栈上。
+
+## Round 20（2026-08-21,关键发现:SDK 有反 inline-hook 自检）
+
+动态插桩实验(hook TMX 的 access/stat wrapper + Transmit amIJailbroken)发现:
+
+| tweak 配置 | 存活 |
+|---|---|
+| 纯心跳,不 hook 任何 SDK 函数 | ~374ms(#30,基线) |
+| MSHookFunction hook Transmit amIJailbroken(0x12b16c) | **立即退出(心跳 #0 都没输出)** |
+| MSHookFunction hook TMX access/stat wrapper | **立即退出** |
+
+⇒ **这些 SDK 有反 inline-hook 自检**:MSHookFunction 改函数头字节(插跳转)会被检测到,
+触发即时退出(比正常越狱检测的 ~374ms 快得多)。
+
+### 重大结论:必须二进制 patch,运行时 hook 必被反制
+- 运行时 `MSHookFunction`/fishhook 改内存指令 → SDK 自检发现 → 秒杀。这解释了本 session
+  以及历史所有"hook 尝试"失败的另一层原因(不只是时机,还有反 hook 自检)。
+- **二进制 patch(改磁盘 + 重签 + trustcache)是正确路径**:patch 后内存里是完整正常指令,
+  无 hook 跳转痕迹,不触发反 hook 自检。裸崩不产生 crash log 也符合(自检退出走 svc)。
+- patch Transmit amIJailbroken 时 App 仍存活到 ~300ms(Round 19)→ 说明 patch 本身不触发
+  反制(对的),只是 Transmit 非触发退出的检测源。
+
+### 下一步:策略3 批量二进制 patch
+逐个/批量 patch 各 SDK 的越狱判定函数(改返回未越狱),用二进制 patch(非 hook)避开自检:
+1. 已 patch:Transmit amIJailbroken(无效,非真凶)。
+2. 待 patch:TMXProfiling 0x15090(检测函数)、TuringShield isJailbrokenEnvironment:、
+   BioCatchSDK、RemoteSale、ChinaFacialRecognition 等。
+3. 一次 patch 多个 → App 若存活 → 二分定位真凶。
+4. 注意:patch 要避开各 SDK 可能的完整性自检(改磁盘 hash 变);但 Round 16 已证上层不校验
+   framework hash,SDK 自身若校验 __TEXT 需一并处理。
