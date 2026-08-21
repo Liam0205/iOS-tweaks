@@ -863,3 +863,27 @@ Transmit/TMX/Turing/BioCatch 的越狱判定函数。它们是"检测→上报"�
 - binary patch:✅ 前置条件全通,但要先定位"检测→自毁"链的 patch 点。
 - **tweak 内存 patch(不 hook,直接改目标模块指令)**:理论可行且不被 inline-hook 自检发现
   (改的是别的模块的指令,不是自己 hook),但需先定位 patch 点 + 确认无周期性 __TEXT 自检。
+
+## Round 24（2026-08-21,动态定位真凶的多种尝试）
+
+为定位"检测→退出"触发点,试了多种不被反制的动态观测,均未直接命中:
+- **fishhook mmap/mprotect**(GOT,不被反制):零命中 PROT_EXEC → RWX 不走 libc GOT。
+- **mach 异常端口抢 EXC_BAD_ACCESS**:有 tweak 时不触发异常(退出走静默 svc exit,非 stub 崩溃)。
+- **task_threads 枚举 + thread_get_state 采样所有线程 PC**(300us 间隔):零命中 App 模块
+  → 检测线程执行极快,采样错过;或不在预期模块。
+
+### 关键区分:有无 tweak,退出路径不同
+- **无 tweak**:曾产生 SIGBUS 崩溃日志(143428,PC=RWX stub,LR=0xcafebabe)。但现在裸跑
+  (无 tweak)也**不再产生崩溃日志**,说明常态退出是**静默 svc exit**,那次 SIGBUS 是特例。
+- **有 tweak**:一律静默 svc exit(~380-460ms),无异常、无崩溃日志、无 libc 退出调用。
+
+### 已确认的可用/不可用手段(交付形态依据)
+- MSHookFunction(改函数头):❌ 被反 inline-hook 自检秒杀。
+- fishhook(改 GOT):✅ 不被反制,但只能 hook libc 导入,抓不到内联 svc。
+- mach 异常端口 / task_threads 采样:✅ 不被反制(不 hook),但抓不到极快的内联 svc 检测。
+- binary patch:✅ 不被反制,但逐个 patch SDK 判定函数(Transmit/TMX/Turing/BioCatch)均无效。
+
+### 困境
+真凶是"检测越狱→内联 svc 退出"的链,执行极快、用 svc 绕开所有可观测点,且不在已排除的
+4 个 SDK 的判定函数里。候选剩:主 App China 自身逻辑、RemoteSale(子代理分析中)、
+或其他未排查 framework。静态因 Swift 符号剥离/混淆难定位,动态因 svc 极快难捕获。

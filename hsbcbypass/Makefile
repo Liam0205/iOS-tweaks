@@ -10,7 +10,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = HSBCBypass
 
-HSBCBypass_FILES = Tweak.x fishhook.c
+HSBCBypass_FILES = Tweak.x
 HSBCBypass_CFLAGS = -fobjc-arc
 ifeq ($(shell uname),Linux)
 HSBCBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
