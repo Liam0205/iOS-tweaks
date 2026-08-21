@@ -1407,3 +1407,41 @@ agent 建议:(a)用真正的反编译器(Ghidra/IDA CFG 恢复)离线破;(b)上�
 - 主攻 patch(0x712e10 nop)机理正确 + 单一用途安全,已提交。
 - HK 侧:本地无 HK 二进制(232MB 需上设备拉),HK 离线预研受阻,待设备。
 - 不再重复 trace(避免与 agent 撞车/盲猜);等 agent 依赖枚举 + 设备一条命令验证。
+
+## Round 43（2026-08-21,★★ 独立二次验证 —— clean 路径纯寄存器,patch 对 dispatcher 成立）
+
+### RE 子代理独立方法验证(非复述我的数,是第二套工具重现)
+子代理自写确定性 tracer(从 loop head 播种 w8=w9=0x7480f1e,机械解析每条
+mov/movk/cmp/csel/branch,操作数是具体整数就解析分支,遇未知就停并报依赖)。
+产物 /tmp/hsbc_clean_path_trace.txt,脚本 /tmp/trace_clean_path.py。
+
+### clean 路径状态序列(确认,4 跳到终止)
+```
+0x7480f1e  (patch 强制的 clean 态)
+0x366c8782 (block 0x712c80: cmp w9,0x7480f1e eq → csel 选 0x366c8782, 同时 w19 清零)
+0x366c8782 (原地一次 pass-through 块, 状态不变)
+0x17c6c0cf (block 0x712720: b.le → 0x7130fc)
+0x4624b8ac (终止! block 0x7130fc 内 0x71311c: cmp w9,0x17c6c0cf eq → csel w8=0x4624b8ac)
+→ 0x7136e4 cmp w9,0x4624b8ac eq → 0x7136f8 ldr w8,[sp,#0x8c]; ret@0x71371c
+```
+
+### 三个关键结论(独立验证)
+1. **内存依赖:仅 1 处,且不影响状态转移。** 0x71312c `ldr w9,[sp,#0x8c]` 在终止块内、
+   状态决策(0x713128 已定 w8=0x4624b8ac)之后执行;其结果喂 csel→str 回返回值槽,
+   但下条 `b 0x7126e4`→`mov x9,x8` 无条件用 w8 重导 w9,**该 ldr/csel 对循环是死的**。
+   查全 dispatcher 20 处 w19 触点,只 0x713130 在路径上,即这个死写。
+2. **[sp,#0x8c] = 返回值 w0 来源**(0x7136f8 `ldr w8; and w0,w8,#1; ret`)。clean 路径
+   w19=0(0x712ca4 具体清零,非内存读)→ 返回 w0=0,纯寄存器常量,**无 encrypted-stub 依赖**。
+3. **判决:纯寄存器/立即数路径,patch 对 dispatcher 独立成立。** 0x7480f1e→...→0x4624b8ac
+   到终止 ret 全程只用编译期常量 + 寄存器算术,**0 次加密 stub 调用(0x7748d8/775034/774f68),
+   0 处 gate 分支的内存读**。每个分支都以具体整数比较解析成功(有未知会停,未停)。
+
+### 唯一未验证环节(agent 明确标注,非 patch 缺陷)
+分析是 dispatcher 0x712668 独立层面。**caller 0x5d8758**(`bl 0x712664` init→`bl 0x712668`
+→`tbnz w0,#0` @0x5d87a4)需接受 w0=0 为"未越狱"信号——与原始崩溃栈语义一致
+(tbnz w0,#0 在低位=0 即 clean 时跳过 guarded body)。首份报告已刻画,本 trace 无矛盾。
+
+### 置信度提升
+0x712e10 nop patch 从"机理正确候选"升级为"**对 dispatcher 离线双重验证成立**"。
+剩余唯一不确定 = 设备实测整条 +load 是否真跑完(dispatcher 只是其一环)。
+一条命令待验:`./patchtest.sh 712e10 1f2003d5 25`。
