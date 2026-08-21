@@ -545,3 +545,36 @@ fishhook/ObjC swizzle）无法拦截。** 这与历史 hsbcchina 10+ 轮失败�
 2. **patch VASCODSK 磁盘二进制**:定位混淆检测函数改其返回/跳转,但有完整性自检 + 签名,
    且函数混淆难定位、跨版本不稳。
 3. **syscall 层拦截**:hook `svc` 不可能(用户态);唯一是内核 sysent 或 dyld 的 syscall shim。
+
+## Round 13（2026-08-21，内核态 / 二进制 patch 可行性评估）
+
+设备 = iPhone 13 Pro / iOS 15.4.1 / **Dopamine 2**（KFD + PPL bypass）/ ElleKit / rootless。
+
+### 路径 A：内核态拦截 syscall —— 理论可能但高风险，不优先
+
+- 设备有 **libkrw0 + libkrw0-dopamine**（内核读写 API）。
+- Dopamine 的 libkrw **包含写 PPL 保护内存 + kcall 原语**（官方 README 确认），
+  理论上能改内核代码页 / sysent。
+- 但拦截"应用内联 svc 发的裸 syscall"需在 syscall 入口/sysent 插 hook：
+  - 高难内核工程；改错直接 boot loop；semi-untethered 每次重启要重做。
+  - 会影响全系统所有进程的 syscall，副作用大。
+- 结论：**理论可行但风险/成本过高，作为最后手段**。
+
+### 路径 B：二进制 patch VASCODSK —— 更实际，优先 ✅
+
+关键前提已具备：
+- VASCODSK **未加密**（cryptid=0），可完整反汇编。检测的**判断/分支逻辑是普通 arm64 代码**，
+  改指令即可绕过（不受"裸 syscall 免疫 hook"影响——patch 改的是代码本身，不是 hook）。
+- 设备装 **AppSyncUnified**（接受 unsigned/fakesigned）+ **ldid**（重签名）→ patch 后能重签、系统能接受。
+- 方案：patch VASCODSK 检测函数（改判定分支/直接返回未越狱）→ ldid -S 重签 → 替换
+  `China.app/Frameworks/VASCODSK.framework/VASCODSK`（需 root 写 Bundle，sudo 可）。
+
+**唯一未知障碍 = 完整性自检**：
+- VASCODSK 是否自校验 __TEXT？主二进制是否校验 VASCODSK 的 hash/签名？
+- 若有自检：要么一并 patch 掉自检，要么自检也走裸 syscall 读文件（那 patch 磁盘文件会被发现）。
+- **子代理正在反汇编 VASCODSK 查：检测判定地址、退出触发、完整性自检、最小 patch 方案。**
+
+### 下一步
+1. 等子代理 VASCODSK 反汇编报告（patch 点 + 自检情况）。
+2. 若无自检或自检可一并 patch：做 patch → ldid 重签 → 替换 → 测试。
+3. patch 前备份原 VASCODSK。改 Bundle 内文件是中等风险（可逆，先备份）。
