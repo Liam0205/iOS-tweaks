@@ -200,6 +200,61 @@ static void hsbc_dyld_image_added(const struct mach_header *mh, intptr_t slide) 
     hsbc_try_hook_rasp("dyld-add-image");
 }
 
+// ======== 脱壳:dump 主二进制解密后的加密页 ========
+// China 只有 1 页(cryptoff=0x8000, cryptsize=0x1000)加密。
+// 内存里该页已解密,dump 出来即可离线拼回完整明文二进制。
+#import <mach-o/loader.h>
+#import <mach-o/getsect.h>
+
+static void hsbc_dump_decrypted(void) {
+    // 遍历找 MH_EXECUTE 主可执行(image[0] 在有注入时未必是主 App)
+    const struct mach_header_64 *mh = NULL;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (h && h->filetype == MH_EXECUTE) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && strstr(nm, "China.app/China")) { mh = h; break; }
+            if (!mh) mh = h;  // 兜底:第一个 MH_EXECUTE
+        }
+    }
+    if (!mh) { HSBCLOG(@"脱壳:未找到主可执行"); return; }
+    HSBCLOG(@"脱壳:主二进制 header=%p", mh);
+
+    // 遍历 load commands 找 LC_ENCRYPTION_INFO_64
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    uint32_t cryptoff = 0, cryptsize = 0, cryptid = 0;
+    uint64_t text_vmaddr = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_ENCRYPTION_INFO_64) {
+            const struct encryption_info_command_64 *e =
+                (const struct encryption_info_command_64 *)lc;
+            cryptoff = e->cryptoff; cryptsize = e->cryptsize; cryptid = e->cryptid;
+        } else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const struct segment_command_64 *)lc;
+            if (strcmp(s->segname, "__TEXT") == 0) text_vmaddr = s->vmaddr;
+        }
+        p += lc->cmdsize;
+    }
+    HSBCLOG(@"脱壳:cryptoff=0x%x cryptsize=0x%x cryptid=%u text_vmaddr=0x%llx",
+            cryptoff, cryptsize, cryptid, text_vmaddr);
+    if (cryptsize == 0) { HSBCLOG(@"脱壳:无加密段"); return; }
+
+    // 加密页在内存的地址 = text_vmaddr(含 slide, header 即 text_vmaddr+slide) + cryptoff
+    // header 地址就是 __TEXT 段的运行时基址
+    const uint8_t *decptr = (const uint8_t *)mh + cryptoff;
+    NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:@"China_dec_page.bin"];
+    FILE *f = fopen([out fileSystemRepresentation], "wb");
+    if (f) {
+        size_t w = fwrite(decptr, 1, cryptsize, f);
+        fclose(f);
+        HSBCLOG(@"脱壳:已 dump %zu 字节 → %@", w, out);
+    } else {
+        HSBCLOG(@"脱壳:无法写文件 %@", out);
+    }
+}
+
 // ======== 检测「输入」观测(纯记录,原样放行)========
 // 越狱检测必须先读环境。记录含越狱特征的查询,定位判定方式。
 #import <sys/stat.h>
@@ -295,6 +350,8 @@ static pid_t my_fork(void) {
         MSHookFunction((void *)pthread_kill,  (void *)my_pthread_kill,  (void **)&orig_pthread_kill);
 
         HSBCLOG(@"退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill)");
+
+        hsbc_dump_decrypted();  // 尽早脱壳,趁进程存活
 
         // 检测「输入」观测
         MSHookFunction((void *)stat,   (void *)my_stat,   (void **)&orig_stat);
