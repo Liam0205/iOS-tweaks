@@ -11,10 +11,17 @@
 - App Store 参考（bundle id 需在设备上实测确认，勿凭此猜测）：
   - HSBC China：App Store id `1217785007`，开发者 HSBC Bank (China) Company Limited
   - HSBC HK Mobile Banking：App Store id `1164066737`
-- 待确认（首轮上设备后立即补全）：
-  - [ ] 两个 App 的 CFBundleIdentifier
-  - [ ] 主可执行文件名（binary）
-  - [ ] 是否带 App Extension（`.appex`，存活检测须排除，见 RE 方法论 guide）
+- 已确认（第 0 轮，2026-08-21，设备 22215）：
+
+| App | bundle id | binary | 版本 | 扩展(.appex) | binary 大小 |
+|---|---|---|---|---|---|
+| 汇丰中国 | `cn.com.hsbc.hsbcchina` | `China.app/China` | 3.72.15 | 无 | 6.9MB |
+| 汇丰香港 | `hk.com.hsbc.hsbchkmobilebanking` | `HongKong.app/HongKong` | 3.69.12 | `HSBC_HongKong.appex` + `PushServiceExtension.appex` | 232MB |
+
+  - Team ID: `VWDSW3WE4N`（汇丰中国），签名与 entitlements 正常。
+  - **⚠️ 汇丰香港有 2 个扩展进程，存活检测必须排除 `.appex`/PlugIns**（test 脚本已处理，
+    参考 abcbypass 把扩展误当主 App 的教训）。
+  - 测试工具：`hsbcbypass/tmp/hsbctest.sh`（精确匹配主 App 路径、排除 appex、崩溃判定）。
 
 ## ⚠️ 关键历史情报（来自 llmdoc/memory/reflections/hsbc-methodology-lesson.md）
 
@@ -49,9 +56,20 @@
 
 ## 实验记录
 
-（待上设备后开始）
+### 第 0 轮（2026-08-21）：情报收集 + 裸跑对照（部分完成）
+
+- 设备通过 **22215** 端口访问（2215 端口的旧 sshd 隧道僵死占用，改用 22215，同一台
+  iPhone 13 Pro / iOS 15.4.1）。
+- 两个 App 的 bundle id / binary / 版本 / 扩展已确认（见上表）。
+- **裸跑对照遇阻**：`uiopen cn.com.hsbc.hsbcchina` 返回 0，但主 App 进程**从未出现**
+  （每 0.2s 高频抓取 5s 内 0 命中），无 crash log。汇丰香港同样起不来。
+  - 已排除：uiopen 本身失效（能正常拉起设置 App `com.apple.Preferences`）；签名问题
+    （entitlements 正常）；bundle id 错误（已用 ldid/strings 核准）。
+  - **最可能原因：设备锁屏**。银行 App 常因数据保护（NSFileProtection）/前台策略，在
+    锁屏状态下不启动到前台，而系统 App 不受此限。需用户解锁并点亮屏幕后重测。
 
 ## 当前阻塞
 
-- **2215 SSH 连接超时**（banner exchange timeout）：TCP 端口通但设备端 sshd 无响应，
-  疑似设备锁屏/休眠/负载高或 sshd 需重启。已提示用户处理。设备恢复后从第 0 轮开始。
+- **需用户解锁 2215 设备并保持点亮**：裸跑对照无法完成（App 进程起不来，疑锁屏）。
+  解锁后重跑 `hsbctest.sh cn` / `hk` 观察原始退出行为，再拉主 binary 做静态分析
+  （找 OneSpan 特征、svc #0x80 内联点、检测字符串），判断 HK 是否同为 OneSpan RASP。
