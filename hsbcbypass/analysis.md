@@ -604,3 +604,27 @@ fishhook/ObjC swizzle）无法拦截。** 这与历史 hsbcchina 10+ 轮失败�
 4. 若签名这关过不去 → 二进制 patch 路径受阻,回到内核态(路径 A)或放弃。
 
 ### 现状:等子代理 VASCODSK 反汇编(patch 点),并行解签名问题
+
+## Round 15（2026-08-21，签名障碍突破 —— patch 工具链打通 ✅）
+
+Dopamine 用 **jailbreakd + trustcache**(不是证书链)信任 adhoc 签名的二进制。
+`/var/jb/basebin/jbctl rebuild_trustcache` 会重建 trustcache 信任已签名文件。
+
+**验证成功**:adhoc 重签的 VASCODSK 放进 Bundle → `jbctl rebuild_trustcache` → 启动,
+**探针成功注入(pid=20387),无 CODESIGNING 崩溃**。Round 14 的签名墙被绕过。
+
+### 完整可行的二进制 patch 工具链(已验证)
+1. patch `VASCODSK` 二进制指令（绕过检测判定）
+2. `ldid -S <file>` adhoc 重签
+3. `sudo cp` 替换进 `China.app/Frameworks/VASCODSK.framework/VASCODSK`（chown _installd）
+4. `sudo /var/jb/basebin/jbctl rebuild_trustcache` 信任新 cdhash
+5. `uiopen --bundle` 启动 → 加载成功
+
+备份在 `/tmp/VASCODSK.orig`。改 Bundle 可逆（cp 回原库 + rebuild_trustcache）。
+
+### 剩余:定位 patch 点 + 完整性自检
+- 子代理正在反汇编 VASCODSK 找：越狱检测判定地址、退出触发、完整性自检。
+- 若 VASCODSK 自校验 __TEXT（patch 后 hash 变会被发现）→ 需一并 patch 掉自检，或
+  改成"不改磁盘、只在运行时用 tweak patch 内存"（但那又回到 hook 时机问题）。
+- 若主二进制/RASPFramework 校验 VASCODSK 的 hash → 也要处理。
+- **关键有利点**：检测的判定/分支是普通 arm64 代码，patch 改指令直接生效，不受裸 syscall 影响。
