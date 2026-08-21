@@ -410,3 +410,23 @@ tweak 内存脱壳法离线分析。
    无参的返回状态）。
 2. 据观测确定"安全"返回值，改为始终返回未检测到。
 3. 注意 OneSpan 可能有完整性自检——ObjC swizzle 通常安全（abcbypass 验证），但需实测。
+
+## Round 8（2026-08-21，AppSecurityMonitor ObjC 方法观测 —— 未命中）
+
+观测版 tweak（重写，聚焦）：`NSClassFromString(@"_TtC15WithOneSpanRASP18AppSecurityMonitor")`
+成功找到类并 `method_setImplementation` hook 了全部 8 个检测方法（日志确认 8 个都 hook 上）。
+
+**结果：8 个方法一次都没被调用**（`→` 计数为 0），进程仍退出。
+
+⇒ 这些 ObjC 方法是 OneSpan 暴露的**被动查询接口**（供 App 主动查状态），**实际的越狱拦截
+不经过它们**——OneSpan 在自己的 C 层后台自动检测并触发退出（内联 svc）。
+
+### 下一步（更接近根源的观测）
+
+- hook `pthread_create`，记录所有新线程的**入口函数地址 + 所属模块**——检测后台线程的入口
+  会直接暴露检测代码在哪个模块（大概率 VASCODSK / MobileSecurity 的 C 层）。
+- hook `AppSecurityMonitor` 的 `init`/`alloc` 及 `ActiveOneSpanRASPProvider` 的方法，确认
+  检测启动链（是谁 new 了 monitor、调了什么启动检测）。
+- 等子代理反汇编报告（分析 China.decrypted 的检测→退出调用链）。
+- 若确认检测纯在 VASCODSK C 层且用内联 svc 读环境 + 触发退出：最后手段是运行时 patch
+  VASCODSK 的检测函数（需定位）或在其依赖的 syscall 封装处拦截（若有）。
