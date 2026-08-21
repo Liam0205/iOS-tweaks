@@ -451,3 +451,36 @@ tweak 内存脱壳法离线分析。
 ⇒ 检测确定在 **VASCODSK C 层**(混淆),由 China 的 `AppSecurityMonitor`/
 `ActiveOneSpanRASPProvider` 初始化时启动后台检测,内联 syscall 读环境 + 触发退出。
 静态定位混淆检测函数是当前唯一出路(子代理进行中)。
+
+## Round 10（2026-08-21，子代理反汇编报告 + 核对）
+
+子代理反汇编 China.decrypted 完成,关键结论 + 我的核对:
+
+### 确认:AppSecurityMonitor 是"状态汇报"接口,判定不在其中
+- 9 个方法(init + 8 检测)只是把外部传入的 Bool 参数转成整数状态码返回
+  (`jailbreakStatus:` 返 0/2,`debuggerStatus:` 返 0/1...),判定值从 x2/x3 参数传入。
+- 通过 `RASPFramework.SecureAppModel.init(appSecurityMonitor:)`(China 内 GOT
+  `0x1004cec38`,构造点约 0x100016b60/0x100016bbc)接入:SecureAppModel 持有满足
+  `AppMonitorDelegate` 协议的 AppSecurityMonitor。
+- 印证我 Round 8 实测:这些 ObjC 方法闪退前从未被调用。
+
+### 核对:`_matrix_die` 不是越狱退出路径（子代理误判,已排除）
+- 子代理发现 VASCODSK `0xfb38`(它猜名 `_matrix_die`)封装调 `abort`(经 stub 0x26824),
+  被 0xfdc0/0xfe10/0xfed4 调用。
+- **但反汇编显示这些是内部错误处理**(0xfddc 分配内存→0xfde4 cbz 查空指针→die),
+  是"malloc 失败就 abort"的标准模式,不是越狱检测。
+- 且崩溃日志明确是 **SIGBUS(跳 RWX stub)不是 SIGABRT**,`abort` 产生 SIGABRT,
+  时间线不符。→ `_matrix_die` 不是越狱退出点,排除。
+- VASCODSK 不含 `brk`/`udf`/`svc`;China 里的 `brk #1` 是 Swift 标准 fatalError trap,非检测专用。
+
+### 子代理最有价值的洞察:hook 时机可能太晚
+- 检测可能在 **tweak 的 hook 完成之前的极早期**(dyld 静态初始化器 / Swift 全局初始化器 /
+  `+load` 阶段)就跑完并触发退出。这能统一解释"所有 hook(libc/信号/mach/pthread/ObjC)
+  都没命中"——不是拦不到,是**太晚**。
+- 观测显示 tweak 在 `+7~12ms` 才布设完 hook;若检测在 0~7ms 跑完,全错过。
+
+### 下一步:验证并解决 hook 时机
+1. 确认检测相对 tweak `%ctor` 的时序:tweak 是否晚于 OneSpan 的初始化器。
+2. 若太晚:设法让 tweak 更早注入(ElleKit 加载顺序 / DYLD_INSERT / `+load` 里抢先 /
+   构造器优先级),赶在 OneSpan 检测初始化器之前 hook。
+3. 时机解决后,重新用 mach 异常端口 / RWX mmap hook 抓 SIGBUS stub 的真实来源。
