@@ -628,3 +628,23 @@ Dopamine 用 **jailbreakd + trustcache**(不是证书链)信任 adhoc 签名的�
   改成"不改磁盘、只在运行时用 tweak patch 内存"（但那又回到 hook 时机问题）。
 - 若主二进制/RASPFramework 校验 VASCODSK 的 hash → 也要处理。
 - **关键有利点**：检测的判定/分支是普通 arm64 代码，patch 改指令直接生效，不受裸 syscall 影响。
+
+## Round 16（2026-08-21,验证主二进制不校验 VASCODSK hash）
+
+用 adhoc 重签版(逻辑未改、仅 hash/签名变)启动:App 行为**与原版完全一致**
+(存活 ~300ms 后检测退出),没有因 hash 不符提前崩。
+
+⇒ 证明两点:
+1. **主二进制 / RASPFramework 不校验 VASCODSK 的文件 hash**——patch VASCODSK 不会被上层发现。
+2. patch VASCODSK 的逻辑改动会真正加载执行。
+
+**二进制 patch 路径的前置条件全部验证通过**:
+- ✅ VASCODSK 未加密可反汇编
+- ✅ adhoc 重签 + jbctl rebuild_trustcache 能让改动的库被 dyld 接受(Round 15)
+- ✅ 上层不校验 VASCODSK hash(Round 16)
+- ✅ Bundle 可写、可逆(备份 /tmp/VASCODSK.orig)
+
+**唯一剩余未知 = VASCODSK 是否自校验自己的 __TEXT**（子代理正在查）。若无自检,patch 检测
+判定点即可成功;若有自检,需一并 patch 自检。
+
+现在等子代理定位:检测判定指令地址 + 退出触发 + 自检。拿到后即可实施 patch。
