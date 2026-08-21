@@ -1062,44 +1062,75 @@ BT[14] dyld start + 2528
 
 ---
 
-## 第 14 轮: 推翻"RunLoop 破坏"假说 + 确认多重时序敏感检测（2026-08-20）
+## 第 14 轮: 探索 UI 冻结 (⚠️ 结论多数无效, 见第 15 轮更正)（2026-08-20）
 
-### 方案 b 实测: 丢弃检测 block 成功阻止 exit, 但 UI 仍完全不可交互
-- `DETECT BLOCK DROPPED #1`, `EXIT blocked=0 / DRAIN ESCAPE=0`, 进程健康存活 >30s。
-- **用户实测: 登录页所有元素(勾选圈/输入框/注册登录按钮/返回键)全部无反应。**
+> **⚠️ 本轮及第 13 轮"续"的存活类结论全部作废。** 原因: 存活检测用了
+> `grep MbapMPaaS`, 它匹配到的是后台扩展进程 `group.abc.toolExtension`
+> (常驻), **不是主 App**。因此"存活 >30s / >3min""进入业务流程""UI 渲染正常"
+> 等判断都建立在错误信号上, 不可信。保留本轮仅为记录教训, 具体数据勿引用。
+>
+> 唯一可能仍有效的观察: `sendEvent:` 曾收到过 touch 事件 (但因主 App 存活本身
+> 存疑, 该观察也需重测才能采信)。
 
-### 关键诊断: 加 UI 状态诊断 timer (每 3s dump)
-- **主 RunLoop 完全健康**: UIDIAG 每 3s 精准触发 (1.82→4.76→7.76…)。
-- **UI 对象状态完全正常**: `ignoringEvents=0`, keyWindow `userInteractionEnabled=1`,
-  `hidden=0 alpha=1.00`, 仅 1 个 window (level=0), rootVC=`DFNavigationController`。
-  **无遮罩、无 ignoreInteraction、无异常层级。**
-- **⇒ 推翻 v89-92 及本轮早期假说: UI 冻结与 longjmp / RunLoop 破坏无关。**
-  方案 b 从未触发 longjmp, RunLoop 始终正常, UI 依旧死 —— 冻结另有原因。
+### 本轮犯的方法论错误 (教训)
+1. **存活检测匹配错进程**: `grep MbapMPaaS` 命中扩展, 未排除 `PlugIns`。
+   正确做法: `ps -eo args | grep -E 'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。
+2. **在被污染的存活信号上叠加了大量结论**: RunLoop 健康、UI 状态正常、
+   "僵尸登录页"等推断都可能是对扩展进程或崩溃前瞬间的误读。
+3. **反复打补丁而非先建立可信基线**: 违反"失败两次就查根因"原则。
 
-### sendEvent: hook 证明触摸能到达 App
-- 注入 tap(490,1075) → App `sendEvent:` 收到 `phase=0 (Began) at (163,358) view=UIView`,
-  `phase=3 (Ended) view=nil`。坐标 490/3≈163 (px→pt), **命中正确, hit-test 到 UIView**。
-- **⇒ 触摸事件通路完全正常, 能进入 App 并 hit-test 到视图。封锁不在系统层、不在 hit-test。**
+---
 
-### 决定性认知: 多重、时序敏感的分布式检测
-- 加 UIControl `sendAction:`/`beginTracking` hook 后, 换一次运行 **App 在 T+0.71s 就挂**:
-  日志止于 `objc_exception_throw: DTRpcException — 取消请求`, UIDIAG(1s)都没起来。
-- crash log: **EXC_BAD_ACCESS / SIGSEGV, PAC failure** (KERN_INVALID_ADDRESS at
-  0xe2e3...pointer authentication failure), 后台线程经 libdispatch block, 栈全是
-  MbapMPaaS 内部 (无 ABCBypass 帧)。疑 SDK 主动用坏 PAC 指针触发崩溃作为反注入响应。
-- **多次运行触发的检测各不相同**: exit(0) / DTRpcException / PAC-fail SIGSEGV。
-  说明 ABC 有一套**分布式、时序敏感的检测网络**, 单点阻断 exit 不足以恢复功能。
+## 第 15 轮: 建立可信基线 + 二分定位有害 hook（2026-08-21）
 
-### 修正后的问题定性
-- 触摸能到达、能 hit-test, 但**登录页控件无响应** —— 最可能是: 检测命中后 SDK 走了
-  **降级/半初始化分支**, `DFNavigationController` 装载的登录页控件没有绑定
-  target-action / 业务逻辑未启动 (而非触摸被拦)。即 exit 只是检测后果之一,
-  真正问题是**检测导致 App 未进入正常业务初始化路径**。
-- 阻断 exit 让进程"活着"但停在僵尸登录页, 不等于绕过成功。
+### 可信测试工具 (tmp/abctest.sh)
+- 精确匹配主 App: `ps -eo args | grep -E 'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。
+- 三模式: bare(卸载 tweak 裸跑) / tweak(带 tweak) / current。逐秒探测存活,
+  对比 CrashReporter 新增判定崩溃 vs 正常退出。
 
-### 待用户决策的方向 (见对话)
-1. 深挖 w24 检测源头, 让所有检测判定返回 clean, 使 SDK 走完整正常初始化路径 (方案 a 强化版)。
-2. 用 Frida 动态插桩实时追踪检测调用链 / 定位降级分支 (需设备装 frida-server)。
-3. 评估该 App 反调试强度, 判断投入产出比后再决定是否继续。
+### 用正确方法重建的基线 (全部可信)
+| 配置 | 主 App 结果 |
+|---|---|
+| **裸跑 (无 tweak)** | ~13s **正常退出** (exit, 无崩溃) — ABC 越狱检测原始行为 |
+| **全量 hook tweak** | ~1s **崩溃** (`0xb5a06000` SIGSEGV) — 比裸跑更早死, 净负面 |
+| **ABC_AGGRESSIVE=0** (关 exit/dispatch/exception/CFRunLoop/drain, 留 libc+ObjC hook) | ~1s 仍崩溃 (`0xb5a06000`) |
+| **ABC_LIBC_HOOKS=0** (再关 libc inline hook, 仅留 ObjC swizzle) | ~13s **正常退出, 无崩溃** = 裸跑基线 |
+
+### 关键确定结论 (二分法证实)
+1. **`0xb5a06000` 崩溃的根因 = 对 libc 函数 inline-hook (MSHookFunction)**。
+   stat/lstat/access/open/fopen/realpath/readlink/sysctl/getenv/fork/dlopen/dlsym
+   及 `_dyld_*` 一旦被 MSHook 改写序言, ABC 完整性自检发现后, 在后台 GCD 线程
+   跳到固定哨兵地址 `0xb5a06000` 触发 SIGSEGV。地址每次完全相同(非 PAC 随机),
+   佐证是"主动触发"而非随机内存错误。
+   - 与"__text patch 被完整性校验发现崩溃"(第 13 轮) 同类防护, **范围更广: 连
+     libc 序言都在校验内**。**⇒ 对 ABC 禁用一切 C 函数 inline-hook。**
+2. **ObjC 方法 swizzle (Logos %hook / method swizzle) 安全**, 不触发完整性校验
+   (不改函数序言字节, 改的是 objc 方法表)。当前 ObjC 越狱 hook 覆盖:
+   DTNetworkAdapterUtils/GMRZUACInterface/IsJailBreak/RiskStub/SecCodeImp/
+   AIPIFlySystemInfo/EESBPhoneInfo/UPWRNUtil/LuaSystem 的 isJailbroken 类方法。
+3. **但仅 ObjC swizzle 挡不住退出**: 装了以上 hook 后主 App 仍 13s 退出 (= 裸跑),
+   说明触发退出的检测**不走这些 ObjC 方法**, 而是之前定位的 native 路径
+   (`MbapMPaaS+0x8db260` 的 exit(0), 由 `[receiver action]==3` 判定, 见下)。
+
+### 仍然可信的历史静态分析结论 (与存活无关, 保留)
+- 退出源头: `MbapMPaaS+0x8db254: cmp w24,#3; b.ne 0x8db1bc; ...; bl _exit`。
+  `w24 = [receiver action]` (receiver = 检测 block 捕获对象 `*(block+0x20)`,
+  selector = `action`, 返回枚举 0/1/2/3, **3=风险→exit**)。GOT 经 LIEF 确认
+  `_exit`/`___stack_chk_fail`/`_objc_release`。
+- 该 exit block 的 invoke 函数入口 = `MbapMPaaS+0x8dad68`。
+- Frida 路线**放弃**: ABC 反注入, spawn 时 frida-agent 注入即在 dyld 早期
+  (仅 2 镜像) 跳非法地址自毁。frida-server 装/停都会让 ABC 更快崩 (反 frida
+  文件/进程扫描), 已彻底卸载。
+
+### 下一步 (基于可信基线)
+- 现有干净基线 = 仅 ObjC swizzle, 13s 正常退出无崩溃。在此之上**只用 ObjC/数据层
+  手段**中和 `[receiver action]`:
+  - 定位 receiver 的类 (读 `*(block+0x20)` 的 isa, 需在不 inline-hook libc 的
+    前提下, 可用 ObjC hook dispatch 或直接在 %ctor 后延迟读取), %hook 其
+    `-action` 使其返回非 3。
+  - 或 %hook 该 block 所属检测类的入口方法整体短路。
+- **约束**: 绝不 inline-hook C 函数; 绝不 patch __text; 绝不引入 frida。
+  所有验证必须用 abctest.sh 的正确进程匹配, 以"达到或超过 13s 且无崩溃 + 最终
+  真正进入登录/业务界面"为成功标准 (存活本身不等于成功)。
 
 

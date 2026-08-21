@@ -1,6 +1,20 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+
+// ABC_AGGRESSIVE: 是否启用激进 hook (exit/abort/kill/signal/dispatch/exception/
+// CFRunLoop/检测函数/block丢弃)。0 = 只保留文件隐身 + ObjC 越狱方法 hook (低风险)。
+// 二分定位有害 hook 时用。默认 0(最小安全集)。
+#ifndef ABC_AGGRESSIVE
+#define ABC_AGGRESSIVE 0
+#endif
+
+// ABC_LIBC_HOOKS: 是否 inline-hook libc 函数 (stat/open/access/sysctl/dlopen…)。
+// 怀疑 ABC 完整性自检会发现 libc 序言被改 -> 0xb5a06000 崩溃。0 = 全关, 只留
+// ObjC 越狱方法 swizzle (不改任何 C 函数序言)。二分定位用。
+#ifndef ABC_LIBC_HOOKS
+#define ABC_LIBC_HOOKS 0
+#endif
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
@@ -1511,6 +1525,7 @@ static void hookDetectionByOffset(void) {
             (void *)g_main_stack_top, g_main_thread_id);
     abc_log("malloc zones: %u, force_unlock=%p", g_saved_zone_count, (void *)g_force_unlock_fn);
 
+#if ABC_AGGRESSIVE
     g_dispatch_drain_fn = (void (*)(void *))dlsym(RTLD_DEFAULT, "_dispatch_main_queue_callback_4CF");
     abc_log("dispatch drain fn: %p", (void *)g_dispatch_drain_fn);
 
@@ -1518,6 +1533,7 @@ static void hookDetectionByOffset(void) {
         MSHookFunction((void *)g_dispatch_drain_fn, (void *)hooked_dispatch_drain, (void **)&orig_dispatch_drain);
         abc_log("_dispatch_main_queue_callback_4CF hook armed (drain-level exit neutralization)");
     }
+#endif
 
     // Arm file/dyld/sysctl hooks FIRST (MSHookFunction, not fishhook — avoids GOT modification).
     build_dyld_map();
@@ -1542,6 +1558,7 @@ static void hookDetectionByOffset(void) {
         }
     }
 
+#if ABC_LIBC_HOOKS
     abc_log("arming ctor hooks (MSHookFunction — GOT-clean)");
     MSHookFunction((void *)stat, (void *)hooked_stat, (void **)&orig_stat);
     MSHookFunction((void *)lstat, (void *)hooked_lstat, (void **)&orig_lstat);
@@ -1560,7 +1577,11 @@ static void hookDetectionByOffset(void) {
     MSHookFunction((void *)dlopen, (void *)hooked_dlopen, (void **)&orig_dlopen);
     MSHookFunction((void *)dlsym, (void *)hooked_dlsym, (void **)&orig_dlsym);
     abc_log("ctor inline hooks armed (16 functions, zero GOT modifications)");
+#else
+    abc_log("ABC_LIBC_HOOKS=0 — libc inline hooks skipped (only ObjC swizzle)");
+#endif
 
+#if ABC_AGGRESSIVE
     MSHookFunction((void *)CFRunLoopAddTimer, (void *)hooked_CFRunLoopAddTimer, (void **)&orig_CFRunLoopAddTimer);
     abc_log("CFRunLoopAddTimer hook armed (ctor)");
 
@@ -1570,6 +1591,7 @@ static void hookDetectionByOffset(void) {
     // dispatch_after hook MUST be in ctor — detection schedules kill block at t=0.88s
     MSHookFunction((void *)dispatch_after, (void *)hooked_dispatch_after_block, (void **)&orig_dispatch_after_block);
     abc_log("dispatch_after hook armed (ctor — intercept early kill timers)");
+#endif
 
     // Now install ObjC jailbreak detection hooks
     hookSecureUtilityPlus();
@@ -1580,6 +1602,7 @@ static void hookDetectionByOffset(void) {
     hookShowJailBrokenAlert();
     abc_log("all ObjC jailbreak hooks armed (ctor)");
 
+#if ABC_AGGRESSIVE
     // Delay exit/abort hooks + remaining swizzle to avoid BSXPCServiceConnection crash.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
@@ -1612,4 +1635,7 @@ static void hookDetectionByOffset(void) {
 
         abc_log("all hooks armed (GOT-clean — zero rebind_symbols)");
     });
+#else
+    abc_log("ABC_AGGRESSIVE=0 — only file/dyld/sysctl + ObjC jailbreak hooks (minimal safe set)");
+#endif
 }
