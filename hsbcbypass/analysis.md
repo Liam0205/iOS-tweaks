@@ -257,6 +257,39 @@ open("…/TweakInject/HammerIt.plist")   ← … Choicy.dylib … libinjector.dy
 - 但 `frida -f cn.com.hsbc.hsbcchina`（spawn）**`Failed to attach: unexpected early
   end-of-stream`** —— VASCODSK 在 frida 完成注入前就检测到并杀进程。**汇丰也检测 Frida。**
 
+## Round 4（2026-08-21，脱壳 + 退出机制精确观测）
+
+### 内存脱壳成功
+
+- China 只有 **1 页加密**（`cryptoff=0x8000 cryptsize=0x1000 cryptid=1`）。
+- tweak 在 %ctor 里遍历 `MH_EXECUTE` 定位主二进制，dump `header+cryptoff` 处 4096 字节
+  解密内存 → `app-binary/China.decrypted`（拼回 offset 0x8000）。反汇编验证解密页是有效
+  arm64 指令。**离线可反汇编全二进制。**
+- 已交由子代理反汇编分析越狱检测调用链与退出机制。
+
+### 关键 ObjC selector（可 swizzle 的希望）
+
+脱壳后 strings 发现主二进制里有带冒号的 ObjC selector：**`jailbreakStatus:`、
+`debuggerStatus:`**，以及 Swift `jailbreak6statusySb_tF`(返回 Bool)、`isJailbroken`、
+`XChinaJourney.DeviceInfoConfiguration(...isJailbroken:isRooted:)`。带冒号 selector 若是
+可 swizzle 的 ObjC 方法，就是最理想 hook 点（abcbypass 成功靠 ObjC swizzle）。
+
+### 退出机制 —— 约 635ms「无声死亡」，双进程
+
+探针 v11/v12 加了：更多退出变体(`_Exit`/`std::terminate`)、**信号 handler**
+(ABRT/SEGV/BUS/ILL/TRAP/SYS/FPE/PIPE)、心跳按 pid 分文件、记录 pid/ppid/argv0。实测：
+
+- 每次启动**稳定出现两个 China 主进程**（pid 不同，**ppid 都是 1=launchd**，argv0 都是主
+  `China.app/China`，非 extension）——是两次独立 spawn，不是父子。
+- 两个进程心跳都在 **约 635ms（#50）戛然而止**，采集 15s 也无更多心跳 → 进程确实在
+  ~635ms 死亡。
+- 死亡时：**无信号捕获、无 libc 退出函数命中、无 mach terminate**。
+
+⇒ 能这样"无声"杀掉进程的只有 **SIGKILL（不可捕获，无记录）** 或 **`exit_group` 内联
+syscall**。两个进程几乎同时死，略偏向"外部统一 kill / 看门狗"，但 ppid=1 看不出发起者。
+（注：主二进制 China 反汇编中 svc 指令数为 0，说明若是内联 syscall，可能在别的模块或用了
+非常规编码；待子代理反汇编确认。）
+
 ### 下一步（策略选择）
 
 要看 VASCODSK 内联 syscall 的检测逻辑，需绕过其反调试。两条路：

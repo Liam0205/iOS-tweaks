@@ -17,7 +17,8 @@
 static void hsbc_file_log(NSString *line) {
     static NSString *path = nil;
     if (!path) {
-        path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"hsbc_probe.log"];
+        path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"hsbc_probe_%d.log", getpid()]];
     }
     NSString *entry = [line stringByAppendingString:@"\n"];
     FILE *f = fopen([path fileSystemRepresentation], "a");
@@ -89,6 +90,29 @@ static int my_pthread_kill(pthread_t t, int sig) {
     HSBCLOG(@"pthread_kill(sig=%d) 被调用", sig);
     hsbc_dump_backtrace("pthread_kill");
     return orig_pthread_kill(t, sig);
+}
+
+// ---- 更多退出变体 ----
+static void (*orig_Exit)(int);
+static void my_Exit(int code) { HSBCLOG(@"_Exit(%d)", code); hsbc_dump_backtrace("_Exit"); orig_Exit(code); }
+
+static void (*orig_terminate)(void);
+static void my_terminate(void) { HSBCLOG(@"std::terminate/objc"); hsbc_dump_backtrace("terminate"); orig_terminate(); }
+
+// ---- 信号捕获:若靠 raise/信号退出,handler 会先记录(SIGKILL/SIGSTOP 不可捕获)----
+static void hsbc_sig_handler(int sig) {
+    HSBCLOG(@"⚡ 收到信号 sig=%d", sig);
+    hsbc_dump_backtrace("signal");
+    // 记录后恢复默认并重抛,保持原行为
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void hsbc_install_sig_handlers(void) {
+    int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGSYS, SIGFPE, SIGPIPE };
+    for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) {
+        signal(sigs[i], hsbc_sig_handler);
+    }
+    HSBCLOG(@"信号 handler 已安装 (ABRT/SEGV/BUS/ILL/TRAP/SYS/FPE/PIPE)");
 }
 
 // ======== RASPFramework Swift 决策点探针 ========
@@ -340,8 +364,10 @@ static pid_t my_fork(void) {
 
 %ctor {
     @autoreleasepool {
-        HSBCLOG(@"探针注入成功: pid=%d bundle=%@", getpid(),
-                [[NSBundle mainBundle] bundleIdentifier]);
+        HSBCLOG(@"探针注入成功: pid=%d ppid=%d bundle=%@ argv0=%s", getpid(), getppid(),
+                [[NSBundle mainBundle] bundleIdentifier],
+                [[NSProcessInfo processInfo] arguments].count > 0 ?
+                  [[[NSProcessInfo processInfo] arguments][0] UTF8String] : "?");
 
         MSHookFunction((void *)exit,          (void *)my_exit,          (void **)&orig_exit);
         MSHookFunction((void *)_exit,         (void *)my__exit,         (void **)&orig__exit);
@@ -349,7 +375,14 @@ static pid_t my_fork(void) {
         MSHookFunction((void *)kill,          (void *)my_kill,          (void **)&orig_kill);
         MSHookFunction((void *)pthread_kill,  (void *)my_pthread_kill,  (void **)&orig_pthread_kill);
 
-        HSBCLOG(@"退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill)");
+        void *pExit = dlsym(RTLD_DEFAULT, "_Exit");
+        if (pExit) MSHookFunction(pExit, (void *)my_Exit, (void **)&orig_Exit);
+        void *pTerm = dlsym(RTLD_DEFAULT, "_ZSt9terminatev");
+        if (pTerm) MSHookFunction(pTerm, (void *)my_terminate, (void **)&orig_terminate);
+
+        hsbc_install_sig_handlers();
+
+        HSBCLOG(@"退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill/_Exit/terminate/signals)");
 
         hsbc_dump_decrypted();  // 尽早脱壳,趁进程存活
 
