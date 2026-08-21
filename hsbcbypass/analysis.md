@@ -913,3 +913,29 @@ SIGKILL 不可捕获、不产生 crash log、不触发信号/mach handler ——
 ### 已彻底排除
 所有第三方风控 SDK(Transmit/TMX系列/Turing/BioCatch/RemoteSale/OneSpan)的检测→退出;
 China 内联 svc;China initializer。
+
+## Round 26（2026-08-21,MAX effort — _exit import 收敛到 XChinaJourney ★）
+
+### 决定性收敛:主 App China 无任何退出能力,只 4 个 framework import _exit
+- **China 主二进制 import 表:无 exit/abort/kill/terminate/syscall,0 svc** → China 不亲自退出。
+- ThreatMetrix 三兄弟(TMXProfiling/BehavioSec/Connections)的 svc 网关只有
+  access/statfs/sysctl/mprotect/getpid/socket,**无 exit/ptrace/kill stub** → 检测不退出,排除。
+- 全 framework 扫 import `_exit`(直接终止 syscall 封装),只有 4 个:
+  - **XChinaJourney**(汇丰核心 journey 模块,38MB,启动即加载,含
+    `DeviceInfoConfiguration(isJailbroken:isRooted:)`)← ★头号嫌疑
+  - ChinaFacialRecognitionJourneyPluginKit(人脸,启动未必跑)
+  - DidvJourneyPluginKit(DIDV,启动未必跑)
+  - RemoteSale(已排除)
+
+⇒ **退出动作最可能是 XChinaJourney 调 `_exit`**。之前 hook libc _exit 零命中的原因待查
+(可能:被反制/调用的是自身 GOT 未走 libc 本体/时机)。
+
+### 退出机制再定性(排除法收敛)
+进程 `(China)` zombie 态自己退出 + 无 mach 异常(BAD_ACCESS/BREAKPOINT/BAD_INSTRUCTION/
+ARITHMETIC/GUARD/SOFTWARE 全抓零命中)+ 无 libc exit hook 命中 → 是 `_exit`/`exit_group`
+syscall(正常退出,非崩溃、非信号)。由 import _exit 的 framework 执行。
+
+### 下一步(聚焦 XChinaJourney)
+1. 定位 XChinaJourney 里 `_exit` 的 GOT stub 及所有调用点,反汇编调用链,找"检测越狱→_exit"。
+2. patch 那个调用点(把 bl _exit 改 nop,或把检测判定分支反转)。
+3. 验证:patch XChinaJourney 后 App 是否存活。
