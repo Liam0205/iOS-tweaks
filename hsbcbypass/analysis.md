@@ -1066,3 +1066,301 @@ dyld runInitializersBottomUp → notifyObjCInit → libobjc load_images
    找"判定越狱→退出"的精确分支,精细 patch(不破坏返回值)。
 2. 或:找 hsbcchinax 的 `__objc_nlclslist`(+load 类)确认 load 方法,从源头让 load 不检测。
 3. 子代理正在反混淆 0x630430/0x65bfa8 区,结合这条 +load 链定位判定分支。
+
+## Round 32（2026-08-21,★★★ 决定性转折:JB 退出已绕过,现卡在 +load 自旋 → 启动看门狗）
+
+### 实测证据(自取设备日志)
+用户点图标启动,截图见汇丰启动页(红白 logo + 支持IPv6 + 备案)停留 ~20s 后消失。拉日志:
+- 探针 pid 27769 心跳一直跳到 +19306ms(#1550)才停(此前基线只有 374ms/#30)。
+- 崩溃日志 China-2026-08-21-195054.ips(root 可读):
+  - EXC_CRASH / SIGKILL,namespace FRONTBOARD,code 0x8BADF00D
+  - "process-launch watchdog transgression: ...:27769 exhausted real (wall clock)
+    time allowance of 20.00 seconds",ProcessVisibility: Foreground
+  - CPU:20s 窗口烧了 16.8s app CPU(~30% CPU)= 忙自旋,不是等网络。
+- 线程0(主线程,triggered)调用栈仍在 hsbcchinax 的 +load 里:
+  dyld notifyObjCInit → libobjc load_images → hsbcchinax+0x43e0fc → 0x43d6fc →
+  0x5d87a4 → hsbcchinax+0x7128c0(PC 卡在此)。
+
+### 关键重定性:不再是越狱检测!
+- 越狱"检测→退出"已被绕过(不再 374ms 秒退)。现在死因是 iOS 启动看门狗:
+  主线程 20s 没从 +load 返回 → main() 从未执行 → 看门狗 0x8BADF00D 杀进程。
+- 用户看到的"启动页"是 LaunchScreen 启动图(main 没跑),不是真 UI。
+- 双进程:27743/27765(89B)仍 374ms 死(旧路径/prewarm);27769 加载 patch 版
+  hsbcchinax,在 +load 自旋 20s。
+
+### 根因 = 上一次(Round 31 后,未记录)的 patch
+diff app-binary/hsbcchinax(pristine,md5==设备 /tmp/hsbcchinax.orig)vs 设备部署版:
+- 唯一代码改动:文件偏移 0x22910c 一条指令(其余 8B 头部 + 68920B 是 ldid 重签 __LINKEDIT)。
+- 原始:mov w0,#1 (0x22910c) ; b 0x38d974 (0x229110,尾调用独立函数 0x38d974,
+  该函数内 0x38d9c4 调 0x93900——正是 +load 链上的函数)。
+- 我改成了:ret (d65f03c0)——粗暴早返回,跳过尾调用 0x38d974 的后续初始化。
+- 效果:从"374ms 秒退"→"+load 自旋 20s 被看门狗杀"。⇒ 0x22910c 确在 +load 检测路径上,
+  ret 绕过退出但破坏初始化流,使 OLLVM dispatcher(入口 0x712668,热点 0x7128c0,
+  由 0x5d87a0 bl 0x712668 调用返回 bool)陷入非终止自旋。
+
+### 假设 H1(领先)vs H2
+- H1(patch 破坏控制流):ret 丢返回值/跳过 0x38d974,dispatcher 0x712668 输入被破坏,
+  状态机走不到终止态 → 死循环。领先:此前对其它 framework 的 binary patch(Round 19-22)
+  都能加载运行到 ~376ms 无即时反制,无"改磁盘即自旋"的完整性反制。
+- H2(反篡改故意自旋):可能性低,理由同上。
+
+### 下一步(委托子代理深挖 static RE)
+目标:让 +load 正常完成并返回(不退出、不自旋)。候选:
+1. 0x22910c 从 ret 改回不破坏流的形式(如 mov w0,#0; b 0x38d974 中和标志但保留尾调用),
+   实测 +load 是否跑完。
+2. 定位 dispatcher 0x712668 的真实"越狱判定分支"与终止条件,做最小 patch。
+3. 备份齐全(/tmp/*.orig + 本地 app-binary/),改动可逆。
+
+## Round 33（2026-08-21,landing-pad patch 变体实验 + 工具链修正）
+
+### 工具链修正:必须用设备原生 ldid 签名
+- linuxbrew ldid 生成 sha1+sha256 双 hash → dyld 拒绝加载(SIGKILL CODESIGNING)。
+- 设备 /var/jb/usr/bin/ldid 生成 sha256-only → 被 trustcache 接受,可加载。
+- 新流程(patchtest.sh):本地 patch → scp 未签名到设备 → 设备 ldid -S → cp 进 Bundle →
+  chown _installd → jbctl rebuild_trustcache → uiopen 观测。已跑通。
+
+### 实验:0x22910c 三种取值
+| 0x22910c | 行为 | 解读 |
+|---|---|---|
+| mov w0,#1(pristine) | 374ms 静默退出 | 原始越狱退出 |
+| ret(Round 31/32) | +load 自旋 20s → 看门狗 0x8BADF00D | 跳过 0x38d974,破坏 dispatcher 流 |
+| mov w0,#0(本轮) | +504ms(#40)后 SIGSEGV,KERN_INVALID_ADDRESS@0x0,栈损坏 | w0 非布尔门,0x38d974 用它做地址/索引计算,置0→野指针 |
+
+⇒ **0x38d974 不是简单的 exit(flag) 门**:它拿 x0 参与(混淆的 computed blr)地址计算。
+landing-pad 层的三种改法(退出/ret/flag=0)都不对。**必须在上游"越狱判定"处 patch**,
+让根本不抛异常/不进这个 landing pad。等 RE 子代理定位判定分支。
+
+### 现状
+- 设备已回滚 pristine(md5 == orig),干净基线。
+- patchtest.sh 就绪:`./patchtest.sh <off> <bytes> [秒]`,自动从 pristine 干净 patch+部署+测。
+
+## Round 34（2026-08-21,★ 关键收敛:自旋在 dispatcher 0x712668 内部,非 flow 损坏)
+
+### 高层 gate 分析(0x5d8758,+load 子树,调用者 0x43c690/0x43d6f8)
+```
+5d8778 ldrb w8,[x0,#0xa]; cbnz → 已跑过则跳过(run-once 标志)
+5d878c bl 0x712664        ; init 状态对象(sp+0x18)
+5d87a0 bl 0x712668        ; ★ dispatcher 状态机, 返回 w0
+5d87a4 tbnz w0,#0,0x5d87e0 ; if(w0&1) 跳过被保护 body → 干净返回
+5d87b4 bl 0xe4634 ...      ; 否则执行被保护工作(混淆 blr @5d87d4)
+```
+
+### 实验:强制 gate 跳过 body(0x5d87a4 tbnz → 无条件 b 0x5d87e0, 字节 0f000014)
+- 结果:仍 20s 看门狗 0x8BADF00D。probe 到 +19141ms(#1510)。
+- 崩溃栈 PC = **hsbcchinax+0x7126e4(dispatcher 循环头 cmp w8,w25)**,返回地址仍 0x5d87a4。
+- ⇒ **自旋发生在 `bl 0x712668`(0x5d87a0)内部, dispatcher 从未返回**。我的 gate patch
+  (0x5d87a4)根本没执行到。
+
+### 决定性结论
+- 自旋**不是**我之前 patch 破坏控制流导致(本 patch 是干净分支,未corrupt)。
+- **dispatcher 0x712668(OLLVM 扁平化状态机)本身在越狱-且-未退出时不终止**:
+  正常(pristine)路径它检测到越狱后走"退出"case(374ms 死);一旦退出被绕过/上游改变,
+  状态机进入一个等待某永不满足条件的 case → 死循环在 0x7126e4 分发头。
+- landing pad(0x22910c)、gate(0x5d87a4)都是 dispatcher 之外的表皮,patch 它们无效。
+
+### 真正需要:反混淆 dispatcher 0x712668
+必须定位状态机里:(a)"检测到越狱"置哪个 state 值;(b)该 state 通向 exit case 的分支;
+(c)把"越狱 state"改写成"正常 state",让状态机走完正常初始化并返回 w0=1(跳过 body 且不死)。
+或找到检测输入(state 变量的赋值处),从源头让它取"未越狱"值。
+- hsbcchinax **无 CC_SHA/CCHmac/csops/amfi import** → 大概率无 __TEXT 自检, 磁盘 patch 可行。
+- 已委托 RE 子代理反汇编此 dispatcher(进行中)。
+
+## Round 35（2026-08-21,运行时状态机采样 —— 探针扰动目标,需降低侵入性）
+
+### 尝试:探针 tweak 采样主线程 PC + x8/x9(状态机变量)
+- dispatcher 静态区间 [0x712118,0x713400),状态变量 = w8/w9(0x712174 初始化为
+  0x257df12c,与各 case 的 32-bit magic 比较选择跳转)。
+- 探针每 0.5ms suspend 主线程 → thread_get_state 读 PC/x8/x9 → 命中区间记 state 值。
+- 部署到 gate-skip patch(0x5d87a4=0f000014,Round34 确认能自旋到 20s)+ 探针一起跑。
+
+### 结果:探针把结果改变了(致命扰动)
+- 装了采样探针后,App 不再自旋到 20s,而是 ~460ms(#40)就退出(接近 pristine 退出时机)。
+- 采样器 0 命中 dispatcher 区间(`disp pc` 一条没记)。
+- 原因:每 0.5ms suspend 主线程 = 高频打断状态机;且 mach_thread_self() 每次泄漏 port。
+  suspend/resume 扰动了时序,可能让 app 走了不同分支或被自身逻辑判定异常退出。
+
+### 教训 + 下一步
+- 侵入式采样(高频 suspend 主线程)不可用于这种紧循环状态机观测。
+- 备选:(a)极低频采样(20ms/次,减少扰动,20s 仍能抓上千样本);(b)放弃运行时,
+  依赖静态 RE(agent 已生成 87MB 全反汇编,分析中);(c)只读不 suspend(用
+  thread_get_state 不 suspend,精度差但零扰动——但 Apple 要求 suspend 才能稳定读)。
+- 决定:优先静态 RE(agent);运行时改用极低频采样作为交叉验证。
+- 工具链提醒:替换 framework 后首次启动偶发 CODESIGNING(forEachDependentDylib),
+  重建 trustcache 后重启即好(同 Round 19/22 现象)。
+
+## Round 36（2026-08-21,RE 子代理报告 —— 重大修正 + 新方向）
+
+### ★ SDK 身份修正:hsbcchinax = Promon SHIELD(不是 OneSpan/ThreatMetrix/自研)
+strings 实锤:`no.promon.shield`、`PRMShield`、`ShieldSDK:`、gitlab `.../release/shield/...`。
+之前 32 轮对"OneSpan/VASCODSK/ThreatMetrix"的归因,对 hsbcchinax 这个模块是错的——
+真正跑退出的是 **Promon SHIELD**(嵌在 hsbcchinax)。
+
+### ★ 0x22910c 修正:是 -[PRMShieldEventManager performSecurityChecks],不在 +load 静态链上
+- `--objc-meta-data` 确认:类 `PRMShieldEventManager`,方法 `performSecurityChecks` imp=0x22910c。
+- 全文件 0x22910c 只出现 1 次(method_t 的 imp 槽 @0x836528)。
+- 我把它 patch 成 `ret` = 把这个 ObjC 方法变成返回垃圾的空 stub,**没碰真正的检测/退出逻辑**。
+- 该方法静态只被 addObserver:/removeObserver: 引用,**agent 找不到它到 +load 的静态调用边**。
+  ⇒ 但我的**实测**:patch 0x22910c 确实把行为从"374ms 死"变成"20s 自旋"——有可复现因果。
+  reconcile:performSecurityChecks 极可能是**通过 observer/通知机制动态派发调用**的周期性/
+  事件安全检查(所以没有静态 bl 边,objc_msgSend 动态分发看不到)。我 nop 它 → 检测不出
+  越狱裁决(不 374ms 死)但也没完成 event bookkeeping → +load 等待检查完成的 dispatcher
+  永久自旋。**即"patch 对了函数,但改法错了"(粗暴 ret 而非"返回干净裁决 + 完成记账")。**
+
+### ★ 0x38d974 修正:不是异常 landing pad,是"调用回调+销毁"辅助函数
+agent 反汇编:独立函数(自有序言),取 x0(BOOL flag)→ 经 objc_getAssociatedObject 键控的
+computed blr 调用存储的回调 → 调析构 0x93900 → __stack_chk 返回。**不 throw、不 exit。**
+纠正我 Round 32-33 的"异常 landing pad / __cxa_throw"假设(那是 __unwind_info LSDA 把相邻
+两函数合并造成的错觉)。这解释了为何我 `mov w0,#0` 得到 SIGSEGV:破坏了回调调用的参数。
+
+### +load 真实链路(修正)
+- +load IMP=0x228f74 → 尾调 0x43e0ac(在巨型 OLLVM 扁平化函数 0x439f68-0x443a7c 内)。
+- 0x43e0f8 有 `blr x8`,x8 = 运行时解析(x19 从 dyld-rebase 指针槽 0x849000 + objc 关联对象
+  键控 hash 算出)——**静态无法确定跳转目标**。
+- 0x5d8758 检查 [x0+0xa] 标志 → `bl 0x712664`(1 条 thunk→0x712118 dispatcher A)→
+  `bl 0x712668`(**独立函数 dispatcher B**,agent 纠正早前误并)。**自旋点 0x7128c0 在 0x712668 内。**
+- 两个都是 OLLVM 状态机(w9 状态寄存器 vs 一堆混淆 32-bit 常量比较)。
+
+### 检测判定:未静态定位(但有强线索)
+- 全文件**无** jailbreak/Cydia/substrate/frida 字符串;**无** ptrace/sysctl/csops/fork import。
+- ⇒ Promon SHIELD 的越狱检测**极可能走 Foundation `fileExistsAtPath:` 文件探测**,路径串
+  运行时用 `mov/movk` 逐字节拼装(混淆),静态 grep 不到。
+- **无 __TEXT 自检**(无大范围读 __TEXT 的 hash 循环、无未导入 hash syscall)——磁盘 patch
+  本身不会被自检发现。**但** +load 控制流依赖运行时 dyld-bind/关联对象值 ⇒ patch dispatcher
+  的混淆常量有"磁盘值≠运行时值"风险。
+
+### agent 结论 + 我的下一步(input 层,绕开混淆)
+- agent 明确:静态已到瓶颈,不愿瞎猜 patch 点;建议**动态 trace**(断点 performSecurityChecks
+  / fileExistsAtPath: / 监视 [x0+0xa] 标志)确认真实数据流。
+- 我的方向(与历史 abcbypass 成功路径一致 = ObjC/高层而非字节 patch):
+  **探针 hook `fileExistsAtPath:`(ObjC swizzle)+ `stat/lstat/access/open/fopen`(fishhook GOT,
+  Round 23 证 GOT hook 不触发反 inline-hook 自检),按 caller 模块(dladdr)过滤只留 hsbcchinax
+  发起的调用** → 观测 Promon SHIELD 到底探哪些路径。若确认走文件探测 → 对越狱路径返回
+  "不存在",在**输入层**绕过,完全不碰混淆的 dispatcher/字节 patch。
+- 探针已在本地写好并编译(见 Tweak.x),等设备可用一条命令部署。
+
+### 交付形态再评估
+- 之前认为 hsbcchinax 走 raw syscall 不可 hook —— 对 Promon SHIELD **可能不成立**(无 syscall
+  import,走 Foundation)。若检测确在 fileExistsAtPath:/stat 层 → **ObjC swizzle / fishhook
+  tweak 可能直接可行**,不必二进制 patch。这是本 session 相对历史结论的又一利好。
+
+## Round 38（2026-08-21,RE 子代理 —— 检测判定定位到"加密 stub 表",判定不可静态 patch）
+
+### dispatcher 0x712668 机制(agent 精确反汇编)
+- 函数体 0x712668-0x71371c,**仅一个出口**。w9 状态寄存器在 0x7126d8 被**固定常量 0x54d8b0c8**
+  播种(非参数派生,每次运行起点相同)。主循环头 0x7126e4(cmp/b.le/b.gt/b.eq vs ~40 个 magic)。
+- 第一次迭代落到 0x712de0:把 caller 数据写入 x24 状态对象(x24 = 0x5d8758 帧的 sp+0x18,
+  贯穿 0x712664→0x712668 的持久状态缓冲),写常量 0xa7418482 到 x24+0x88,然后
+  **`bl 0x713720`(x1=x24+0x8c)= 检测调用**。
+- 0x713720 = 第二个小状态机,出口 0x713930 `w0 = w23 & 1`。w23 由三个分支置 0/1,取决于
+  两个调用的结果:**`bl 0x7748d8`(×3: 0x7137cc/0x713810/0x713870)+ `bl 0x775034`
+  (×1, 内部 0x7138f8, x0=handle x1=x24+0x8c x2=4, 比较 x0==4)**。
+- 0x713720 返回 0/1 回流到 0x712dfc(`cmp w0,#0`)→ csel 选下一个状态常量 → `b 0x7126e4`。
+  **这里就是"越狱(w23=1 / count==4)vs 干净(w23=0)"分叉点。** 干净分支最终到真正终止 case
+  0x7136f8(`w0=[sp,#0x8c]&1; ret`@0x71371c);越狱分支走别的 case,一旦上游退出被堵→自旋。
+
+### ★ 判定不可静态 patch 的根因:加密 lazy-stub 表
+- `0x7748d8`、`0x775034` 是 `__stubs` 跳板(adrp x16,0x84c000; ldr x16,[x16,#off]; br x16),
+  但目标槽(0x7748d8→**0x84c000**;0x775034→**0x84c020**)**不在 dyld bind/lazy-bind 表里**。
+- agent dump 该页原始字节(0x84c000-0x84c128,~38 槽):每个非零槽是远超二进制地址范围的
+  64 位值(如 0x687fc6c16e5511b4)= **密文**。0x84c130 起全 0。
+- ⇒ **Promon SHIELD 运行时把这些槽解密成真实函数指针**(疑似 dispatch_once 守卫的 init,
+  在 0x6bdc48-0x6bdc90,与 +load 自身 cache-check 同一 idiom)。这是保护检测原语的**反静态
+  分析机制**——不是 __TEXT hash/CRC 自检(再次确认无),而是**惰性指针解密表**。
+
+### 再次确认:无全局完整性自检
+无 CC_SHA/CCHmac/csops/amfi import(查全 bind+lazy-bind);__text 无 svc;无读大范围
+__TEXT 的循环。**改别处明文指令不会被 hash 检查抓**——风险仅限这个加密 stub 表(局部)。
+
+### agent 给的候选(明文可 patch,但未验证):
+- 0x713908 `f100101f cmp x0,#0x4` → `f100001f cmp x0,#0x0`(或改分支),强制"未越狱"比较结果。
+  **agent 明确不愿作为"第五次盲猜",建议先 live trace。**
+
+### 下一步:runtime 读解密后的 stub 槽(我的 tweak,非 frida)
+agent 核心建议 = 先动态确认 0x7748d8/0x775034 解密后指向什么真实函数(极可能
+fileExistsAtPath:/stat/access,因为全二进制无 ptrace/sysctl/csops raw import/svc)。
+我的做法(可靠注入,无需 frida-server):
+- 探针 poll 槽 0x84c000/0x84c020(+slide),一旦变成合法进程内指针 → dladdr 出真实符号+模块。
+- 同时保留 fileExistsAtPath: swizzle + fishhook(stat/lstat/access/open/fopen)做兜底。
+- 若解密指针指向导出符号(如 stat)→ Shield 直接调它可能**绕过 GOT**,fishhook 抓不到,
+  但 dladdr 读槽能识别;若走 ObjC(fileExistsAtPath:)→ swizzle 能抓+能改。据此决定绕过点。
+- 并行:已请 agent 静态反解密例程(若能离线解密 stub 表,直接静态定位真实函数,免上设备)。
+
+## Round 39（2026-08-21,RC4 引擎定位 + 静态撞墙 + 转向动态/反编译器）
+
+### agent 发现:解密引擎 = RC4(确认逐字节匹配)
+- 0x6df1cc = RC4 PRGA 核心(标准 i/j swap + keystream XOR 循环,x8=256项 uint32 加宽 S-box,
+  x2=输入 x3=输出 x0=状态)。**但**只有 3 个真实调用者(0x3c151c/0x485e2c/0x485f5c),
+  操作的是另一个结构(config/telemetry blob 解密),**没有静态边指向 stub 表槽 0x84c000/0x84c020**。
+
+### 关键情报:加密 stub 表是"全二进制系统级"机制,非专门保护 JB 检测
+- 345 个 __stubs 里 **243 个(70%)** 指向未解析区间 0x84BF58-0x84CB60(~250 槽)。
+- dyld fixup 空洞:rebase 表在 0x84BF30 断,0x84D298 续,中间(含两个目标槽)完全在
+  dyld bind/rebase/lazy-bind 之外。二进制用 legacy LC_DYLD_INFO_ONLY(非 chained fixups)。
+- ⇒ Promon 编译工具对**数百处内部调用**做了 stub 表混淆,由一个**运行时 unpacker 极早期**
+  填充(agent 静态找不到 writer,疑在 +load/构造器早期,可能非简单 adrp+str)。
+- **推论(利好)**:writer 必须在检测运行前把整表解密好 → 那一刻起,内存里槽全是明文指针。
+  探针只要在检测发生时读槽(Round 38 已实现)就能拿到真实函数;不必静态解密。
+
+### agent 自我纠错:0x713908 `cmp x0,#0x4` 不是干净 patch 点
+- 完整 trace 两分支:x0==4→w23=1(越狱);x0!=4→w23=0(干净)。**但两分支都无条件调
+  encrypted stub 0x7748d8**,越狱分支还多调 0x774f68(又一加密槽 0x84c580)。
+- ⇒ patch 这个 cmp 只是改走哪个"仍依赖加密调用"的分支,**不隔离加密表**,不是干净点。
+  agent 明确收回上轮的这个建议(诚实)。
+- 干净分支状态流 0x7480f1e→0x366c8782(清 w19)向终止 case(0x713120 `w9==0x4624b8ac`→
+  [sp,#0x8c]→ret@0x71371c)收敛更快;越狱分支 3+ 跳仍未收敛(与 pristine 374ms 越狱快退一致?
+  待证:未确认每 case 最终 [sp,#0x8c]&1 返回值)。
+
+### 静态结论:撞墙(非努力不足,是加密表覆盖 70% 调用 + writer 不在磁盘可见处)
+agent 建议:(a)用真正的反编译器(Ghidra/IDA CFG 恢复)离线破;(b)上设备 live trace
+0x775034/0x7748d8/0x774f68 解密后目标 + 参数/返回值,一步绕开静态解密难题。
+
+### 我的行动(离线优先,设备兜底)
+1. 环境无 Ghidra/IDA/r2,但有 Java26 + pip + brew + 网络。**后台装 angr**(/tmp/angr_install.log):
+   angr 的 CFGEmulated 能跟间接调用,且可**符号执行/模拟 RC4 例程直接离线解密两个槽**,
+   甚至定位 writer。这是最有希望"不上设备就破"的路径。
+2. 设备兜底:Round 38 探针(stub 槽轮询 + fileExistsAtPath:/libc swizzle)已编译就绪,
+   一条命令部署,读解密后真实目标。
+3. 一旦知道真实检测函数:优先 tweak 级 hook(swizzle/fishhook 目标函数)绕过,避开加密表 +
+   避开脆弱字节 patch。这与 abcbypass 成功路径一致。
+
+## Round 40（2026-08-21,★★★ angr 离线 CFG 恢复 —— 定位检测判定消费点,得干净 patch）
+
+### 工具:本地装 angr 9.3.3(pip,~/.re-venv),CFGFast 成功恢复 dispatcher CFG
+环境无 Ghidra/IDA,但 pip+网络可用。angr CFGFast(限定 0x712668-0x714000)恢复 333 节点,
+稳定解出状态机结构(纯静态 CFG,不依赖运行时值——正好补上 agent 手工 trace 的缺口)。
+
+### 决定性:dispatcher 只在唯一状态值时终止,检测判定在唯一 csel 消费
+- 终止条件(0x7136e4):`cmp w9,#0x4624b8ac; b.ne 0x7126e4`(不等就跳回循环头=自旋);
+  等则 `ldr w8,[sp,#0x8c]; ret`(0x7136f8/0x71371c)。
+- 唯一产生终止态 0x4624b8ac 的块 = 0x7130fc(需先到达中间态 0x17c6c0cf)。
+- **检测结果分叉(唯一)@0x712dfc-0x712e14**:
+  ```
+  712dfc cmp w0,#0            ; w0 = 检测结果(0=干净, 1=越狱)
+  712e00 w8 = 0x07480f1e      ; "干净"下一状态
+  712e08 w9 = 0x564fec1b      ; "越狱"下一状态
+  712e10 csel w8,w9,w8,ne     ; w0!=0(越狱)→0x564fec1b, 否则→0x07480f1e
+  712e14 b 0x7126e4
+  ```
+- 干净态 0x7480f1e 收敛到终止(agent 已 trace + angr CFG 佐证);越狱态 0x564fec1b 走深链,
+  上游退出被绕过时不收敛 → 自旋。**这解释了全部现象**:pristine 越狱→走越狱态→(原本有退出)
+  374ms 死;我之前 patch 绕过退出但没改 verdict→越狱态自旋。
+
+### ★ 干净 patch(第 4 candidate,机理正确,非盲猜)
+- **文件偏移 0x712e10**:`csel w8,w9,w8,ne`(`2811881a`)→ `nop`(`1f2003d5`)。
+- 效果:nop 后 w8 保持 0x712e00 载入的**干净态 0x7480f1e**,无视 w0(检测结果)。
+  状态机随后完全按"非越狱设备"正常跑完初始化 → +load 返回 → 无看门狗。
+- **为何优于前 3 次失败**:前 3 次(landing-pad ret / flag=0 / gate skip)是跳过/破坏代码,
+  把状态机留在 limbo。本 patch **让所有 encrypted-stub 副作用照常执行**(两分支都调 0x7748d8),
+  只在最终 verdict 消费点翻转成"干净",精确模拟正常设备。不碰加密表、不碰退出、不破坏流。
+- 备选(冗余):0x712dfc `cmp w0,#0`→恒等,或直接让 0x712e10 选 w8。首选 nop 最干净。
+
+### 待设备验证(一条命令)
+`./patchtest.sh 712e10 1f2003d5 25` —— 从 pristine 干净 patch + 设备签 + trustcache + 启动观测。
+预期:+load 跑完,存活 >20s 不被看门狗杀,进入真实 UI(而非停在 LaunchScreen)。
+若成功:香港 App 同法(同 Promon SHIELD 栈)。若仍自旋:说明干净态也依赖某未满足的运行时
+副作用,需回到 live trace 0x7748d8/0x775034 解密目标。
+
+### 交付形态
+若 0x712e10 patch 成功 → **二进制 patch 方案成立**(改 1 条指令 + ldid 重签 + trustcache)。
+无 __TEXT 自检(已多轮确认),patch 稳定。仍可探索 tweak 级(hook 检测函数)作为免改 Bundle 的
+交付,但 1 指令 patch 已是最小可用方案。
