@@ -802,3 +802,32 @@ import `_mprotect` 的只有 **RemoteSale**(29MB)和 TMX(内联 svc mprotect@wra
   (`JailbreakModelEx`)的判定函数地址 + patch 方案。
 - 待查:RemoteSale 的 mprotect 用途(是否生成退出 stub)。
 - 候选真凶优先级:Turing(明文越狱路径,最像专门检测)> RemoteSale(能生成RWX)> BioCatch。
+
+## Round 22（2026-08-21,继续排除:Turing/BioCatch 也非真凶）
+
+子代理给出精确 patch 点:
+- Turing `+[...isJailbrokenEnvironment:]` @0x5ba10(位掩码访问器,`ubfx x0,x2,#27,#1`)
+  → patch `mov w0,#0;ret`。
+- BioCatch isRooted 落地点 @0xa9ba0(`and w8,w23,#0x1`)→ patch `and w8,wzr,#0x1`。
+
+patch 两个 + 重签(注意:ldid -S 要验证生成 CandidateCDHash,否则加载失败 Library not loaded)
++ rebuild_trustcache,加载成功,但 **App 仍 ~379ms 退出**(基线不变)。
+
+### 已排除的检测源(patch 判定函数后 App 仍退出)
+Transmit(amIJailbroken)、TMX(0x15090)、Turing(isJailbrokenEnvironment:)、BioCatch(isRooted)。
+
+⇒ 这些 SDK 都是"检测→存结果→上报服务端"模式,**不直接触发退出**。真凶不在这批风控 SDK 的
+越狱判定函数。
+
+### 重新聚焦:主 App China 自己的越狱判定+退出
+- 崩溃在 `notifyObjCInit`(初始化阶段),主二进制 China 有 `isJailbroken`/`jailbreak6status`
+  /`XChinaJourney.DeviceInfoConfiguration(isJailbroken:isRooted:)` 符号。
+- 最可能:**China 主 App 自己检测越狱(或读取某 SDK 结果),然后自己决定退出**。
+- 之前 hook China 的 AppSecurityMonitor ObjC 方法没被调用——但那是 OneSpan 的;China 自己的
+  Swift 越狱判定(jailbreak6status)可能才是。
+- 也可能是某个没排查的 framework(RemoteSale 有 mprotect 能生成 RWX stub;
+  ChinaFacialRecognition/HKEApi/Sensors/Tealium 等)。
+
+### 签名工具链注意(重要)
+`ldid -S` 偶发不生成有效签名 → dyld `Library not loaded`(签名无效)。**必须验证
+`ldid -h <file>` 输出含 `CandidateCDHash` 再部署**,然后 `jbctl rebuild_trustcache`。
