@@ -132,6 +132,13 @@ v95 发现：即使越狱文件检测和 ObjC 方法检测均已成功绕过（�
 
 **`swizzle -[DTFrameworkInterface initRiskManage]` 为空实现。**
 
+> **跨版本/跨设备已验证**：
+> - ABC **11.1.0** / iPhone 13 Pro / iOS 15.4.1（2215）：进入首页，交互正常。
+> - ABC **11.2.0** / iPhone 14 Pro Max / iOS 16.3.1（2216）：能用（用户确认）。
+> - 方案靠 ObjC 类名/方法名（mPaaS 稳定接口），**不依赖地址偏移**，故 ABC 小版本
+>   升级、不同机型/iOS 版本均通用。上文的 `0x8db260`/`0x8dad68`/`0x8da804` 等偏移
+>   仅是 11.1.0 的定位依据，swizzle 本身不用它们。
+
 - 那条 native exit（`MbapMPaaS+0x8db260` 的 `exit(0)`，由 `[receiver action]==3`
   判定触发）所在的检测 block（invoke=`MbapMPaaS+0x8dad68`）**定义在
   `-[DTFrameworkInterface initRiskManage]` 方法内**（方法起始 `0x8da804`，block 在其 +0x564）。
