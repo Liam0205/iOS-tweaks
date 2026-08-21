@@ -988,3 +988,30 @@ abort、pthread_kill、abort_with_reason、abort_with_payload。**全部 hook �
 1. 动态抓网关的 syscall 号:MSHookFunction hook 网关地址记录 x16(可能被反制,试)。
 2. 或 patch 网关:x16==1/59 时跳过 svc(拦 exit 不影响其他 syscall)→ 看 App 是否存活。
 3. 若 TMX 网关确实调 exit → 找调用网关传 exit 的上游(检测判定)→ patch 判定或拦 exit。
+
+## Round 29（2026-08-21,MAX — 重大方法论疑点:退出可能是 SSH uiopen 假象 ★★★）
+
+### 退出机制在技术上"无处可寻"
+穷尽确认,退出**不经过**:
+- 任何 libc/libsystem 退出封装(exit/_exit/__exit/abort/pthread_kill/abort_with_reason/payload
+  全 hook 零命中)
+- 内联 svc exit:全 App(China + 150+ framework)**无任何 `mov x16,#1; svc` 或 `#59`**
+  (hsbcchinax/TechnicalPlatform 的 mov x16,#1 后不接 svc,是普通代码/数据)
+- XChinaJourney 的 _exit/_abort stub(patch 成 ret 后仍退出)
+- 无崩溃日志、无 mach 异常(全掩码零命中)、无信号
+
+### ⇒ 退出极可能不是 App 自己发起,而是外部 SIGKILL
+SIGKILL:不可捕获、无 crash log、无 svc、无异常 —— **完美符合所有观测**。
+
+### ★核心疑点:我一直用 SSH `uiopen --bundle` 启动,可能是假象
+- SSH uiopen 拉起的 App **不是正常用户前台启动**,可能因 FrontBoard 场景未正确建立/
+  非前台/看门狗,被 SpringBoard 用 SIGKILL 回收(~260-500ms 很像场景建立超时)。
+- 双进程先后启动、(China) zombie 态、存活时间随机波动 260~500ms —— 都更像**系统回收**
+  而非越狱检测的确定性退出。
+- **我可能追了 29 轮一个非越狱检测的现象!** 之前 4 个 SDK/XChinaJourney patch"无效",
+  可能因为它们本来就不是退出原因——退出是 uiopen 启动方式导致的系统回收。
+
+### 必须验证(用户设备端)
+请用户**亲手点图标**启动汇丰中国,肉眼看:是立即闪退(越狱检测)?还是能进入界面/停留更久?
+对比 SSH uiopen 的 260ms 退出。若点图标能正常/久留 → 之前的"退出"是 uiopen 假象,
+真正的越狱检测行为需要重新用点图标观测。
