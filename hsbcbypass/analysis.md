@@ -965,3 +965,26 @@ syscall(正常退出,非崩溃、非信号)。由 import _exit 的 framework 执
 - 效果:唯一的 _exit(1) 调用变 nop,检测触发到这里也不退出。
 - 风险:若此 _exit 有正常业务用途会有副作用;但它是全 framework 唯一 _exit + 退出码1,
   高度像"检测→异常退出"。先实验验证。
+
+## Round 28（2026-08-21,MAX — 确证退出=内联 svc,非任何函数封装）
+
+hook 全套底层退出封装(dlsym 取真实地址 + MSHookFunction):
+exit@0x1ca8336dc、_exit/__exit@0x1f721cf34(libsystem_kernel 同一 syscall 封装)、
+abort、pthread_kill、abort_with_reason、abort_with_payload。**全部 hook 成功,全部零命中。**
+(exit_group 在 iOS 不存在)。进程 ~261ms 静默退出。
+
+⇒ **退出不经过任何 libc/libsystem 退出函数,确证是内联 svc(mov x16,#1/#59; svc #0x80)。**
+- patch XChinaJourney 的 _exit stub + _abort stub 为 ret → App 仍退出(排除 XChinaJourney)。
+- 全 framework 扫 `mov x16,#1/#59` → China 0 处;各 framework 也无明文 exit stub。
+- 唯一可能:**ThreatMetrix 通用 svc 网关**(TMXProfiling/BehavioSec/Connections 的 0x4010/
+  0x4068,`ldr x16,[sp,#0x10]; svc`,syscall 号从栈传入)被传入 exit(1)。静态看不到栈值。
+
+### 关键疑点:ThreatMetrix 通用 syscall 网关
+- 0x4010: `svc; ldp x16,x17,[sp,#0x10]; ...` — x16 之前由 `ldr x16,[sp,#0x10]` 从栈加载
+- 这种"通用 syscall 分发器"能调**任意** syscall 号,包括 exit(1)/exit_group(59)。
+- 之前判断"TMX 检测不退出"是基于它没有 `mov x16,#1` 的明文 exit stub,但**网关+栈传号可绕过**。
+
+### 下一步(不惜代价)
+1. 动态抓网关的 syscall 号:MSHookFunction hook 网关地址记录 x16(可能被反制,试)。
+2. 或 patch 网关:x16==1/59 时跳过 svc(拦 exit 不影响其他 syscall)→ 看 App 是否存活。
+3. 若 TMX 网关确实调 exit → 找调用网关传 exit 的上游(检测判定)→ patch 判定或拦 exit。
