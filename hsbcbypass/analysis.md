@@ -688,3 +688,39 @@ sysctl/csops/ptrace/mmap/mprotect,纯 Digipass OTP 库)。RASPFramework/MobileSe
    调用链,先试运行时 hook 观测它是否被调用、何时。
 2. 分析 TransmitSDK3 的 JailbreakCheck、TMXProfiling 的 12 处 svc。
 3. 判断哪个 SDK 的检测触发了退出（可能多个并存,需逐个验证）。
+
+## Round 18（2026-08-21,真凶锁定 = ThreatMetrix (TMXProfiling)★）
+
+TMXProfiling(ThreatMetrix,LexisNexis 反欺诈/RASP SDK,479KB,未加密)**含 12 处内联
+`svc #0x80`**,是唯一用内联 syscall 的 framework。这就是"检测源"。
+
+### 它自己实现 syscall wrapper 绕开 libc(所以我们 hook libc 全零命中)
+
+反汇编 0x4a38 是个 `access` 的裸 syscall wrapper:
+```
+0x4a38: stp x29,x30,[sp,#-0x20]!
+0x4a3c: stp x16,x17,[sp,#0x10]
+0x4a40: mov x16, #0x21      ; 33 = SYS_access
+0x4a44: svc #0x80           ; 直接 syscall,不调 libc access()
+0x4a48: ldp x16,x17,[sp,#0x10]
+0x4a50: ret
+```
+syscall 号:`0x21`(33=access,查越狱文件存在)、`0x9d`(157)、`0xca`(202=sysctl,查被调试)。
+
+⇒ **这解释了之前所有零命中**:ThreatMetrix 用自实现的 svc wrapper 调 access/sysctl,
+完全绕开 libc 符号,MSHookFunction hook libc 的 access/sysctl/stat 当然抓不到。
+检测和退出都在 TMXProfiling 内。
+
+### 从 OneSpan 死胡同中走出
+
+- 之前 10+ 轮 + 本 session 前半都盯错了对象(OneSpan/VASCODSK)。真凶是 ThreatMetrix。
+- ThreatMetrix **未加密、可反汇编、可 patch**,patch 工具链(Round 15-16)已就绪。
+- 可能还有其他检测源(TransmitSDK3 的 libDeviceSecurityAssessment、TuringShield),
+  但 ThreatMetrix 的内联 svc 最符合观测到的"绕开所有 hook + 静默退出"。
+
+### 下一步:分析并 patch TMXProfiling
+1. 反汇编 TMXProfiling,定位:哪些函数调这些 svc wrapper 做越狱判定;判定结果如何流向退出;
+   是否有完整性自检。
+2. 找退出触发点(它有 mmap import,RWX stub 可能它生成)。
+3. patch 检测判定(改分支/返回未越狱)或退出触发 → ldid 重签 → 替换 → rebuild_trustcache → 测试。
+4. 委托子代理做 TMXProfiling 深度反汇编。
