@@ -484,3 +484,28 @@ tweak 内存脱壳法离线分析。
 2. 若太晚:设法让 tweak 更早注入(ElleKit 加载顺序 / DYLD_INSERT / `+load` 里抢先 /
    构造器优先级),赶在 OneSpan 检测初始化器之前 hook。
 3. 时机解决后,重新用 mach 异常端口 / RWX mmap hook 抓 SIGBUS stub 的真实来源。
+
+## Round 11（2026-08-21，RWX 监控零命中 —— 确认 hook 时机太晚）
+
+给 tweak 加 hook `mmap`(PROT_EXEC)/`mprotect`(+EXEC)——生成 RWX stub 的必经路径,带调用栈回溯。
+
+**结果:零命中**(0 次 PROT_EXEC 分配被捕获),进程仍闪退。
+
+崩溃日志证明 RWX stub 内存确实被分配(Memory Tag 255 r-x/rwx),但我们的 mmap/mprotect
+hook 没抓到 → **该分配发生在 tweak 的 MSHookFunction 生效之前**。
+
+**决定性结论:hook 时机太晚。** OneSpan 的检测+退出发生在 tweak `%ctor` 里布设 hook
+(约 +7ms)之前的极早期。综合此前所有"零命中"(libc 退出/信号/mach/pthread/mmap/ObjC
+方法),统一解释就是时机——不是拦不到,是**所有 hook 都晚于检测**。
+
+推论:OneSpan 检测在**某个先于我们 tweak 初始化的 framework 的初始化器**里跑完
+(dyld `runAllInitializersForMain`/`notifyObjCInit` 早期)。tweak 虽在主 App 前注入,
+但 OneSpan 的检测 framework 可能排在我们 tweak 构造器之前执行。
+
+### 下一步:解决注入时机(核心突破口)
+1. 确认 tweak dylib 相对 OneSpan framework(VASCODSK/RASPFramework)的初始化顺序。
+2. 让 tweak 抢最早:
+   - `%ctor` 用 `__attribute__((constructor(101)))` 提最高优先级;
+   - 或 hook dyld 的镜像加载早期回调,在 OneSpan 初始化器执行前布设 hook;
+   - 或研究 ElleKit 注入顺序,让 HSBCBypass.dylib 排在最前(文件名/依赖控制)。
+3. 时机赶上后,mmap/mprotect hook 应能抓到 RWX stub 生成的调用栈 → 定位检测退出模块。

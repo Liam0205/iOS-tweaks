@@ -13,6 +13,7 @@
 #import <objc/message.h>
 #import <pthread.h>
 #import <dlfcn.h>
+#import <execinfo.h>
 
 // 日志写沙盒文件(设备无 syslog 工具,靠文件回捞)
 static void hsbc_log(NSString *line) {
@@ -80,6 +81,40 @@ static void hsbc_hook_monitor(void) {
     hook_method(cls, "emulatorDetected", NO);
 }
 
+#import <sys/mman.h>
+
+// 回溯调用栈定位发起模块
+static void hsbc_bt(const char *tag) {
+    void *fr[16]; int n = backtrace(fr, 16);
+    for (int i = 1; i < n && i < 8; i++) {
+        Dl_info di;
+        if (dladdr(fr[i], &di) && di.dli_fname) {
+            const char *b = strrchr(di.dli_fname, '/'); b = b?b+1:di.dli_fname;
+            HSBCLOG(@"    %s #%d %s +0x%lx", tag, i, b, (uintptr_t)fr[i]-(uintptr_t)di.dli_fbase);
+        }
+    }
+}
+
+// ---- hook mmap:抓 PROT_EXEC(生成可执行 stub 的必经路径)----
+static void *(*orig_mmap)(void *, size_t, int, int, int, off_t);
+static void *my_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    void *r = orig_mmap(addr, len, prot, flags, fd, off);
+    if (prot & PROT_EXEC) {
+        HSBCLOG(@"mmap RWX/RX len=0x%zx prot=%d → %p", len, prot, r);
+        hsbc_bt("mmap");
+    }
+    return r;
+}
+// ---- hook mprotect:抓给内存加 EXEC 权限 ----
+static int (*orig_mprotect)(void *, size_t, int);
+static int my_mprotect(void *addr, size_t len, int prot) {
+    if (prot & PROT_EXEC) {
+        HSBCLOG(@"mprotect +EXEC addr=%p len=0x%zx prot=%d", addr, len, prot);
+        hsbc_bt("mprotect");
+    }
+    return orig_mprotect(addr, len, prot);
+}
+
 // ---- hook pthread_create:记录新线程入口函数所属模块,定位检测线程 ----
 static int (*orig_pthread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 static int my_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*start)(void *), void *arg) {
@@ -112,6 +147,8 @@ static void on_image(const struct mach_header *mh, intptr_t slide) { try_hook();
         HSBCLOG(@"探针注入: pid=%d bundle=%@", getpid(),
                 [[NSBundle mainBundle] bundleIdentifier]);
         MSHookFunction((void *)pthread_create, (void *)my_pthread_create, (void **)&orig_pthread_create);
+        MSHookFunction((void *)mmap, (void *)my_mmap, (void **)&orig_mmap);
+        MSHookFunction((void *)mprotect, (void *)my_mprotect, (void **)&orig_mprotect);
         try_hook();
         _dyld_register_func_for_add_image(&on_image);
         HSBCLOG(@"已注册 dyld 回调等待 AppSecurityMonitor + hook pthread_create");
