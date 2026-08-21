@@ -128,17 +128,30 @@ v95 发现：即使越狱文件检测和 ObjC 方法检测均已成功绕过（�
 > 基于错误的存活检测（把后台扩展进程 `group.abc.toolExtension` 当成主 App），
 > 且大量依赖被证明有害的 libc inline-hook / fishhook。勿引用。
 
-### 可信状态（第 15 轮，2026-08-21，正确进程匹配）
+### ✅ 已解决（第 16 轮，2026-08-21）——最终有效方案
+
+**`swizzle -[DTFrameworkInterface initRiskManage]` 为空实现。**
+
+- 那条 native exit（`MbapMPaaS+0x8db260` 的 `exit(0)`，由 `[receiver action]==3`
+  判定触发）所在的检测 block（invoke=`MbapMPaaS+0x8dad68`）**定义在
+  `-[DTFrameworkInterface initRiskManage]` 方法内**（方法起始 `0x8da804`，block 在其 +0x564）。
+- 用纯 ObjC swizzle 把 `initRiskManage` 替换成空 `void` 实现 → 风险管理不初始化
+  → 检测 block 永不创建/投递 → exit 从源头消失。
+- **ObjC swizzle 不改函数序言字节，不触发 ABC 完整性自检**（区别于致命的 libc inline-hook）。
+- **可信实测**：`initRiskManage NEUTRALIZED`（被调 2 次），无 exit/DTRpcException/崩溃，
+  主 App 存活 >90s，**完整进入农业银行首页**（我的账户/转账/明细/理财/基金 + 5 tab +
+  实时资讯），用户设备实测 tab 切换/功能页/列表滚动全部正常响应。
+- 定位方法：手动解析 `__objc_classlist` 方法表，找 IMP ≤ block invoke 地址且最近的方法
+  即为 block 宿主方法（脚本见 `abcbypass/tmp/objcparse.py`）。
+
+### 可信基线（第 15 轮，2026-08-21，正确进程匹配）
 
 | 配置 | 主 App 结果 | 结论 |
 |------|------|------|
 | 裸跑（无 tweak） | ~13s **正常退出**（exit，无崩溃） | ABC 越狱检测原始行为 |
 | 全量 hook | ~1s **崩溃** `0xb5a06000` | 净负面，libc inline-hook 触发完整性自检 |
-| 仅 ObjC swizzle（`ABC_LIBC_HOOKS=0`） | ~13s 正常退出，无崩溃 | = 裸跑，ObjC swizzle 安全但挡不住退出 |
-
-- 退出源头（静态分析，可信）：`MbapMPaaS+0x8db260` 的 `exit(0)`，由
-  `cmp w24,#3`（`w24=[receiver action]`，receiver=检测 block 捕获对象）判定触发。
-- 尚未绕过：这条 native exit 路径。方向 = 用 ObjC/数据层手段让 `[receiver action]≠3`。
+| 仅 ObjC swizzle（未含 initRiskManage） | ~13s 正常退出，无崩溃 | = 裸跑，挡不住 native exit |
+| **+ swizzle initRiskManage** | **存活，进入首页** | ✅ 成功 |
 
 ### 作废的 v95 覆盖表（仅存档，勿引用）
 

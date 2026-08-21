@@ -10,11 +10,17 @@
 >    被 ABC 完整性自检发现所致**。范围覆盖 stat/open/access/sysctl/dlopen/`_dyld_*`
 >    等——**不止 libpthread，libc 普遍在校验内**。下方"libdispatch 安全""内存扫描器
 >    不覆盖 libdispatch"等说法**未经可信验证，勿依赖**。
-> 3. **唯一确认安全的手段 = ObjC 方法 swizzle**（不改函数序言）。但仅 swizzle
->    挡不住 native exit（`MbapMPaaS+0x8db260`），主 App 仍 13s 退出。
+> 3. **唯一确认安全的手段 = ObjC 方法 swizzle**（不改函数序言）。
 > 4. **硬约束：禁 C 函数 inline-hook、禁 fishhook GOT 改写、禁 __text patch、禁 Frida。**
 >
-> 下方原始内容仅作历史推断存档，事实以本框及 `analysis.md` 第 15 轮为准。
+> **✅ 第 16 轮已解决**：native exit 的检测 block 定义在
+> `-[DTFrameworkInterface initRiskManage]` 内，**swizzle 该方法为空实现**即可从源头
+> 消除 exit，纯 ObjC swizzle 不触发完整性校验。实测主 App 存活并完整进入首页、交互正常。
+> 有效方案就这一个 swizzle，不需要任何 exit 拦截/栈切换/longjmp/libc hook。
+>
+> 下方原始内容（四阶段 ctor、栈切换、双通道杀死、longjmp 恢复等）**几乎全部是失败尝试
+> 的历史存档，已在代码中删除**。事实以本框、`analysis.md` 第 15-16 轮、
+> `reference/abc-detection-vectors.md` 为准。
 
 ## 架构目标
 
