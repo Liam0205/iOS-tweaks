@@ -831,3 +831,35 @@ Transmit(amIJailbroken)、TMX(0x15090)、Turing(isJailbrokenEnvironment:)、BioC
 ### 签名工具链注意(重要)
 `ldid -S` 偶发不生成有效签名 → dyld `Library not loaded`(签名无效)。**必须验证
 `ldid -h <file>` 输出含 `CandidateCDHash` 再部署**,然后 `jbctl rebuild_trustcache`。
+
+## Round 23（2026-08-21,退出机制深挖 + fishhook 可用性）
+
+### fishhook(GOT hook)不被反制 —— 重要的可用手段
+用 fishhook 改 GOT hook mmap/mprotect(不动函数头),App 存活基线 384ms **没被秒杀**。
+⇒ **fishhook/GOT hook 不触发反 inline-hook 自检**(区别于 MSHookFunction 改函数头被秒杀)。
+这为"tweak 方案"保留了一条路:能 hook 的是 libc 导入符号(GOT),但 SDK 用内联 svc 的调用抓不到。
+
+但 fishhook mmap/mprotect **零命中 PROT_EXEC** → RWX stub 不走 libc mmap/mprotect 的 GOT,
+用内联 svc(TMX 式)或 mach vm_protect 生成。
+
+### ★崩溃日志关键指纹:LR=0xcafebabe
+重新深挖唯一完整崩溃日志(143428,无 tweak):触发线程
+- PC=0x1162f4000(RWX stub),**LR=0xcafebabe**,x20=0x1162f8000(stub 尾)
+- usedImages 只有 dyld + 一个 base=0 伪 image → 崩溃在 dyld 初始化**极早期**
+- `0xcafebabe` 是故意设的魔术值(也是 Mach-O FAT magic),典型反篡改自毁标记
+- 静态搜所有 SDK 无 `0xcafebabe` 字节 → 运行时用 mov 构造,静态抓不到
+
+### 已排除检测源(patch 判定后仍退出)
+Transmit/TMX/Turing/BioCatch 的越狱判定函数。它们是"检测→上报"型,不触发退出。
+
+### 现状判断
+- 触发退出的是**运行时动态生成的自毁 stub**,生成方式绕开静态/GOT-hook 点(内联 svc/vm)。
+- 由某模块检测越狱后触发,该"检测→自毁"链未定位(可能在主 App China 或 RemoteSale)。
+- 子代理正在查 RemoteSale(有 mprotect,RWX 生成嫌疑)。
+
+### 交付形态判断(回答"能否用 tweak")
+- inline-hook tweak:❌ 被反制秒杀。
+- fishhook/GOT tweak:✅ 不被反制,但只能 hook libc 导入,抓不到内联 svc,对本检测可能不够。
+- binary patch:✅ 前置条件全通,但要先定位"检测→自毁"链的 patch 点。
+- **tweak 内存 patch(不 hook,直接改目标模块指令)**:理论可行且不被 inline-hook 自检发现
+  (改的是别的模块的指令,不是自己 hook),但需先定位 patch 点 + 确认无周期性 __TEXT 自检。
