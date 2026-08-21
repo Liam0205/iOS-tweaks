@@ -578,3 +578,29 @@ fishhook/ObjC swizzle）无法拦截。** 这与历史 hsbcchina 10+ 轮失败�
 1. 等子代理 VASCODSK 反汇编报告（patch 点 + 自检情况）。
 2. 若无自检或自检可一并 patch：做 patch → ldid 重签 → 替换 → 测试。
 3. patch 前备份原 VASCODSK。改 Bundle 内文件是中等风险（可逆，先备份）。
+
+## Round 14（2026-08-21，patch 工具链验证 —— 撞上代码签名墙）
+
+验证 patch→重签→替换链路(用**原样重签**的 VASCODSK,零逻辑改动):
+
+- 备份原库到 `/tmp/VASCODSK.orig`(2409312 字节),root 可写 Bundle。
+- `ldid -S` 重签成功(→2350064 字节)。
+- 替换后启动 → **App 崩溃 `SIGKILL - CODESIGNING`**(namespace CODESIGNING),
+  崩在 dyld `makeJustInTimeLoaderDisk`/`compatibleSlice`(加载 VASCODSK 时签名校验失败)。
+- 已恢复原库(App 恢复正常)。
+
+### 关键结论:主障碍是 iOS 代码签名,不是 OneSpan 自检
+
+- App Store App 的 nested framework 被 ldid adhoc 重签后,**dyld 拒绝加载**(SIGKILL-CODESIGNING)。
+- AppSyncUnified 放行主可执行的伪签名,但**这里 nested framework 的 adhoc 签名仍不被接受**。
+- 这比 OneSpan 自检更早触发(探针都没注入就崩)。
+
+### 待解决:如何让 patch 后的 VASCODSK 通过签名
+候选(待验证):
+1. **重签整个 App**(主二进制+全部 framework 用同一 adhoc,保持一致),而非只单个 framework。
+2. **正确的 adhoc/fakesign**:ldid -S 可能没生成 AMFI 认的 CDHash;试 `ldid -S` 带
+   entitlements、或用 `jtool2`/`ldid` 不同参数,或 `codesign` (若有)。
+3. 确认 AppSync 是否需要 App 的 cdhash 进 trustcache(改了 cdhash 就要重新 trust)。
+4. 若签名这关过不去 → 二进制 patch 路径受阻,回到内核态(路径 A)或放弃。
+
+### 现状:等子代理 VASCODSK 反汇编(patch 点),并行解签名问题
