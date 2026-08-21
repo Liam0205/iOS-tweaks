@@ -724,3 +724,32 @@ syscall 号:`0x21`(33=access,查越狱文件存在)、`0x9d`(157)、`0xca`(202=s
 2. 找退出触发点(它有 mmap import,RWX stub 可能它生成)。
 3. patch 检测判定(改分支/返回未越狱)或退出触发 → ldid 重签 → 替换 → rebuild_trustcache → 测试。
 4. 委托子代理做 TMXProfiling 深度反汇编。
+
+## Round 19（2026-08-21,首次 patch 实验 —— Transmit 非真凶）
+
+### 子代理 TMXProfiling 报告修正
+- TMXProfiling 12 处 svc:mprotect(74)/getpid(20)×2/bind(104)/close(6)/socket(97)/
+  setsockopt(105)/access(33)×2/statfs(157)/sysctl(202)/stat(188)。**没有 exit/kill/ptrace**,
+  这 12 处 svc 里没有直接终止进程的。
+- 检测函数 0x15090:遍历加密路径字符串,调 stat/fstatat 查存在性,结果只是把标记 "C" 塞进
+  profile 上报数据(0x282ac 调用点),**未见它自己调 exit/abort**。
+- TMXProfiling 有**控制流扁平化**(0x7b5c 分发器被 984 处调用)+ 字符串混淆,静态难还原。
+- CC_SHA256/CCHmac 疑似校验配置文件非自身 __TEXT,自检未确证。
+
+### patch 工具链验证成功(重要)
+- **TransmitSDK3 用开源 IOSSecuritySuite**:`amIJailbroken`(0x12b16c)、`amIReverseEngineered`。
+- patch `amIJailbroken` → `mov w0,#0; ret`（`00008052 c0035fd6`,VA==fileoff）。
+- 部署踩坑:首次 ldid -S 后 dyld 报 `code signature invalid errno=1`;重做一遍
+  (ldid -S 生成 CandidateCDHash → cp → rebuild_trustcache)**成功加载**,探针注入(pid 变化)。
+  → **patch+重签+trustcache 工具链对 4MB framework 也可行**(注意 ldid 要确认生成了 CDHash)。
+
+### 实验结果:patch Transmit amIJailbroken 后 App 仍退出(~300-400ms,行为不变)
+⇒ **TransmitSDK3 不是触发退出的检测源**(其越狱检测可能只用于风险上报,不杀进程)。
+真凶仍未定位。多个风控 SDK 并存,需继续。
+
+### 下一步
+- 候选剩:TMXProfiling(0x15090 检测/上报)、TuringShieldPluginKit(isJailbrokenEnvironment:)、
+  BioCatchSDK、RemoteSale(有 mprotect,能生成 RWX!)、ChinaFacialRecognition 等。
+- 更高效:用 tweak(能注入)hook TMXProfiling 的 svc wrapper 地址 + 各 SDK 检测入口,
+  运行时记录谁被调用、时序,而非逐个 patch 盲试。
+- 或抓一份无 tweak 的完整裸崩溃日志(线程更全)看哪个 framework 在退出线程栈上。
