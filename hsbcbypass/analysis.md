@@ -329,11 +329,34 @@ vmRegionInfo: 0x1162f4000-0x1162f8000 [16K] r-x/rwx SM=PRV  "Memory Tag 255"
 - 检测跑在某 framework 的 initializer 里；候选发起者：`MobileSecurity`、`VASCODSK`、或主
   二进制自身的 C 检测。等子代理反汇编报告定位判定函数地址与调用链。
 
-### 待办
-1. 等子代理反汇编报告 → 确定 `jailbreakStatus:`/`debuggerStatus:` 类归属和检测判定函数。
-2. 抓一份**装了 mach 异常 handler 的**新崩溃日志（当前 handler 是 BSD signal，抢不过
-   OneSpan 的 mach handler；可用 `task_set_exception_ports` 抢 EXC_BAD_ACCESS 看触发点的
-   完整寄存器/LR，回溯是谁跳的 stub）。
-3. 定位判定函数后，优先 ObjC swizzle / 高层 Swift hook 让其返回"未越狱"，避开完整性自检
-   （abcbypass 经验）。
+## Round 6（2026-08-21，穷尽退出拦截 —— 确认退出路径不可拦）
+
+依次尝试并全部落空（进程仍在 ~635~760ms 死亡）：
+
+| 手段 | 结果 |
+|---|---|
+| `sigaction(SA_SIGINFO)` 抓 ABRT/SEGV/BUS/ILL/TRAP/SYS/FPE | **未触发**（BSD signal 层收不到） |
+| `task_set_exception_ports` 抢 EXC_BAD_ACCESS/BAD_INSTRUCTION（kr=0 成功） | **未触发** |
+| 扩大到 EXC_MASK 全类型（ARITHMETIC/SOFTWARE/BREAKPOINT/CRASH/GUARD） | **未触发** |
+| hook `task_set_exception_ports`/`thread_set_exception_ports` 看 OneSpan 是否重设 | **无任何第三方调用** |
+| hook mach `task_terminate` | **未触发** |
+| hook libc `exit/_exit/_Exit/abort/kill/pthread_kill/terminate` | **未触发** |
+
+**关键推论**：
+- 有 tweak 注入时的退出，**不产生崩溃日志、不触发 mach 异常、不调用任何可 hook 的终止/
+  信号函数**。（14:34 那份 SIGBUS 崩溃日志是**无 tweak 时**的行为；有 tweak 时走了更彻底的
+  静默路径。）
+- 唯一符合的机制：**内联 `svc #0x80` 直接调 `SYS_exit`/`exit_group`**，位于运行时动态生成
+  的 RWX stub（崩溃日志里的 `Memory Tag 255` r-x/rwx 区域）内，纯汇编，**无法 hook**。
+- ⇒ **退出路径彻底放弃拦截**。必须且只能在「检测判定」处下手，让检测认为"未越狱"，使其
+  根本不跳 stub。
+
+### 待办（聚焦检测判定）
+1. **等子代理反汇编报告**（正在跑）→ 确定 `jailbreakStatus:`/`debuggerStatus:` 类归属、
+   `jailbreak6status`/`isJailbroken` 的判定函数地址和调用链。
+2. 定位后优先 **ObjC swizzle / 高层 Swift hook** 让判定返回"未越狱/未调试"，避开完整性自检
+   （abcbypass 经验：C 函数 inline-hook 会触发自检，只有 ObjC/高层入口安全）。
+3. 若判定在纯 C 且有自检：考虑在**检测输入**层伪造（但 Round 3 已知它不走 libc 文件符号，
+   可能用内联 svc 直接 syscall 读环境，那样输入也 hook 不了 → 最后手段是 patch 判定函数
+   返回值，需先确认无自检或自检可绕）。
 4. 汇丰香港（含 `.appex`）稍后单独验证是否同一套机制。

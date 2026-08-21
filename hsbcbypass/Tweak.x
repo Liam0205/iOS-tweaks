@@ -6,6 +6,7 @@
 // 命中时打印调用栈到 syslog,借此定位是谁、走哪条路径触发退出,再决定 hook 层。
 // 不改变行为(打印后仍调用原实现),纯诊断,可逆。
 
+#define _XOPEN_SOURCE 700
 #import <Foundation/Foundation.h>
 #import <substrate.h>
 #import <execinfo.h>
@@ -99,20 +100,154 @@ static void my_Exit(int code) { HSBCLOG(@"_Exit(%d)", code); hsbc_dump_backtrace
 static void (*orig_terminate)(void);
 static void my_terminate(void) { HSBCLOG(@"std::terminate/objc"); hsbc_dump_backtrace("terminate"); orig_terminate(); }
 
-// ---- 信号捕获:若靠 raise/信号退出,handler 会先记录(SIGKILL/SIGSTOP 不可捕获)----
-static void hsbc_sig_handler(int sig) {
-    HSBCLOG(@"⚡ 收到信号 sig=%d", sig);
-    hsbc_dump_backtrace("signal");
-    // 记录后恢复默认并重抛,保持原行为
+// ---- 信号捕获:SA_SIGINFO 拿到出错地址 + 完整寄存器(PC/LR/SP)----
+// 关键:崩溃是"检测到越狱→跳 RWX stub 触发 Instruction Abort(SIGBUS)"。
+// LR 指向"跳转前那条指令",能定位检测代码在哪个模块+偏移。
+#import <ucontext.h>
+static void hsbc_sigaction_handler(int sig, siginfo_t *info, void *uctx) {
+    ucontext_t *uc = (ucontext_t *)uctx;
+    HSBCLOG(@"⚡⚡ 致命信号 sig=%d code=%d addr=%p", sig, info->si_code, info->si_addr);
+    if (uc && uc->uc_mcontext) {
+        _STRUCT_ARM_THREAD_STATE64 *ts = &uc->uc_mcontext->__ss;
+        uint64_t pc = ts->__pc, lr = ts->__lr, sp = ts->__sp;
+        HSBCLOG(@"   PC=0x%llx LR=0x%llx SP=0x%llx", pc, lr, sp);
+        // 把 PC/LR 翻译成模块+偏移
+        Dl_info di;
+        if (dladdr((void *)pc, &di) && di.dli_fname) {
+            const char *b = strrchr(di.dli_fname, '/'); b = b?b+1:di.dli_fname;
+            HSBCLOG(@"   PC → %s +0x%lx", b, (uintptr_t)pc - (uintptr_t)di.dli_fbase);
+        } else {
+            HSBCLOG(@"   PC 不在任何已知模块(疑动态 RWX stub)");
+        }
+        if (dladdr((void *)lr, &di) && di.dli_fname) {
+            const char *b = strrchr(di.dli_fname, '/'); b = b?b+1:di.dli_fname;
+            HSBCLOG(@"   LR → %s +0x%lx  ← 跳转来源(检测代码)", b, (uintptr_t)lr - (uintptr_t)di.dli_fbase);
+        } else {
+            HSBCLOG(@"   LR 不在任何已知模块");
+        }
+    }
+    hsbc_dump_backtrace("fatal-signal");
     signal(sig, SIG_DFL);
     raise(sig);
 }
 static void hsbc_install_sig_handlers(void) {
-    int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGSYS, SIGFPE, SIGPIPE };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = hsbc_sigaction_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGSYS, SIGFPE };
     for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) {
-        signal(sigs[i], hsbc_sig_handler);
+        sigaction(sigs[i], &sa, NULL);
     }
-    HSBCLOG(@"信号 handler 已安装 (ABRT/SEGV/BUS/ILL/TRAP/SYS/FPE/PIPE)");
+    HSBCLOG(@"信号 handler(SA_SIGINFO)已安装");
+}
+
+// ======== mach 异常处理:抢 EXC_BAD_ACCESS 端口 ========
+// OneSpan 用 mach exception port 拦自己触发的 SIGBUS,BSD signal 抢不到。
+// 我们抢先设 task 级 exception port,在崩溃瞬间拿到线程完整寄存器,
+// 从 LR 定位"跳 RWX stub 前"的检测代码位置。
+#import <mach/mach.h>
+#import <mach/exc.h>
+#import <mach/task.h>
+#import <pthread.h>
+
+extern boolean_t exc_server(mach_msg_header_t *, mach_msg_header_t *);
+
+static mach_port_t g_exc_port = MACH_PORT_NULL;
+
+// 翻译地址到 模块+偏移
+static void hsbc_addr_desc(uint64_t a, const char *tag) {
+    Dl_info di;
+    if (dladdr((void *)a, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/'); b = b?b+1:di.dli_fname;
+        HSBCLOG(@"   %s=0x%llx → %s +0x%lx", tag, a, b, (uintptr_t)a - (uintptr_t)di.dli_fbase);
+    } else {
+        HSBCLOG(@"   %s=0x%llx → (不在已知模块,疑动态 stub)", tag, a);
+    }
+}
+
+// exc_server 回调:catch_exception_raise 系列
+kern_return_t catch_exception_raise(mach_port_t ep, mach_port_t thread, mach_port_t task,
+                                    exception_type_t exc, exception_data_t code,
+                                    mach_msg_type_number_t ncode) {
+    HSBCLOG(@"⚡⚡⚡ MACH 异常 exc=%d code0=0x%lx code1=0x%lx",
+            exc, ncode>0?(unsigned long)code[0]:0, ncode>1?(unsigned long)code[1]:0);
+    arm_thread_state64_t ts;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt) == KERN_SUCCESS) {
+        hsbc_addr_desc(__darwin_arm_thread_state64_get_pc(ts), "PC");
+        hsbc_addr_desc((uint64_t)__darwin_arm_thread_state64_get_lr(ts), "LR(跳转来源)");
+        hsbc_addr_desc(__darwin_arm_thread_state64_get_sp(ts), "SP");
+        // 额外 dump x0-x8(可能含检测结果/参数)
+        for (int i = 0; i <= 8; i++) HSBCLOG(@"   x%d=0x%llx", i, ts.__x[i]);
+    }
+    HSBCLOG(@"⚡⚡⚡ 已记录 mach 异常现场,交回默认处理(将崩溃)");
+    return KERN_FAILURE;  // 交还,让进程按原样崩溃(不吞,保持行为)
+}
+kern_return_t catch_exception_raise_state(mach_port_t ep, exception_type_t exc,
+    const exception_data_t code, mach_msg_type_number_t ncode, int *flavor,
+    const thread_state_t ois, mach_msg_type_number_t oisc,
+    thread_state_t ns, mach_msg_type_number_t *nsc) { return KERN_FAILURE; }
+kern_return_t catch_exception_raise_state_identity(mach_port_t ep, mach_port_t thread,
+    mach_port_t task, exception_type_t exc, exception_data_t code, mach_msg_type_number_t ncode,
+    int *flavor, thread_state_t ois, mach_msg_type_number_t oisc,
+    thread_state_t ns, mach_msg_type_number_t *nsc) { return KERN_FAILURE; }
+
+static void *hsbc_exc_thread(void *arg) {
+    while (1) {
+        struct { mach_msg_header_t head; char data[1024]; } req;
+        struct { mach_msg_header_t head; char data[1024]; } rep;
+        if (mach_msg(&req.head, MACH_RCV_MSG, 0, sizeof(req), g_exc_port,
+                     MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
+        exc_server(&req.head, &rep.head);
+        mach_msg(&rep.head, MACH_SEND_MSG, rep.head.msgh_size, 0, MACH_PORT_NULL,
+                 MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
+    return NULL;
+}
+
+// hook task/thread_set_exception_ports:看 OneSpan 是否重设端口抢回去,并暴露其 handler
+static kern_return_t (*orig_task_set_exc)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t);
+static kern_return_t my_task_set_exc(task_t t, exception_mask_t m, mach_port_t p, exception_behavior_t b, thread_state_flavor_t f) {
+    HSBCLOG(@"[hook] task_set_exception_ports(mask=0x%x port=%u behavior=%d)", m, p, b);
+    return orig_task_set_exc(t, m, p, b, f);
+}
+static kern_return_t (*orig_thread_set_exc)(thread_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t);
+static kern_return_t my_thread_set_exc(thread_t t, exception_mask_t m, mach_port_t p, exception_behavior_t b, thread_state_flavor_t f) {
+    HSBCLOG(@"[hook] thread_set_exception_ports(mask=0x%x port=%u behavior=%d)", m, p, b);
+    return orig_thread_set_exc(t, m, p, b, f);
+}
+// hook mach 终止
+static kern_return_t (*orig_task_terminate)(task_t);
+static kern_return_t my_task_terminate(task_t t) {
+    HSBCLOG(@"[hook] task_terminate(task=%u) self=%u", t, mach_task_self());
+    hsbc_dump_backtrace("task_terminate");
+    return orig_task_terminate(t);
+}
+
+static void hsbc_install_mach_handler(void) {
+    // 先 hook 端口设置和终止函数
+    MSHookFunction((void *)task_set_exception_ports, (void *)my_task_set_exc, (void **)&orig_task_set_exc);
+    MSHookFunction((void *)thread_set_exception_ports, (void *)my_thread_set_exc, (void **)&orig_thread_set_exc);
+    MSHookFunction((void *)task_terminate, (void *)my_task_terminate, (void **)&orig_task_terminate);
+
+    kern_return_t kr;
+    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
+    if (kr != KERN_SUCCESS) { HSBCLOG(@"mach:分配端口失败 %d", kr); return; }
+    kr = mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) { HSBCLOG(@"mach:插入 send 权限失败 %d", kr); return; }
+    pthread_t t;
+    pthread_create(&t, NULL, hsbc_exc_thread, NULL);
+    pthread_detach(t);
+    // 抢 EXC_BAD_ACCESS / BAD_INSTRUCTION 的 task 级端口
+    // 抓所有异常类型(用 orig 避开自己的 hook 日志)
+    exception_mask_t mask = EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION |
+                            EXC_MASK_ARITHMETIC | EXC_MASK_SOFTWARE |
+                            EXC_MASK_BREAKPOINT | EXC_MASK_CRASH | EXC_MASK_GUARD;
+    kr = orig_task_set_exc(mach_task_self(), mask, g_exc_port,
+                           EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+    HSBCLOG(@"mach:task_set_exception_ports(all) kr=%d(0=成功)", kr);
 }
 
 // ======== RASPFramework Swift 决策点探针 ========
@@ -381,8 +516,9 @@ static pid_t my_fork(void) {
         if (pTerm) MSHookFunction(pTerm, (void *)my_terminate, (void **)&orig_terminate);
 
         hsbc_install_sig_handlers();
+        hsbc_install_mach_handler();
 
-        HSBCLOG(@"退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill/_Exit/terminate/signals)");
+        HSBCLOG(@"退出路径探针已布设 (exit/_exit/abort/kill/pthread_kill/_Exit/terminate/signals/mach)");
 
         hsbc_dump_decrypted();  // 尽早脱壳,趁进程存活
 
