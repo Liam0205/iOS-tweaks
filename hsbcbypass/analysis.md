@@ -1042,3 +1042,27 @@ SIGKILL:不可捕获、无 crash log、无 svc、无异常 —— **完美符合
 2. 找 hsbcchinax 如何间接调用退出(它无 exit import,但主线程从这里退出)——追 0x630430
    状态机的出口跳转,可能跳到某 framework 的退出封装或函数指针表。
 3. 二分:patch hsbcchinax 的 0x65bfa8 hash 循环 / 0x630430 状态机入口,看能否阻断。
+
+## Round 31（2026-08-21,MAX — 检测入口=hsbcchinax +load,patch 0x43c118 暴露调用栈 ★★★）
+
+patch hsbcchinax 0x43c118(采样最热调用者)入口为 ret → App 存活延长(376→501ms)且
+**退出变成 SIGSEGV 崩溃**(原本静默),崩溃栈完整暴露检测入口链:
+```
+dyld runInitializersBottomUp → notifyObjCInit → libobjc load_images
+  → hsbcchinax+0x43e104 (+load 里的调用)
+  → hsbcchinax+0x43e0fc
+  → hsbcchinax+0x93924 → 0x93964 → 0x939b8 → 0x939ec → 0x93ab0 → 0x93b64 (崩)
+```
+
+### 决定性:检测在 hsbcchinax 的 ObjC `+load`(启动最早期)
+- **`load_images → hsbcchinax+0x43e104`**:hsbcchinax 有 `+load` 方法,启动最早期(dyld
+  notifyObjCInit 阶段,正是崩溃日志一直显示的阶段)就跑检测。
+- 检测核心函数链:`+load`(0x43e0fc/0x43e104)→ 0x43c118(检测,OLLVM 混淆)→ 0x93xxx 区。
+- 0x93924-0x93b64 是检测的子逻辑(之前采样热点 0x93a10/0x93c30 也在此)。
+- patch 0x43c118 整体 ret 太粗暴(破坏返回值→野指针 SIGSEGV),但**证明这条链就是检测**。
+
+### 下一步(精确 patch)
+1. 反汇编 hsbcchinax `+load` 链:0x43e0fc(load 方法)、0x93924 区(检测子函数),
+   找"判定越狱→退出"的精确分支,精细 patch(不破坏返回值)。
+2. 或:找 hsbcchinax 的 `__objc_nlclslist`(+load 类)确认 load 方法,从源头让 load 不检测。
+3. 子代理正在反混淆 0x630430/0x65bfa8 区,结合这条 +load 链定位判定分支。
