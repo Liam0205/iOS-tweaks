@@ -23,7 +23,7 @@
 
 - `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 - `llmdoc/reference/icbc-detection-vectors.md`：工商银行检测框架（SecureUtilityPlus）、冻结机制（持续 freeze 循环及版本间时序差异）、弹窗退出链路、版本适配记录（3.0.80、3.0.90）与覆盖情况。
-- `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、双通道杀死机制（CFRunLoop timer + GCD dispatch_after）、第二检测路径（hook 完整性）、svc #0x80 不可拦截 syscall、当前覆盖状态。
+- `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、SDK 识别与 exit 源头静态分析。**⚠️ 含 2026-08-21 第 15 轮重大更正**：可信基线（裸跑主 App ~13s 正常退出、全量 hook ~1s 崩溃）、`0xb5a06000` 崩溃根因 = libc 函数 inline-hook 被完整性自检发现、唯一安全手段为 ObjC swizzle；旧 v95"双通道杀死/覆盖成功"多为误判（存活检测匹配到扩展进程），已标注作废。
 - `llmdoc/reference/lianjiabypass-detection-vectors.md`：链家/贝壳找房检测栈（JGBSDK 核心引擎 + du/senseid 指纹采集器 + a.framework 注入检测）、JGBSDK XxxCheck selector 与越狱特征字符串、DynamicLibraries 目录扫描、a.framework 主线程慢扫描机制、29 处内联 svc #0x80 退出点、anti-frida、当前覆盖状态（四层全覆盖，两 App 均验证）。
 - `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径、单次 IPC swipe 消除合并竞态、gesture arbiter 投递路径限制迫使系统手势走 SpringBoard API、edge mask 诊断用途）+ Phase 3（从零创建多指事件、cubic-bezier、HID keyboard、killall backboardd）。
 

@@ -1,5 +1,15 @@
 # ABCBypass Rounds 1-9 Reflection (v1 - v81)
 
+> ✅ **2026-08-21 复核（analysis.md 第 15 轮）。** 本文最核心的教训——
+> "MSHookFunction hook libc/pthread 触发 SDK 内存完整性扫描 → SIGSEGV"——已被
+> 可信二分实验**再次证实且范围更广**：不止 pthread_create，`stat/open/access/
+> sysctl/dlopen/_dyld_*` 等 libc 函数被 inline-hook 都会触发固定哨兵地址
+> `0x00000000b5a06000` 的崩溃。**保守结论：对 ABC 任何 C 函数都不要 inline-hook。**
+>
+> ⚠️ 但凡本文涉及"存活/UI 存活"的具体数字或成功断言，同样受"grep 匹配到扩展进程
+> `group.abc.toolExtension` 而非主 App"的方法论错误影响，需以第 15 轮可信基线为准
+> （裸跑主 App ~13s 正常退出）。
+
 ## Task
 
 对农业银行 (com.bankabc.iphonerelease, binary MbapMPaaS) v11.1.0 的越狱检测绕过开发。目标 SDK 使用 SmAntiFraud + SecurityGuard/mPaaS + SecureUtilityPlus 三层检测架构，含多重杀进程机制。经历 9 轮迭代，从 v1 到 v81。

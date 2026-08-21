@@ -1,5 +1,21 @@
 # ABC Bypass 架构
 
+> ⚠️ **2026-08-21 重大更正（第 15 轮）。** 本文档 v95 时期的多数"成功"结论
+> **不可信**，因为它们基于错误的存活检测（`grep MbapMPaaS` 命中后台扩展进程
+> `group.abc.toolExtension`，而非主 App）。经可信重测（`abctest.sh` 精确匹配
+> `MbapMPaaS.app/MbapMPaaS` 且排除 `PlugIns`）确认：
+>
+> 1. **裸跑主 App ~13s 正常退出（无崩溃）**；**全量 hook 反而 ~1s 崩溃**。
+> 2. **`0xb5a06000` SIGSEGV 崩溃 = 对 libc 函数 inline-hook（MSHookFunction/fishhook）
+>    被 ABC 完整性自检发现所致**。范围覆盖 stat/open/access/sysctl/dlopen/`_dyld_*`
+>    等——**不止 libpthread，libc 普遍在校验内**。下方"libdispatch 安全""内存扫描器
+>    不覆盖 libdispatch"等说法**未经可信验证，勿依赖**。
+> 3. **唯一确认安全的手段 = ObjC 方法 swizzle**（不改函数序言）。但仅 swizzle
+>    挡不住 native exit（`MbapMPaaS+0x8db260`），主 App 仍 13s 退出。
+> 4. **硬约束：禁 C 函数 inline-hook、禁 fishhook GOT 改写、禁 __text patch、禁 Frida。**
+>
+> 下方原始内容仅作历史推断存档，事实以本框及 `analysis.md` 第 15 轮为准。
+
 ## 架构目标
 
 `abcbypass/Tweak.x` 对抗中国农业银行 (com.bankabc.iphonerelease) v11.1.0 的越狱检测与退出杀死链路。当前版本 v0.1.0-95，状态：活跃开发中（尚未发布）。
@@ -47,11 +63,17 @@
 
 两个通道冗余执行，当前 CFRunLoop 通道已被拦截，GCD 通道尚未拦截。
 
-## 核心约束：MSHookFunction 在 libpthread 不安全
+## 核心约束：禁止一切 C 函数 inline-hook（第 15 轮更正）
 
-SDK 内存完整性扫描器（`memmem` 运行在 `com.apple.uikit.xpc-service` 线程）会检测 libpthread 函数的 inline hook。MSHookFunction 覆盖 `pthread_create` 后触发 SIGSEGV（crash 在 unmapped shared cache region）。通过受控二分测试确认。
+SDK 内存完整性扫描器（`memmem`，运行在 GCD worker 线程）会检测 **libc 广泛函数**的
+inline hook / GOT 改写。二分实验证实：MSHookFunction 覆盖
+`stat/lstat/access/open/fopen/realpath/readlink/sysctl/getenv/fork/dlopen/dlsym`
+及 `_dyld_*` 后，启动 ~1s 触发后台线程跳到固定哨兵地址 `0x00000000b5a06000` 的
+SIGSEGV（地址每次相同 ⇒ 主动触发）。
 
-**安全范围**：MSHookFunction 对 libdispatch 函数（dispatch_async/dispatch_async_f）是安全的，内存扫描器不覆盖 libdispatch。
+> ⚠️ **旧说法"MSHookFunction 对 libdispatch 安全 / 内存扫描器不覆盖 libdispatch"
+> 及"仅 libpthread 不安全"均未经可信验证。** 已确认范围至少覆盖上述 libc 函数。
+> 保守结论：**对 ABC 任何 C 函数都不要 inline-hook**；越狱绕过只用 ObjC swizzle。
 
 ## Hook 策略（混合方案）
 

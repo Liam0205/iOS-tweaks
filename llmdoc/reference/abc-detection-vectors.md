@@ -60,19 +60,27 @@
 
 **Syscall 级检测**：直接内联 ARM64 汇编执行 stat/access/sysctl，完全绕过 GOT/PLT，用户态不可拦截。
 
-**内存完整性扫描**：
-- 使用 `memmem` 扫描代码段
-- 运行在 `com.apple.uikit.xpc-service` 线程
-- 检测 libpthread 上的 inline hook（MSHookFunction trampoline）
-- 不检测 libdispatch（MSHookFunction 对 dispatch_async 安全）
+**内存完整性扫描**（⚠️ 2026-08-21 重测更正，范围比原记录广得多）：
+- 使用 `memmem` 扫描代码段，运行在 GCD worker 线程。
+- **对 libc 函数的 inline hook 全部会被发现**。经二分实验证实（第 15 轮）：
+  对 `stat/lstat/access/open/fopen/realpath/readlink/sysctl/getenv/fork/dlopen/dlsym`
+  及 `_dyld_*` 做 MSHookFunction，会在启动 ~1s 触发后台 GCD 线程跳到**固定哨兵地址
+  `0x00000000b5a06000`** 的 SIGSEGV（地址每次相同 ⇒ 主动触发，非随机内存错误）。
+- **旧记录"不检测 libdispatch / MSHookFunction 对 dispatch_async 安全"未经可信验证，
+  勿依赖。** 唯一可信的安全手段：**ObjC 方法 swizzle**（不改函数序言字节）。
+- **⇒ 对 ABC 的硬约束：禁用一切 C 函数 inline-hook，禁止 __text patch，禁止 fishhook GOT 改写。**
 
 ## 杀死机制
 
 ### 退出行为时序
 
-检测延迟：启动后约 15 秒触发。
+检测延迟：裸跑实测**约 13 秒**后主 App 正常退出（第 15 轮可信测量；旧记录"15 秒"为近似）。
 
-### 双通道杀死架构（v95 确认）
+> ⚠️ 下方"双通道杀死架构 / 退出路径 / 第二检测路径"均为 v95 及更早的**推断**，
+> 且部分依赖被污染的存活判断。exit 源头的**可信**结论见文首"可信状态"与
+> `MbapMPaaS+0x8db260`。以下小节仅作历史推断存档，勿直接引用为事实。
+
+### 双通道杀死架构（v95 推断，未经可信验证）
 
 SDK 使用两个独立的杀死通道冗余执行：
 
@@ -114,22 +122,34 @@ v95 发现：即使越狱文件检测和 ObjC 方法检测均已成功绕过（�
 - 文案："为保护您的资金安全，中国农业银行不支持越狱设备上使用。"
 - 关键字匹配：农业银行/越狱/资金安全
 
-## 当前覆盖状态（v95）
+## 当前覆盖状态
 
-| 检测向量 | 状态 | 实现方式 |
+> ⚠️ **旧 v95 覆盖表（下方"作废"块）中的"✅ 已阻断/已拦截/已规避"多为误判**：
+> 基于错误的存活检测（把后台扩展进程 `group.abc.toolExtension` 当成主 App），
+> 且大量依赖被证明有害的 libc inline-hook / fishhook。勿引用。
+
+### 可信状态（第 15 轮，2026-08-21，正确进程匹配）
+
+| 配置 | 主 App 结果 | 结论 |
+|------|------|------|
+| 裸跑（无 tweak） | ~13s **正常退出**（exit，无崩溃） | ABC 越狱检测原始行为 |
+| 全量 hook | ~1s **崩溃** `0xb5a06000` | 净负面，libc inline-hook 触发完整性自检 |
+| 仅 ObjC swizzle（`ABC_LIBC_HOOKS=0`） | ~13s 正常退出，无崩溃 | = 裸跑，ObjC swizzle 安全但挡不住退出 |
+
+- 退出源头（静态分析，可信）：`MbapMPaaS+0x8db260` 的 `exit(0)`，由
+  `cmp w24,#3`（`w24=[receiver action]`，receiver=检测 block 捕获对象）判定触发。
+- 尚未绕过：这条 native exit 路径。方向 = 用 ObjC/数据层手段让 `[receiver action]≠3`。
+
+### 作废的 v95 覆盖表（仅存档，勿引用）
+
+| 检测向量 | ~~旧状态~~ | 备注 |
 |----------|------|----------|
-| SecureUtilityPlus (13 classes) | ✅ 已中和 | ObjC method_setImplementation |
-| 文件/dyld/sysctl/env 检测 | ✅ 已隐藏 | fishhook (ctor 第一阶段) |
-| exit/abort/kill 链 | ✅ 已阻断 | fishhook + ARM64 栈切换 |
-| dispatch_async 主线程 block | ✅ 已重定向 | MSHookFunction (560+ redirects) |
-| pthread_create 检测线程 | ✅ 已拦截 | fishhook (非 MSHookFunction) |
-| CFRunLoop 杀死定时器 | ✅ 已拦截 | MSHookFunction CFRunLoopAddTimer + 过滤规则 |
-| GCD dispatch_after 杀死 | ❌ 未拦截 | 无有效拦截方式 |
-| Hook 完整性检测（第二路径） | ❌ 未绕过 | 疑似 FishHookChecker / GOT 比对 |
-| svc #0x80 后台杀死 | ⚠️ 缓解 | 线程挂起 + 巡逻定时器 |
-| 内存完整性扫描 | ✅ 已规避 | 不对 libpthread 使用 inline hook |
-| 弹窗 | ✅ 已抑制 | UIAlertController 关键字拦截 |
-| UI 完全恢复 | ❌ 未解决 | longjmp CF 状态损坏 / 巡逻定时器误挂起 |
+| SecureUtilityPlus (13 classes) | ~~✅ ObjC method_setImplementation~~ | swizzle 本身安全，但"已中和"未经可信验证 |
+| 文件/dyld/sysctl/env 检测 | ~~✅ fishhook/inline hook~~ | **实为有害**：触发 `0xb5a06000` 崩溃 |
+| exit/abort/kill 链 | ~~✅ fishhook + 栈切换~~ | 存活判断不可信 |
+| dispatch_async block 重定向 | ~~✅ 560+ redirects~~ | "560+"计数来自被污染的运行 |
+| CFRunLoop / GCD / svc / 内存扫描 | ~~各种~~ | 结论不可信，见上方可信表 |
+| UI 完全恢复 | ~~❌ longjmp CF 损坏~~ | UI 冻结的 longjmp 归因也未经可信验证 |
 
 ## 与 ICBC 检测的差异
 
