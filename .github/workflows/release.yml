@@ -110,7 +110,7 @@ jobs:
           rm -rf repo/.git
           git worktree remove /tmp/gh-pages
           # Remove stale directories that shouldn't be on gh-pages
-          rm -rf repo/bankcommbypass repo/mybankbypass repo/icbcbypass repo/dist repo/repo
+          rm -rf repo/bankcommbypass repo/mybankbypass repo/icbcbypass repo/abcbypass repo/dist repo/repo
 
       - name: Update Sileo repo
         run: |
