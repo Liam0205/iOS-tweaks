@@ -99,6 +99,30 @@ RASPFramework 揭示的检测→响应模型（strings）：
 
 ## 当前阻塞
 
-- **需用户解锁 2215 设备并保持点亮**：裸跑对照无法完成（`uiopen` 返回 0 但 App 进程从不
-  出现，疑锁屏 / 数据保护）。解锁后重跑 `hsbctest.sh cn` / `hk`：观察原始退出方式
-  （弹窗？abort？秒退？crash 特征？），验证上面的"Swift/ObjC 层策略退出"新假设。
+### 观测工具不可靠（已定位，2026-08-21）
+
+设备锁屏假设已被用户否定（"一直解锁呢"）。重新诊断发现**是观测手段坏了，不是 App 起不来**：
+
+- `ps -eo pid,args`（mobile 用户）**看不到任何 Bundle/Application 下的 App 进程**——
+  不只汇丰，所有 App 都抓不到 args。此前多轮"进程从未出现"的结论都建立在这个坏观测上，作废。
+- `log stream` 在本越狱环境对 SpringBoard/launchd 谓词**零输出**（无权限或被裁剪）。
+- 从 SSH 发起的 `uiopen <bundle>` 返回 0，但只是"请求已投递给 SpringBoard"，不代表拉起。
+
+**可靠信号**：汇丰中国数据容器
+`…/Data/Application/67AD6C38…/` 内有 **13:50 的新写入**
+（AppDynamics、高德 SDK 日志），证明它**近期确实运行过**；但通过 SSH `uiopen` 后容器
+**mtime 零变化**，说明 SSH 侧拉起没生效。
+
+**其他已确认事实**：
+- 主二进制 `China` 为 App Store 加密（`LC_ENCRYPTION_INFO_64 cryptid 1`），静态分析需先脱壳。
+- 设备装了大量全局注入 tweak：`Shadow`（filter=UIKit，注入所有 App）、`noJailbreak` 等。
+- mobile 用户**无权限**改 `/var/jb/Library/MobileSubstrate/DynamicLibraries/`（`mv` 被拒）。
+- **Choicy 里汇丰中国和汇丰香港均已设 `tweakInjectionDisabled=true`**——当前完全禁止任何
+  tweak 注入这两个 App（推测上一轮排查时手动设的）。这既意味着裸跑环境更干净，也意味着
+  **将来 hsbcbypass 要能注入，必须先在 Choicy 放开或加白名单**。
+
+### 下一步（需用户设备端配合）
+
+由于 SSH 观测三件套都不可靠，需用户在设备上**亲手点图标**启动汇丰中国 / 香港，直接肉眼观察
+原始越狱响应：是弹窗（"检测到越狱"类）？还是秒退 / 卡住 / 白屏 / 正常进入？据此确认
+"Swift/ObjC 层策略退出"新假设的真实退出方式，再决定 hook 层。
