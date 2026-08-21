@@ -648,3 +648,43 @@ Dopamine 用 **jailbreakd + trustcache**(不是证书链)信任 adhoc 签名的�
 判定点即可成功;若有自检,需一并 patch 自检。
 
 现在等子代理定位:检测判定指令地址 + 退出触发 + 自检。拿到后即可实施 patch。
+
+## Round 17（2026-08-21,重大转折 —— 检测源不是 OneSpan!）
+
+子代理彻底核实 **VASCODSK 里没有任何越狱检测**(0 svc、无检测字符串、import 表无
+sysctl/csops/ptrace/mmap/mprotect,纯 Digipass OTP 库)。RASPFramework/MobileSecurity 同样无。
+**之前所有"检测在 OneSpan/VASCODSK C 层内联 svc"的假设被证伪。** China 主二进制自身也
+0 svc、无 mmap/sysctl import、无实际越狱路径字符串。
+
+### 扫描全部 framework 的 import,找到真正的检测源
+
+扫 China.app 所有 framework 的 `nm -u`,找 import mmap/mprotect/sysctl/csops/ptrace 的:
+
+| framework | 可疑 import | 性质 |
+|---|---|---|
+| **TuringShieldPluginKit** | _mmap _sysctl | **腾讯 Turing 盾风控** |
+| **TransmitSDK3** | (Swift) | **Transmit Security,含 libDeviceSecurityAssessment** |
+| **TMXProfiling** | _mmap _sysctl _sysctlbyname | **ThreatMetrix(12 处 svc!)** |
+| RemoteSale | _mmap _mprotect _sysctl | 有 mprotect(能生成 RWX) |
+| BioCatchSDK/TransmitSDK3/TuringShield/... | _sysctl 等 | 各类风控/生物识别 |
+
+### 三个明确的检测源(都未加密、明文可分析)
+
+1. **TuringShieldPluginKit**(腾讯 Turing 盾,744KB,0 svc):**明文越狱路径字符串全在**
+   (`/var/jb/Applications/Sileo.app`、`/Library/MobileSubstrate/...`、Cydia、apt),
+   且有 ObjC 方法 **`isJailbrokenEnvironment:`** ← 最理想,可 hook 也可 patch。
+2. **TransmitSDK3**(Transmit Security,4MB,0 svc):`libDeviceSecurityAssessment.JailbreakCheck`
+   枚举列出全部检测手段:urlSchemes/symbolicLinks/existenceOfSuspiciousFiles/
+   suspiciousFilesCanBeOpened/restrictedDirectoriesWriteable/dyld/fork,`isJailbroken`(Swift)。
+3. **TMXProfiling**(ThreatMetrix,479KB,**12 处 svc**):可能是用内联 svc 的那个。
+
+### 意义
+- 之前"用户态 hook 全零命中"可能是因为 hook 错了对象(盯 OneSpan)。真正检测在这些 SDK。
+- TuringShield 的 `isJailbrokenEnvironment:` 是 ObjC 方法,能 swizzle(abcbypass 路径可用)。
+- 二进制 patch 工具链(Round 15-16)已就绪,可直接用于这些 framework。
+
+### 下一步
+1. 优先分析 TuringShieldPluginKit（明文 + ObjC 方法,最好下手）:定位 `isJailbrokenEnvironment:`
+   调用链,先试运行时 hook 观测它是否被调用、何时。
+2. 分析 TransmitSDK3 的 JailbreakCheck、TMXProfiling 的 12 处 svc。
+3. 判断哪个 SDK 的检测触发了退出（可能多个并存,需逐个验证）。
