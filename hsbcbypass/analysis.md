@@ -430,3 +430,24 @@ tweak 内存脱壳法离线分析。
 - 等子代理反汇编报告（分析 China.decrypted 的检测→退出调用链）。
 - 若确认检测纯在 VASCODSK C 层且用内联 svc 读环境 + 触发退出：最后手段是运行时 patch
   VASCODSK 的检测函数（需定位）或在其依赖的 syscall 封装处拦截（若有）。
+
+## Round 9（2026-08-21，并行静态分析 —— 缩小检测源）
+
+与子代理并行,排除了若干路径:
+
+- **pthread_create 未被调用**:检测后台线程不用 libc `pthread_create`(疑用
+  `bsdthread_create` syscall 或 mach `thread_create` 直建),又一处绕开可 hook 层。
+- **MobileSecurity 不是 RASP 检测层**:`otool -L` 显示它不依赖 VASCODSK,只做加密
+  (SymmetricCryptor)、生物识别、屏幕捕获。
+- **China 直接链接 VASCODSK**(`@rpath/VASCODSK.framework`),`AppSecurityMonitor`
+  (在主二进制 China 的 `WithOneSpanRASP` 模块)是调 VASCODSK 的层。China 用 iOS15
+  chained-fixups,`--bind`/`--lazy-bind` 解析不出 VASCODSK 符号引用(需 chained imports 解析)。
+- **VASCODSK C 层全混淆**:导出函数名全随机(`_ACdvYdwnXvIsmklLDhnw` 类),检测字符串
+  加密隐藏;发现 `__swift56_hooks`/`__s_async_hook` 段名(疑检测 Swift/async hook)。
+- **RaspAdapterPlugin-Policy.json**(DataProvider.framework)只是插件消息路由声明
+  (fraud feed 查询),**不是检测行为开关**。RASP 检测行为编译进 OneSpan 库,无外部配置可改。
+- **8 个 AppSecurityMonitor ObjC 检测方法确认是被动查询接口**,拦截不经过它们。
+
+⇒ 检测确定在 **VASCODSK C 层**(混淆),由 China 的 `AppSecurityMonitor`/
+`ActiveOneSpanRASPProvider` 初始化时启动后台检测,内联 syscall 读环境 + 触发退出。
+静态定位混淆检测函数是当前唯一出路(子代理进行中)。

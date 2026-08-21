@@ -11,6 +11,8 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <pthread.h>
+#import <dlfcn.h>
 
 // 日志写沙盒文件(设备无 syslog 工具,靠文件回捞)
 static void hsbc_log(NSString *line) {
@@ -78,6 +80,21 @@ static void hsbc_hook_monitor(void) {
     hook_method(cls, "emulatorDetected", NO);
 }
 
+// ---- hook pthread_create:记录新线程入口函数所属模块,定位检测线程 ----
+static int (*orig_pthread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+static int my_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*start)(void *), void *arg) {
+    Dl_info di;
+    if (dladdr((void *)start, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/'); b = b?b+1:di.dli_fname;
+        HSBCLOG(@"pthread_create → start=%p [%s +0x%lx] sym=%s",
+                (void *)start, b, (uintptr_t)start - (uintptr_t)di.dli_fbase,
+                di.dli_sname ? di.dli_sname : "?");
+    } else {
+        HSBCLOG(@"pthread_create → start=%p [未知模块]", (void *)start);
+    }
+    return orig_pthread_create(t, a, start, arg);
+}
+
 // 类可能晚加载:注册 dyld 回调,每次新 image 都尝试;并在 ctor 立即试一次
 #import <mach-o/dyld.h>
 static bool g_done = false;
@@ -94,8 +111,9 @@ static void on_image(const struct mach_header *mh, intptr_t slide) { try_hook();
     @autoreleasepool {
         HSBCLOG(@"探针注入: pid=%d bundle=%@", getpid(),
                 [[NSBundle mainBundle] bundleIdentifier]);
+        MSHookFunction((void *)pthread_create, (void *)my_pthread_create, (void **)&orig_pthread_create);
         try_hook();
         _dyld_register_func_for_add_image(&on_image);
-        HSBCLOG(@"已注册 dyld 回调等待 AppSecurityMonitor");
+        HSBCLOG(@"已注册 dyld 回调等待 AppSecurityMonitor + hook pthread_create");
     }
 }
