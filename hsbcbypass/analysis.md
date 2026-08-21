@@ -783,3 +783,22 @@ syscall 号:`0x21`(33=access,查越狱文件存在)、`0x9d`(157)、`0xca`(202=s
 3. 一次 patch 多个 → App 若存活 → 二分定位真凶。
 4. 注意:patch 要避开各 SDK 可能的完整性自检(改磁盘 hash 变);但 Round 16 已证上层不校验
    framework hash,SDK 自身若校验 __TEXT 需一并处理。
+
+## Round 21（2026-08-21,逐个 patch 排除 + 定位剩余 SDK）
+
+二进制 patch(不被反制)逐个测试判定函数:
+- **Transmit amIJailbroken(0x12b16c)** patch 返回0 → App 仍 ~376ms 退出。**排除**。
+- **TMX 检测函数 0x15090** patch 返回0 → App 仍 ~376ms 退出。**排除**(或 0x15090 非关键点)。
+
+基线存活稳定 ~376ms(#30)。已确认 patch 机制对 TMX/Transmit/VASCODSK 都能重签加载成功。
+
+### 重要线索:RWX stub 生成者 = 有 mprotect 的模块
+崩溃日志退出机制是"跳动态 mmap 的 RWX stub"。生成 RWX 需 mprotect(+EXEC)。
+import `_mprotect` 的只有 **RemoteSale**(29MB)和 TMX(内联 svc mprotect@wrapper 0x41ec)。
+→ **RemoteSale 是重点嫌疑**(它能生成 RWX stub)。
+
+### 进行中
+- 子代理批量定位 TuringShieldPluginKit(`isJailbrokenEnvironment:`)和 BioCatchSDK
+  (`JailbreakModelEx`)的判定函数地址 + patch 方案。
+- 待查:RemoteSale 的 mprotect 用途(是否生成退出 stub)。
+- 候选真凶优先级:Turing(明文越狱路径,最像专门检测)> RemoteSale(能生成RWX)> BioCatch。
