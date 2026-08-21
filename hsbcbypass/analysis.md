@@ -887,3 +887,29 @@ Transmit/TMX/Turing/BioCatch 的越狱判定函数。它们是"检测→上报"�
 真凶是"检测越狱→内联 svc 退出"的链,执行极快、用 svc 绕开所有可观测点,且不在已排除的
 4 个 SDK 的判定函数里。候选剩:主 App China 自身逻辑、RemoteSale(子代理分析中)、
 或其他未排查 framework。静态因 Swift 符号剥离/混淆难定位,动态因 svc 极快难捕获。
+
+## Round 25（2026-08-21,全 framework svc 扫描 + 退出机制再定性）
+
+字节级扫描 App 全部 framework 的 `svc #0x80`(011000d4,仅 4 字节对齐的才是代码):
+- 有 svc 的:TMXProfiling(access/statfs/sysctl)、TMXBehavioSec(同)、TMXProfilingConnections、
+  RemoteSale(OpenSSL 内)。**syscall 号全是 access(33)/statfs(157)/sysctl(202),无 exit(1)/ptrace(26)。**
+- XChinaJourney/hsbcchinax 的 "svc" 未对齐 → 是数据里的巧合字节,非代码。
+- **China 主二进制:0 处 svc**(字节级确认)。China initializer(0x1000196f4)是全局对象构造,非检测。
+
+### 退出机制的逻辑矛盾(重新定性)
+进程退出:❌ 不走 libc exit/abort/kill(hook 零命中);❌ 无内联 svc exit(全扫无 exit syscall);
+❌ 常态不产生崩溃日志(那次 SIGBUS 143428 是特例)。那进程如何消失?
+
+**新假设:被外部 SIGKILL(不可捕获,无记录)。** 佐证:每次启动稳定出现**两个 China 进程**
+(ppid 都=1)。可能是:看门狗进程检测越狱后 kill 主进程,或子进程 kill 父进程。
+SIGKILL 不可捕获、不产生 crash log、不触发信号/mach handler —— 完美符合所有观测。
+
+### 下一步(全新方向)
+1. 验证"双进程 + 外部 kill"假设:root 高频监控两个 China 进程的生死顺序,看谁先死、
+   是否一个 kill 另一个(hook kill 零命中是因为 kill 调用在**另一个进程**里,我们只注入了被杀的那个)。
+2. 若确认是伴生进程 kill:需在**发起 kill 的进程**里注入/拦截,或阻止伴生进程启动。
+3. 若是同进程内:重新审视 China Swift 代码里调用 exit 的高层封装。
+
+### 已彻底排除
+所有第三方风控 SDK(Transmit/TMX系列/Turing/BioCatch/RemoteSale/OneSpan)的检测→退出;
+China 内联 svc;China initializer。
