@@ -509,3 +509,39 @@ hook 没抓到 → **该分配发生在 tweak 的 MSHookFunction 生效之前**�
    - 或 hook dyld 的镜像加载早期回调,在 OneSpan 初始化器执行前布设 hook;
    - 或研究 ElleKit 注入顺序,让 HSBCBypass.dylib 排在最前(文件名/依赖控制)。
 3. 时机赶上后,mmap/mprotect hook 应能抓到 RWX stub 生成的调用栈 → 定位检测退出模块。
+
+## Round 12（2026-08-21,mach VM 层 hook —— 仍零命中,确认裸 syscall）
+
+### 澄清注入时机(查证 dyld 行为)
+
+查 dyld 加载顺序(leptos-null/LoadOrder):inserted dylib(tweak)的构造器**先于**依赖
+framework 的初始化器**先于**主程序。所以 tweak `%ctor` **理论上早于** VASCODSK 初始化器。
+tweak `%ctor` 里能 `NSClassFromString(AppSecurityMonitor)` 是因为 ObjC 类注册(map_images)
+早于所有初始化器,但≠初始化器已执行。→ 时机本身 tweak 不算晚。
+
+### mach VM 层 hook 仍抓不到 OneSpan 的 RWX 分配
+
+hook `mach_vm_protect`/`vm_protect`(dlsym 取址,mach_vm.h 在 SDK 不可用)。生效
+(抓到 ellekit 自己 hook 时的 +EXEC 副作用),但 **OneSpan 的 RWX stub 分配依然零命中**。
+
+⇒ **OneSpan 用内联 `svc` 直接发 `mach_vm_*` syscall,连 mach 用户态封装都绕过。**
+这是最底层的裸 syscall,用户态**任何** hook(libc/mach 封装/ObjC/信号/异常端口)都拦不到。
+
+### 已穷尽的 hook(全部零命中,统一原因=内联裸 syscall + 混淆)
+
+libc: exit/_exit/_Exit/abort/kill/pthread_kill/terminate/stat/open/access/fopen/dlopen/
+sysctl/fork/mmap/mprotect/pthread_create;
+mach: task_set_exception_ports/thread_set_exception_ports/task_terminate/mach_vm_protect/vm_protect;
+signal: sigaction 全致命信号;ObjC: AppSecurityMonitor 8 方法。
+
+### 最终技术判断
+
+汇丰 OneSpan RASP 在**纯裸 syscall 层**完成检测(读环境)、后台线程、内存分配、退出,
+全程不碰任何用户态可 hook 符号,且检测代码在 VASCODSK 内混淆。**用户态 tweak（MSHookFunction/
+fishhook/ObjC swizzle）无法拦截。** 这与历史 hsbcchina 10+ 轮失败一致,是目前遇到的最强 RASP。
+
+剩余理论路径(都超出常规 tweak,成本/风险高):
+1. **内核态**:KPP/PPL 之外的内核 hook 拦 syscall(需 kernel patch,当前越狱未必支持,风险高)。
+2. **patch VASCODSK 磁盘二进制**:定位混淆检测函数改其返回/跳转,但有完整性自检 + 签名,
+   且函数混淆难定位、跨版本不稳。
+3. **syscall 层拦截**:hook `svc` 不可能(用户态);唯一是内核 sysent 或 dyld 的 syscall shim。
