@@ -1015,3 +1015,30 @@ SIGKILL:不可捕获、无 crash log、无 svc、无异常 —— **完美符合
 请用户**亲手点图标**启动汇丰中国,肉眼看:是立即闪退(越狱检测)?还是能进入界面/停留更久?
 对比 SSH uiopen 的 260ms 退出。若点图标能正常/久留 → 之前的"退出"是 uiopen 假象,
 真正的越狱检测行为需要重新用点图标观测。
+
+## Round 30（2026-08-21,MAX — 定位退出模块=hsbcchinax OLLVM 混淆状态机 ★★★）
+
+### 主线程 PC 采样(环形缓冲抓退出瞬间)决定性定位
+高频采样主线程 PC(环形缓冲留最后60条),退出前主线程执行点:
+- **438/450+ 采样在 `hsbcchinax`**(其他模块个位数噪声)→ 退出代码在 hsbcchinax。
+- 退出瞬间最后热点:`hsbcchinax+0x630430`(状态机节点)、`+0x65bfa8`(hash 循环)。
+- 调用来源 LR:hsbcchinax+0x43ccd0 / 0x3802b0 / 0x713ec8 等(多入口调同一逻辑)。
+
+### hsbcchinax = 汇丰核心扩展,退出逻辑用 OLLVM 控制流扁平化混淆
+- hsbcchinax **import 无 exit/abort、svc=0**(llvm-objdump)——自己不直接退出,间接调用。
+- 0x630430 反汇编:大量 `cmp w17,wN; b.eq/b.ne` + magic 常量(0xcd1/0x5393、0x1a26/0x1d34)
+  = 典型 **OLLVM 控制流扁平化 dispatcher**。0x65bfa8 是 madd/ror/mul 的 hash 循环。
+- 检测+退出决策都在这段混淆代码里。这是最后的硬骨头。
+
+### 确认的完整定位链(30轮收敛)
+真凶 = **主二进制 China + hsbcchinax**(汇丰自研)的越狱检测,不是任何第三方风控 SDK。
+- 检测逻辑:hsbcchinax 的 OLLVM 混淆状态机(0x630430 区 / 0x65bfa8 hash)。
+- 退出:间接调用(具体退出 syscall 点仍被混淆隐藏,无 svc/exit import 说明可能跳转到
+  其他模块的退出封装,或运行时解密的 stub)。
+- 主线程绝大部分时间在此执行直到 ~500ms 退出。
+
+### patch 策略候选
+1. 反混淆 hsbcchinax 的 OLLVM dispatcher,定位"越狱判定→退出"分支,patch 分支。工作量大。
+2. 找 hsbcchinax 如何间接调用退出(它无 exit import,但主线程从这里退出)——追 0x630430
+   状态机的出口跳转,可能跳到某 framework 的退出封装或函数指针表。
+3. 二分:patch hsbcchinax 的 0x65bfa8 hash 循环 / 0x630430 状态机入口,看能否阻断。
