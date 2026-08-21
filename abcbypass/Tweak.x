@@ -249,6 +249,25 @@ static void hookABCJailbreakMethods(void) {
     if (allClasses) free(allClasses);
 }
 
+// 源头阻断 (纯 ObjC swizzle, 安全, 不触发完整性校验):
+// -[DTFrameworkInterface initRiskManage] 内创建并投递那个检测 block
+// (invoke=MbapMPaaS+0x8dad68), block 在越狱时判定 [receiver action]==3 -> exit(0)。
+// swizzle initRiskManage 直接 return, 使风险管理不初始化 -> 检测 block 永不创建/投递。
+static void hookInitRiskManage(void) {
+    Class cls = objc_getClass("DTFrameworkInterface");
+    if (!cls) { abc_log("DTFrameworkInterface not found — initRiskManage hook skipped"); return; }
+    SEL sel = sel_registerName("initRiskManage");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { abc_log("initRiskManage method not found"); return; }
+    char rt[8] = {0};
+    method_getReturnType(m, rt, sizeof(rt));
+    // 返回类型为 void (v) — 替换为空实现
+    method_setImplementation(m, imp_implementationWithBlock(^void(id self) {
+        abc_log("initRiskManage NEUTRALIZED (risk manager init skipped — detection block never scheduled)");
+    }));
+    abc_log("initRiskManage swizzled (rettype=%c)", rt[0] ? rt[0] : '?');
+}
+
 static void hookAuthorityJailBreakFlag(void) {
     unsigned int classCount = 0;
     Class *allClasses = objc_copyClassList(&classCount);
@@ -1598,6 +1617,7 @@ static void hookDetectionByOffset(void) {
     hookSmAntiFraud();
     hookIOSSecuritySuite();
     hookABCJailbreakMethods();
+    hookInitRiskManage();
     hookAuthorityJailBreakFlag();
     hookShowJailBrokenAlert();
     abc_log("all ObjC jailbreak hooks armed (ctor)");
