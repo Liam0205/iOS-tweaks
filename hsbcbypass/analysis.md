@@ -161,10 +161,47 @@ HSBC 自研 Swift 包装（VIPER 架构），符号里锁定两类可下手点�
 - `UntrustedDeviceInteractor`/`Presenter`/`Router`/`ViewController` —— 整套"不受信设备"
   响应流程；`SetupSecureModelStrategy`
 
+## Round 1（2026-08-21，探针 v3~v6 运行时观测）
+
+### 能自助启动了（不再依赖用户点图标）
+
+- 从 SSH 拉起必须带 `--bundle`：`uiopen --bundle cn.com.hsbc.hsbcchina` 才生效；
+  不带参数的 `uiopen cn.com.hsbc.hsbcchina` 返回 0 但不拉起（之前误判为"起不来"的根源）。
+- 用探针日志文件 `…/67AD6C38…/tmp/hsbc_probe.log` 作为"是否真启动"的可靠信号。
+- Choicy 已对汇丰放开注入，dpkg 用 `sudo -n` 可无密码安装。
+
+### 退出时机与检测层级（关键）
+
+探针加了**时间戳 + 心跳线程(每 50ms 落一条) + RASPFramework Swift 入口 hook**，实测：
+
+- App 注入后**存活约 440~450ms**，然后进程被杀，心跳戛然而止（很规律，像定时检查点）。
+- `RASPAppController.init`（off 0x6508）**从未进入**。
+- `RASPAppInteractor.setupSecureModel`（off 0x6a70）**从未进入**。
+
+⇒ **检测与退出发生在 RASPFramework 的 Swift 入口之前**。RASPFramework 只是 UI 响应层
+（弹窗/拦截界面），检测源在更底层。
+
+### 检测源锁定 —— VASCODSK.framework
+
+探针启动瞬间 dump 全部 955 个 image，安全相关的只有四个（都在 App 自带 Frameworks）：
+
+| image | 角色 |
+|---|---|
+| **`VASCODSK.framework`** [106] | **OneSpan/VASCO DSK，RASP 检测核心（首要嫌疑）** |
+| `MobileSecurity.framework` [85] | HSBC 自研安全层 |
+| `RASPFramework.framework` [95] | HSBC 的 RASP UI 包装（VIPER，仅响应层） |
+| `UserSecurity*PluginKit` ×N | 认证 / 业务层，非越狱检测 |
+
+⇒ 约 450ms 的检测 + raw syscall 退出，最可能由 **VASCODSK** 在自己的初始化线程 / 定时器里
+完成，绕过 libc 和 RASPFramework Swift 层。这与历史"纯 OneSpan + raw syscall"结论一致，
+但现在**精确定位到了 image**。
+
 ### 下一步
 
-1. 脱壳主二进制 + 用 Mach-O 工具（设备端 nm/otool 或 macOS）解析 `jailbreak6status`/
-   `acceptJailbroken` 的符号地址（Linux nm 不认 Mach-O）。
-2. 扩展探针：hook 这些 Swift 方法确认哪个是判定源头，优先在**源头层**改返回值（最稳，
-   类似 abcbypass 的 `initRiskManage` 思路）。
-3. 汇丰香港（232MB，含 `.appex`）单独验证是否同一套 RASPFramework。
+1. 从设备拉取 `VASCODSK.framework/VASCODSK` 到 `app-binary/`，用 `llvm-nm`/`llvm-objdump`
+   分析其检测 / 退出相关符号（jailbreak 检测函数、定时器、svc 退出点）。
+2. VASCODSK 是否加密？若明文，找检测判定函数（返回越狱与否的布尔）在源头 hook 返回 false；
+   若检测→退出是一体的 C 函数，考虑 hook 该函数整体短路。
+3. 若 VASCODSK 有完整性自检（历史教训：C/C++ 静态库 + 自检 → 只能 ObjC swizzle），
+   需先确认 hook 方式不触发自检；abcbypass 的成功经验是找 ObjC/高层入口而非 patch text。
+4. 汇丰香港单独验证是否同一套 VASCODSK。
