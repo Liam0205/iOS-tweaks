@@ -43,7 +43,8 @@
 - `llmdoc/memory/reflections/deploy-via-reverse-tunnel.md`：反向隧道部署踩坑——端口号/用户名缺失导致试错、root vs mobile 约束、SSHTunnel 自举问题。
 - `llmdoc/memory/reflections/sshtunnel-autossh-development.md`：SSHTunnel 1.1.1-1.2.1 开发周期——autossh 集成的两个关键 bug（PATH 不传播、process group 继承杀死子进程）、iOS posix_spawn 约束总结。
 - `llmdoc/memory/reflections/abcbypass-round1-9.md`：ABCBypass v1-v81（9 轮迭代）——MSHookFunction 内存扫描触发、inline SVC 不可拦截、_Noreturn 栈切换、dispatch queue 损坏绕过、巡逻定时器策略演进。
-- `llmdoc/memory/reflections/abcbypass-round10-12.md`：ABCBypass v86-v95（3 轮迭代）——exit 存活策略全灭（栈损坏/嵌套 RunLoop/longjmp 状态损坏）、CFRunLoop 定时器拦截、SDK 识别为 mPaaS、ctor 重排序消除文件检测、发现第二检测路径（hook 完整性 + GCD dispatch_after）。
+- `llmdoc/memory/reflections/abcbypass-round10-12.md`：ABCBypass v86-v95（3 轮迭代）——exit 存活策略全灭（栈损坏/嵌套 RunLoop/longjmp 状态损坏）、CFRunLoop 定时器拦截、SDK 识别为 mPaaS、ctor 重排序消除文件检测、发现第二检测路径（hook 完整性 + GCD dispatch_after）。⚠️ 存活类结论受"grep 匹配到扩展进程"方法论错误影响，见 round13-16 更正。
+- `llmdoc/memory/reflections/abcbypass-round13-16.md`：ABCBypass 第13-16轮（2026-08-21）——**✅ 最终成功**。纠正致命方法论错误（`grep MbapMPaaS` 误匹配扩展进程 `group.abc.toolExtension`，导致大批存活结论失效）；二分定位 `0xb5a06000` 崩溃根因=libc inline-hook 触发完整性自检（自伤而非 ABC 检测）；最终方案=swizzle `-[DTFrameworkInterface initRiskManage]` 从源头消除 native exit，纯 ObjC swizzle 不触发校验，实测进入首页且交互正常。含可推广教训（先验证测量工具、裸跑对照区分自伤、有完整性自检的App只用ObjC swizzle）。
 - `llmdoc/memory/reflections/sshtunnel-v132-release.md`：SSHTunnel v1.3.2 发布反思——TCP 探测在 iOS sandbox 下不可用、sysctl(KERN_PROCARGS2) 替代 ps|grep、SSH 自愈参数组合消除外部健康检查需求、文档滞后复发。
 - `llmdoc/memory/reflections/simtouch-phase2-development.md`：SimTouch Phase 2 (v1-v24) 开发反思——事件克隆优于从零创建、Darwin notification 新通道不可靠、backboardd 沙箱写入限制、录制分析方法论、回放无效待查。
 - `llmdoc/memory/reflections/simtouch-phase3-development.md`：SimTouch Phase 3 (v25-v36) 开发反思——pinch 从零创建 vs 克隆的条件性规则、sbreload 不重启 backboardd 部署陷阱、DIAG_NOTIFY 诊断通知从未工作。
