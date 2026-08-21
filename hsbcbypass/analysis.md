@@ -371,3 +371,42 @@ vmRegionInfo: 0x1162f4000-0x1162f8000 [16K] r-x/rwx SM=PRV  "Memory Tag 255"
 ⇒ **两个 App 同一套 OneSpan RASP 机制**。攻破汇丰中国的检测判定后，香港大概率同法可解，
 一份 tweak（两个 bundle filter）有望覆盖两者。香港主二进制同样只 1 页加密，可用相同的
 tweak 内存脱壳法离线分析。
+
+## Round 7（2026-08-21，定位检测判定类 —— 决定性突破）
+
+### 手工解析 ObjC 元数据（lief 社区版不带 objc，自写 Python 解析）
+
+- `tmp/nlcls.py`：解析 `__objc_classlist`/`__objc_nlclslist`，处理 iOS15 chained-fixup
+  指针（真实 VA = 低32位 + 0x100000000）。
+- `tmp/cls_methods.py`：解析类的 baseMethods，列方法名+imp 地址。
+
+### 检测核心类 = `AppSecurityMonitor`（模块 `WithOneSpanRASP`）
+
+`__objc_classlist` 里找到 OneSpan RASP 的 Swift 类，**检测方法全是 ObjC 方法（可 swizzle！）**：
+
+| 方法 | imp 地址 | 说明 |
+|---|---|---|
+| `-[AppSecurityMonitor jailbreakStatus:]` | 0x100017d68 | 越狱检测（event码 2） |
+| `-[AppSecurityMonitor repackagingStatus:]` | 0x100017da8 | 重打包检测 |
+| `-[AppSecurityMonitor debuggerStatus:]` | 0x100017de8 | 调试器检测 |
+| `-[AppSecurityMonitor screenshotDetected]` | 0x100017e20 | 截屏 |
+| `-[AppSecurityMonitor libraryInjectionDetected]` | 0x100017e50 | **库注入检测（event码 5）** |
+| `-[AppSecurityMonitor hookingFrameworksDetected]` | 0x100017e80 | **hook框架检测（event码 6）** |
+| `-[AppSecurityMonitor developerModeStatus:]` | 0x100017eb8 | 开发者模式 |
+| `-[AppSecurityMonitor emulatorDetected]` | 0x100017ef0 | 模拟器 |
+
+- 相关类：`ActiveOneSpanRASPProvider`（无 baseMethods，纯 Swift）、`AppSecurityMonitor`。
+- 杀我们的大概率是 `jailbreakStatus:` + `libraryInjectionDetected` + `hookingFrameworksDetected`
+  （我们注入 tweak 必然触发后两者）。
+- 有 `+load` 的 non-lazy 类只有 2 个 ADEum（AppDynamics），**排除 `+load` 是检测点**。
+- `jailbreakStatus:`/`debuggerStatus:` 之前误以为是 AppDynamics（周围字符串是 ADEum），
+  实际是 `AppSecurityMonitor` 的方法（方法名区按字母排序才与 ADEum 相邻）。
+
+### 意义：回到 abcbypass 的成功路径
+
+这些是**标准 ObjC 方法**，可用 Logos `%hook AppSecurityMonitor` 覆盖，让检测返回"安全"值，
+无需碰底层 C / 内联 svc / RWX stub。下一步：
+1. 观测版 hook 这 8 个方法，记录调用顺序 + 返回值类型/值（带冒号的收 x2 参数，返回对象；
+   无参的返回状态）。
+2. 据观测确定"安全"返回值，改为始终返回未检测到。
+3. 注意 OneSpan 可能有完整性自检——ObjC swizzle 通常安全（abcbypass 验证），但需实测。
