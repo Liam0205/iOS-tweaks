@@ -939,3 +939,29 @@ syscall(正常退出,非崩溃、非信号)。由 import _exit 的 framework 执
 1. 定位 XChinaJourney 里 `_exit` 的 GOT stub 及所有调用点,反汇编调用链,找"检测越狱→_exit"。
 2. patch 那个调用点(把 bl _exit 改 nop,或把检测判定分支反转)。
 3. 验证:patch XChinaJourney 后 App 是否存活。
+
+## Round 27（2026-08-21,MAX — 定位 XChinaJourney 唯一 _exit 调用点 ★★）
+
+用 chained-fixups 脚本(tmp/xchina_chained.py)解析 XChinaJourney GOT:
+- `_exit` GOT VA=0x2041af8,`_mmap`=0x2042088,`_sysctl`=0x2042700,`_abort`=0x20418a8。
+- XChinaJourney **同时具备 _sysctl(检测)+ _mmap(RWX)+ _exit(退出)** 能力,真凶画像完整。
+
+追踪调用链:
+- 引用 _exit GOT 的代码只有 __stubs 里的 `_exit` stub @ **0x1b91594**(adrp+ldr 0xaf8+br)。
+- `bl 0x1b91594`(调 _exit)全 framework **只有 1 处:0x180abc0**。
+- 0x180abc0 上下文:
+  ```
+  180abb8: bl 0x1809138        ; 前置(打印/上报?)
+  180abbc: orr w0, wzr, #0x1   ; w0=1 (退出码)
+  180abc0: bl 0x1b91594        ; _exit(1)  ★唯一退出点
+  ```
+- 该退出函数(入口 0x180ab98)无直接 bl 调用者,通过对象 vtable(0x180ab40 处构造,存函数
+  指针 slot)间接 blr 调用 → 混淆的间接派发,所以之前静态难追。
+
+### ★ patch 方案(最接近成功)
+- 目标:XChinaJourney 文件偏移 **0x180abc0**(VA==fileoff,__TEXT vmaddr=0)
+- 原字节:`bl 0x1b91594` = `75 1a 0e 94`
+- patch 为:`nop` = `1f 20 03 d5`
+- 效果:唯一的 _exit(1) 调用变 nop,检测触发到这里也不退出。
+- 风险:若此 _exit 有正常业务用途会有副作用;但它是全 framework 唯一 _exit + 退出码1,
+  高度像"检测→异常退出"。先实验验证。
