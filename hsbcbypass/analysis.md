@@ -196,12 +196,34 @@ HSBC 自研 Swift 包装（VIPER 架构），符号里锁定两类可下手点�
 完成，绕过 libc 和 RASPFramework Swift 层。这与历史"纯 OneSpan + raw syscall"结论一致，
 但现在**精确定位到了 image**。
 
-### 下一步
+## Round 2（2026-08-21，VASCODSK 静态分析 + 策略转向）
 
-1. 从设备拉取 `VASCODSK.framework/VASCODSK` 到 `app-binary/`，用 `llvm-nm`/`llvm-objdump`
-   分析其检测 / 退出相关符号（jailbreak 检测函数、定时器、svc 退出点）。
-2. VASCODSK 是否加密？若明文，找检测判定函数（返回越狱与否的布尔）在源头 hook 返回 false；
-   若检测→退出是一体的 C 函数，考虑 hook 该函数整体短路。
-3. 若 VASCODSK 有完整性自检（历史教训：C/C++ 静态库 + 自检 → 只能 ObjC swizzle），
-   需先确认 hook 方式不触发自检；abcbypass 的成功经验是找 ObjC/高层入口而非 patch text。
-4. 汇丰香港单独验证是否同一套 VASCODSK。
+### VASCODSK 分析结果
+
+- **未加密**（`cryptid 0`，cryptsize 2.24MB），797 个符号，`llvm-nm` 可读。
+- Swift 层 `VascoDPSDK` 类全是 **Digipass OTP / 签名 API**（`GenerateSignature`、
+  `ChangePassword`、`GetDigipassProperty`、`ActivateOnlineWithFingerprint`…）——
+  这是 OneSpan 的**令牌功能，不是越狱检测**。
+- 越狱检测在 **C 层，混淆命名，无明文导出符号**；只 import 了 `_abort`。
+
+### 关键推论 —— 强硬模式，纯 C 检测 → raw syscall 直杀
+
+综合 Round 1+2：
+- 检测走**纯 C 路径**：检测到越狱 → 直接 `svc` 退出，**不经过 RASPFramework 的
+  UntrustedDevice/弹窗 UI 流程**（那些 Swift UI 类是"温和模式"给弹窗用的，此处未触发）。
+- 因此 hook RASPFramework Swift 层无意义（根本没走到）。退出动作是 raw syscall，也 hook 不了。
+
+### 策略转向 —— hook 检测「输入」而非「输出」
+
+历史教训：纯 C + 自检 + raw syscall，patch text / hook 退出都不行。但**检测函数必须先读
+环境**才能判定越狱：`stat`/`lstat`/`access`/`open`/`fopen` 探越狱路径、`sysctl`
+(`kinfo_proc`) 查被调试、`fork`/`getppid`、`dlopen`/`dladdr` 查注入、`readlink`、
+`_dyld_*` 枚举镜像找 tweak。**这些底层输入函数是可 hook 的 libc/dyld 符号**。
+abcbypass 的成功也是靠改检测输入，不是拦退出。
+
+**下一步（探针 v7，输入观测）**：hook 上述输入类函数，记录 App 在 0~450ms 内查询了哪些
+越狱路径 / 做了哪些检测调用，据此定位判定方式，再针对性伪造返回（路径不存在、进程未被调试、
+镜像列表干净）。
+- 注意排除心跳/探针自身产生的调用噪声。
+- 参考 abcbypass 的 `jb_paths[]` 与 fishhook GOT 改写手法（`abcbypass/Tweak.x`）。
+- 汇丰香港（含 `.appex`）稍后单独验证是否同一套 VASCODSK。
