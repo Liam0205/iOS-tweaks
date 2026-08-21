@@ -61,12 +61,24 @@ binary MbapMPaaS = 蚂蚁 mPaaS) 在越狱设备上正常可用。本阶段从"�
 5. **noreturn 函数的 hook 必须保持 noreturn 契约**（objc_exception_throw / exit 等），
    吞掉后 return 会崩。
 
-## Follow-up
+## 结果（已完成）
 
-1. 死代码清理（本轮进行中）：删除 exit-hook/栈切换/longjmp/drain/libc-hook 等全部
-   失败尝试，只留 ObjC swizzle + Logos hooks。
-2. 版本适配：ABC 升级后优先确认 `DTFrameworkInterface initRiskManage` 是否仍是
-   检测 block 宿主；若方法改名/重构，用 objcparse.py 重新定位 `0x8db260` exit 的
-   block invoke 宿主方法。
-3. 关注是否有第二条独立 exit 路径（本轮只确认了这一条；进入首页后长时间运行的
-   稳定性待长测）。
+1. ✅ **死代码清理完成**：`Tweak.x` 从 1660 行删到 483 行（删 1180 行），
+   移除 exit/信号 hook、栈切换、longjmp/drain 恢复子系统、全部 libc inline hook、
+   dispatch hook、__text patch 尝试、二分用的 `ABC_AGGRESSIVE`/`ABC_LIBC_HOOKS`
+   编译开关。只留 7 个 ObjC swizzle（含关键 `hookInitRiskManage`）+ 5 个 Logos
+   `%hook` + `abc_exception_handler` + `is_jb_path`。编译 0 error/warning，
+   复测存活>40s、进首页、交互正常。
+2. ✅ **跨版本/跨设备验证通过**：
+   - ABC 11.1.0 / iPhone 13 Pro / iOS 15.4.1（2215）
+   - ABC 11.2.0 / iPhone 14 Pro Max / iOS 16.3.1（2216，用户确认）
+   证实 swizzle 靠 ObjC 类名/方法名（mPaaS 稳定接口），不依赖地址偏移，跨版本/机型/iOS 通用。
+3. ✅ 长时间运行稳定（2215 上主 App 存活 >10min 无第二条 exit 路径杀掉）。
+
+## Follow-up（后续版本适配）
+
+- ABC 大版本升级后优先确认 `-[DTFrameworkInterface initRiskManage]` 是否仍是检测
+  block 宿主；若方法改名/重构，用 `abcbypass/tmp/objcparse.py`（手动解析
+  `__objc_classlist`，找 IMP ≤ block invoke 地址且最近的方法）重新定位宿主方法。
+- 若出现新的独立 exit 路径，用 `abctest.sh`（正确进程匹配）做裸跑对照，先区分
+  「ABC 检测」还是「自伤」，再定位。

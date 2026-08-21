@@ -1,178 +1,106 @@
 # ABC Bypass 架构
 
-> ⚠️ **2026-08-21 重大更正（第 15 轮）。** 本文档 v95 时期的多数"成功"结论
-> **不可信**，因为它们基于错误的存活检测（`grep MbapMPaaS` 命中后台扩展进程
-> `group.abc.toolExtension`，而非主 App）。经可信重测（`abctest.sh` 精确匹配
-> `MbapMPaaS.app/MbapMPaaS` 且排除 `PlugIns`）确认：
->
-> 1. **裸跑主 App ~13s 正常退出（无崩溃）**；**全量 hook 反而 ~1s 崩溃**。
-> 2. **`0xb5a06000` SIGSEGV 崩溃 = 对 libc 函数 inline-hook（MSHookFunction/fishhook）
->    被 ABC 完整性自检发现所致**。范围覆盖 stat/open/access/sysctl/dlopen/`_dyld_*`
->    等——**不止 libpthread，libc 普遍在校验内**。下方"libdispatch 安全""内存扫描器
->    不覆盖 libdispatch"等说法**未经可信验证，勿依赖**。
-> 3. **唯一确认安全的手段 = ObjC 方法 swizzle**（不改函数序言）。
-> 4. **硬约束：禁 C 函数 inline-hook、禁 fishhook GOT 改写、禁 __text patch、禁 Frida。**
->
-> **✅ 第 16 轮已解决**：native exit 的检测 block 定义在
-> `-[DTFrameworkInterface initRiskManage]` 内，**swizzle 该方法为空实现**即可从源头
-> 消除 exit，纯 ObjC swizzle 不触发完整性校验。实测主 App 存活并完整进入首页、交互正常。
-> 有效方案就这一个 swizzle，不需要任何 exit 拦截/栈切换/longjmp/libc hook。
->
-> 下方原始内容（四阶段 ctor、栈切换、双通道杀死、longjmp 恢复等）**几乎全部是失败尝试
-> 的历史存档，已在代码中删除**。事实以本框、`analysis.md` 第 15-16 轮、
-> `reference/abc-detection-vectors.md` 为准。
-
 ## 架构目标
 
-`abcbypass/Tweak.x` 对抗中国农业银行 (com.bankabc.iphonerelease) v11.1.0 的越狱检测与退出杀死链路。当前版本 v0.1.0-95，状态：活跃开发中（尚未发布）。
+`abcbypass/Tweak.x` 绕过中国农业银行 (`com.bankabc.iphonerelease`) 的越狱检测与
+检测后 `exit(0)` 杀进程链路，使其在越狱设备上正常运行。
 
-目标 Binary：`MbapMPaaS`（~110MB arm64）——已确认为蚂蚁金服 mPaaS 框架，它封装了 UIApplicationMain 并控制整个 App 生命周期。
+- 目标 Binary：`MbapMPaaS`（~110MB arm64）= 蚂蚁金服 **mPaaS** 框架，封装了
+  `UIApplicationMain` 并控制整个 App 生命周期。
+- **已验证可用**：ABC 11.1.0 / iPhone 13 Pro / iOS 15.4.1；ABC 11.2.0 /
+  iPhone 14 Pro Max / iOS 16.3.1。进入首页、交互正常、长时间运行稳定。
 
-## 整体执行模型
+## 核心方案：纯 ObjC swizzle（一句话）
 
-入口为 `__attribute__((constructor))`，分四阶段执行（v95 ctor 重排序后）：
+**swizzle `-[DTFrameworkInterface initRiskManage]` 为空实现**，从源头消除检测退出。
 
-### 阶段 1：ctor 立即 — fishhook 文件系统 hook（最高优先）
+- 触发退出的检测 block（在 11.1.0 上 invoke=`MbapMPaaS+0x8dad68`，含
+  `cmp w24,#3` → `bl _exit`，`w24=[receiver action]`，==3 即风险）**定义在
+  `-[DTFrameworkInterface initRiskManage]` 方法体内**。
+- 把该方法替换成空 `void` 实现 → 风险管理不初始化 → 检测 block 永不创建/投递 →
+  `exit` 从源头消失。
+- **关键：ObjC 方法 swizzle 不改任何函数序言字节，因此不触发 ABC 的完整性自检**
+  （这正是所有 C 函数 inline-hook 方案失败的根因，见下）。
+- 方案靠 ObjC 类名/方法名（mPaaS 稳定接口），**不依赖地址偏移**，故跨 ABC 小版本、
+  机型、iOS 版本通用。上面的偏移仅是 11.1.0 的定位依据，运行时不使用。
 
-在 ctor 时**第一步**执行 fishhook rebind，确保在 SDK 的 ObjC class scanning 之前就位：
-- 文件路径隐藏：stat/lstat/access/open/fopen/opendir/readdir/realpath/readlink/statfs/statvfs
-- 动态库枚举：_dyld_image_count/_dyld_get_image_name
-- 系统信息：sysctl/sysctlbyname
-- 环境变量：getenv
+## 执行模型（%ctor，全部同步完成）
 
-**关键发现（v95）**：fishhook 必须先于 ObjC hook 安装。SDK 在 ObjC class scanning 期间调用 stat/access/fopen 检查越狱文件，如果此时文件 hook 尚未安装则检测已完成。
+`%ctor` 极简，只做 ObjC 层的安装，无延迟 hook、无 C 函数 hook：
 
-### 阶段 2：ctor 立即 — CFRunLoop hook
+1. 初始化日志（`/var/jb/tmp/abcbypass.log`，回退到 App 容器 Documents）。
+2. 设 `NSUserDefaults` 的 `kUPWHomePageJailBrokenToastNotAgainKey=YES`（抑制越狱提示）。
+3. `NSSetUncaughtExceptionHandler(abc_exception_handler)`（仅记录异常，不吞）。
+4. 安装 7 个 ObjC swizzle：
+   - `hookSecureUtilityPlus` — SecureUtilityPlus 的 jailbreak/检测 selector 返回 NO/空
+   - `hookSmAntiFraud` — 数美反欺诈初始化/检测方法中和
+   - `hookIOSSecuritySuite` — 标准 `amIJailbroken` 系列返回 NO
+   - `hookABCJailbreakMethods` — 遍历类表，中和 `isJailbroken`/`checkIsJailBreak`/
+     `isDeviceJailBreak` 等越狱判定方法
+   - **`hookInitRiskManage`** — 核心，空实现（见上）
+   - `hookAuthorityJailBreakFlag` — `authorityWithJailBreakFlag:` 传入 flag 强制清零
+   - `hookShowJailBrokenAlert` — 越狱弹窗方法空实现
 
-紧接文件 hook 之后安装 CFRunLoop 层 hook：
-- `CFRunLoopAddTimer`（MSHookFunction）：追踪并可选阻断 SDK 注册的定时器
-- `CFRunLoopRunSpecific`（MSHookFunction）：在 RunLoop 入口设置 `setjmp` 恢复点
+Logos `%hook`（编译期静态注册，等价 ObjC swizzle）：
 
-### 阶段 3：ctor 立即 — ObjC hook
+- `NSFileManager` — `fileExistsAtPath:` 等对越狱路径返回 NO、目录列举过滤
+- `UIApplication` — `canOpenURL:` 屏蔽 cydia/sileo/filza scheme；`terminateWithSuccess`
+  与 `_terminateWithStatus:`（<30s 视为检测退出，直接拦下不 `%orig`，作为安全网）
+- `UIAlertController` — 标题/正文含"越狱/jailbr/安全/root"的弹窗替换为空并阻止 present
+- `UIViewController` — 阻止被标记的越狱弹窗 present
+- `NSProcessInfo` — `environment` 移除 `DYLD_INSERT_LIBRARIES`/`_MSSafeMode`
 
-- ObjC swizzle（method_setImplementation）：SecureUtilityPlus 13 个 Checker 类、IOSSecuritySuite、ABC 专有越狱检查方法
-- 弹窗抑制
+`is_jb_path` 是唯一的 C 辅助函数（纯字符串比较，不 hook 任何东西）。
 
-### 阶段 4：dispatch_after(200ms) 延迟执行
+## 核心约束：禁止一切 C 函数 inline-hook
 
-延迟是为避免 BSXPCServiceConnection SIGTRAP（ctor 时直接 hook exit 触发）。
+ABC（mPaaS）有 **内存完整性自检**（`memmem`，运行在 GCD worker 线程），会发现对
+**libc 广泛函数**的 inline-hook / GOT 改写。二分实验（第 15 轮）证实：
+MSHookFunction 覆盖 `stat/lstat/access/open/fopen/realpath/readlink/sysctl/getenv/
+fork/dlopen/dlsym` 及 `_dyld_*` 后，启动 ~1s 就在后台 GCD 线程跳到**固定哨兵地址
+`0x00000000b5a06000`** 触发 SIGSEGV（地址每次相同 ⇒ 主动触发，非随机内存错误）。
 
-延迟执行内容：
-- fishhook：exit/_exit/abort/kill/signal/pthread_kill/__stack_chk_fail/objc_exception_throw/posix_spawn/sigaction/pthread_create
-- MSHookFunction（inline hook）：dispatch_async/dispatch_async_f
+**硬约束（对 ABC 必须遵守）：**
 
-### 阶段 5：检测触发（~15s 后）
+- ❌ 禁 C 函数 inline-hook（MSHookFunction 任何 libc/系统函数）
+- ❌ 禁 fishhook GOT 改写
+- ❌ 禁 `__text` patch（同一完整性自检会发现，第 13 轮已证实 SIGILL 崩溃）
+- ❌ 禁 Frida（反注入，spawn 时 frida-agent 注入即在 dyld 早期自毁）
+- ✅ 只用 ObjC 方法 swizzle（Logos `%hook` / `method_setImplementation`）——不改序言字节
 
-检测在启动约 15 秒后触发：
-- **CFRunLoop 定时器通道**：注册一次性 CFRunLoopTimer（delay 5-60s）触发 exit(0)
-- **GCD dispatch_after 通道**：通过 dispatch_after 延迟投递 exit block 到 main queue
-
-两个通道冗余执行，当前 CFRunLoop 通道已被拦截，GCD 通道尚未拦截。
-
-## 核心约束：禁止一切 C 函数 inline-hook（第 15 轮更正）
-
-SDK 内存完整性扫描器（`memmem`，运行在 GCD worker 线程）会检测 **libc 广泛函数**的
-inline hook / GOT 改写。二分实验证实：MSHookFunction 覆盖
-`stat/lstat/access/open/fopen/realpath/readlink/sysctl/getenv/fork/dlopen/dlsym`
-及 `_dyld_*` 后，启动 ~1s 触发后台线程跳到固定哨兵地址 `0x00000000b5a06000` 的
-SIGSEGV（地址每次相同 ⇒ 主动触发）。
-
-> ⚠️ **旧说法"MSHookFunction 对 libdispatch 安全 / 内存扫描器不覆盖 libdispatch"
-> 及"仅 libpthread 不安全"均未经可信验证。** 已确认范围至少覆盖上述 libc 函数。
-> 保守结论：**对 ABC 任何 C 函数都不要 inline-hook**；越狱绕过只用 ObjC swizzle。
-
-## Hook 策略（混合方案）
-
-| 方法 | 目标 | 原因 |
-|------|------|------|
-| MSHookFunction (inline) | dispatch_async, dispatch_async_f | 捕获 ALL callers 包括 shared cache 内部调用（560+ 次重定向 vs fishhook 仅 5 次） |
-| MSHookFunction (inline) | CFRunLoopAddTimer | 拦截 SDK 注册的杀死定时器（一次性、delay>5s） |
-| MSHookFunction (inline) | CFRunLoopRunSpecific | 提供 setjmp 恢复点，longjmp 从 exit 中逃逸（backup） |
-| fishhook (PLT/GOT) | exit, _exit, abort, kill, signal, pthread_kill, __stack_chk_fail, objc_exception_throw, posix_spawn, sigaction, pthread_create | 安全于 SDK 扫描器 |
-| fishhook (PLT/GOT) | stat, access, fopen, open, ... | 文件系统级越狱隐藏 |
-| ObjC swizzle | SecureUtilityPlus (13 classes), IOSSecuritySuite, ABC 方法, 弹窗 | runtime 层替换 |
-| Logos %hook | NSFileManager, UIApplication, UIAlertController, NSProcessInfo | 标准 ObjC hook |
-
-## 退出生存机制
-
-### 1. exit 拦截
-
-`hooked_exit()` 阻止 exit 调用，设置 `g_exit_blocked=1`。
-
-### 2. ARM64 栈切换
-
-exit 是 `_Noreturn` 函数，拦截后"返回"会导致 SIGSEGV 级联。解决方案是 ARM64 inline asm 栈切换到干净 trampoline：
-
-```
-mov sp, <clean_stack>
-mov x29, #0
-mov x30, <trampoline_fn>
-ret
-```
-
-### 3. Trampoline 执行
-
-栈切换后 trampoline 执行：
-1. 挂起所有未命名线程（冻结检测线程）
-2. 安装 0.3s 巡逻定时器（patrol timer），持续检测并挂起新创建的检测线程
-3. 进入 CFRunLoopRun 保持存活
-
-### 4. dispatch_async 重定向
-
-当 `g_exit_blocked && queue == main_queue` 时，`hooked_dispatch_async` 将 block 重定向到：
-```
-CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, block)
-```
-
-原因：栈切换破坏了 dispatch queue 的内部状态，直接使用 dispatch_async 到 main queue 不再可靠。CFRunLoop 是独立于 GCD 的替代调度路径。
-
-### 5. CFRunLoop 定时器拦截（v92+）
-
-`hooked_CFRunLoopAddTimer` 过滤以下定时器注册：
-- 一次性定时器（非 repeating）
-- delay 在 5-60 秒范围
-- 目标为 main RunLoop
-
-匹配的定时器被直接丢弃，不注册到 RunLoop。此机制成功阻止了 CFRunLoop 通道的 kill timer。
-
-### 6. longjmp 恢复（备用，当前不完善）
-
-`hooked_CFRunLoopRunSpecific` 在 RunLoop 入口执行 `setjmp`，当 exit 被调用时 `longjmp` 回到 setjmp 点。
-
-**限制**：longjmp 机械上成功（无 crash），但跳过了 CF RunLoop 内部的 timer callback 清理逻辑，导致 RunLoop 内部状态损坏 → UI 冻结。当前仅作为 backup 机制保留。
+> 旧文档曾称"MSHookFunction 对 libdispatch 安全 / 内存扫描不覆盖 libdispatch / 仅
+> libpthread 不安全"——**均未经可信验证，已作废**。保守结论：任何 C 函数都不要 hook。
 
 ## 与 ICBC bypass 的关键差异
 
 | 维度 | ICBC | ABC |
 |------|------|-----|
-| MSHookFunction | 禁用（MSHookFunctionChecker prologue 检测） | 部分可用（libdispatch 安全，libpthread 不安全） |
-| 检测杀死机制 | ObjC 层冻结 + exit | svc #0x80 直接 syscall（不可 hook） |
-| 退出 hook 策略 | RunLoop + 非主线程 block | 栈切换 + CFRunLoop trampoline |
-| Dispatch queue | 正常 | 栈切换后损坏，通过 CFRunLoop 绕过 |
-| 线程管理 | 不需要 | Mach thread suspend + 巡逻定时器 |
-| 冻结对抗 | semaphore_wait 拦截 + UI 状态保护 | 不需要（ABC 不使用冻结循环） |
-
-## 已知未解决问题
-
-- **GCD dispatch_after 杀死通道**：SDK 通过 `dispatch_after` 投递 exit block，完全绕过 CFRunLoop 定时器拦截。GCD 定时器无法用相同方式 hook（无类似 CFRunLoopAddTimer 的注册 API）。
-- **Hook 完整性检测（第二检测路径）**：即使越狱文件检测和 ObjC 检测均已绕过，SDK 仍有第二条检测路径（疑似 FishHookChecker 或 GOT 完整性校验）触发 exit。
-- **longjmp UI 恢复失败**：longjmp 跳过 CF RunLoop 内部状态清理，导致 timer callback cleanup 缺失 → UI 永久冻结。
-- **UI 完全恢复**：退出拦截后 UI 不能完全恢复正常。巡逻定时器可能过度挂起 GCD worker 线程，导致渐进式 UI 退化。
-- **svc #0x80 后台杀死**：SmAntiFraud 后台线程执行 svc #0x80 直接 _exit()，用户态完全不可拦截。当前通过线程挂起缓解，但无法根本阻止。
-- **Dispatch queue 损坏**：栈切换的副作用，通过 CFRunLoop 绕过但非根本解决。
+| 有效手段 | fishhook + Logos + semaphore 拦截 | **仅 ObjC swizzle**（C 函数 hook 会触发完整性自检崩溃） |
+| 退出机制 | ObjC 层冻结 + exit | 检测 block 判定 `[receiver action]==3` → `exit(0)` |
+| 对抗策略 | 拦冻结循环 + 保护 UI 状态 | swizzle 检测 block 宿主方法，源头消除 exit |
+| 完整性自检 | 无（fishhook 可用） | 有（覆盖 libc 广泛函数，禁一切 inline-hook） |
 
 ## 依赖与边界
 
-- 构建依赖：Theos、fishhook（项目内）、libsubstrate（MSHookFunction）、UIKit/Foundation
-- 打包依赖：rootless scheme
-- 注入边界：限定 `com.bankabc.iphonerelease`
-- 测试设备：iPhone 13 Pro / iOS 15.4.1 / Dopamine 1.x
-- 实验记录：`abcbypass/analysis.md`（12 轮，v1-v95）
+- 构建：Theos、libsubstrate（仅用于 Logos runtime，不主动 MSHookFunction）、UIKit/Foundation
+- 打包：rootless scheme；注入边界限定 `com.bankabc.iphonerelease`
+- 定位工具：`abcbypass/tmp/objcparse.py`（手动解析 `__objc_classlist`，用 IMP ≤ block
+  invoke 地址且最近者定位 block 宿主方法）、`abcbypass/tmp/abctest.sh`（可信进程测试）
+- 实验历史：`abcbypass/analysis.md`（第 15-16 轮为最终可信结论）
 
-## 主要回归风险
+## 主要回归风险（版本适配检查顺序）
 
-- SmAntiFraud 升级扩展 svc #0x80 路径覆盖（更多 syscall 更早执行）
-- 内存扫描器范围扩大（覆盖 libdispatch → MSHookFunction 全部不可用）
-- 检测触发时机前移（<200ms → 延迟 hook 窗口关闭）
-- 巡逻定时器误挂起关键 GCD worker → 功能性退化
-- mPaaS 框架升级引入新检测模块
+1. `-[DTFrameworkInterface initRiskManage]` 是否仍是检测 block 宿主（改名/重构则用
+   `objcparse.py` 重新定位）
+2. 是否新增独立 exit 路径（用 `abctest.sh` 裸跑对照，先区分「检测」vs「自伤」）
+3. SecureUtilityPlus / SmAntiFraud 是否新增检测类或方法
+4. mPaaS 框架大版本升级引入新检测模块
+
+## 历史教训（勿重蹈）
+
+- **存活检测必须精确匹配主 App 进程**：`ps -eo args | grep -E
+  'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。曾用 `grep MbapMPaaS` 误匹配
+  后台扩展 `group.abc.toolExtension`，导致大批"存活成功"结论失效、在假信号上反复打补丁。
+- **崩溃先问"是不是自伤"**：卸载 tweak 裸跑对照 + 二分编译开关，快速区分 ABC 检测与
+  自身 hook 副作用。此前大量"检测"其实是 libc inline-hook 触发完整性自检的自伤。
+- 详见 `memory/reflections/abcbypass-round13-16.md` 与 `reference/abc-detection-vectors.md`。

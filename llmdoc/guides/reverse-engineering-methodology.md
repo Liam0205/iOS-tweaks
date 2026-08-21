@@ -226,12 +226,41 @@
 - 不要在未确认退出机制前就开始扩大 Hook 覆盖面
 - 不要连续多轮“试试看”而不记录每轮结论
 - 不要假设所有 RASP 都走 ObjC delegate 或 libc 退出路径
+- 不要信任未经核实的测量工具（进程匹配、存活判断），先证明工具对，再信结果
+- 崩溃时不要默认是「目标的检测」，先做裸跑对照排除「自己的 hook 自伤」
 
 这些反模式的共同问题是：
 
 - 它们制造改动，但不制造认知
 - 它们让结果无法归因
 - 它们会把项目带入“越来越多 Hook、越来越少确定性”的状态
+
+### 先排除“自伤”，再谈“检测”
+
+当注入后出现崩溃或提前退出，第一反应不应是“目标又加了新检测”，而是先区分是
+**目标的检测**还是**自己的 hook 引入的副作用（自伤）**：
+
+- **裸跑对照**：卸载 tweak 让目标裸跑，记录其原始行为（退出时间、是否崩溃、crash 特征）。
+  若带 tweak 比裸跑**死得更早或崩溃形态不同**，问题极可能在自己的 hook。
+- **二分编译开关**：用 `#if` 把 hook 分组（如 libc-hook 组、aggressive 组、ObjC-swizzle 组），
+  逐组开关，定位是哪一类 hook 引入了问题。
+- **固定哨兵地址的崩溃**：`EXC_BAD_ACCESS` 跳到**每次都相同**的地址，通常是目标的
+  anti-tampering **主动触发**（完整性自检发现 hook 后跳垃圾指针自杀），而非随机内存错误。
+
+abcbypass 的 `0x00000000b5a06000` 崩溃就是典型：折腾多轮当成「ABC 的时序敏感检测」，
+二分后发现根因是**自己对 libc 函数 inline-hook 触发了目标的内存完整性自检**。
+
+### 有完整性自检的目标：只用 ObjC swizzle
+
+部分强 RASP（银行类 mPaaS 框架等）带**内存完整性自检**，会扫描并发现对函数序言的
+inline-hook / GOT 改写 / `__text` patch。对这类目标：
+
+- ❌ C 函数 inline-hook（MSHookFunction）、fishhook GOT 改写、`__text` 运行时 patch
+  都会被发现并触发崩溃（范围可能覆盖 libc 广泛函数，不止某几个）。
+- ✅ **ObjC 方法 swizzle 安全**——它改的是 objc 方法表，不改函数序言字节。
+- **最优解常在 ObjC 层**：定位「检测判定 / 退出逻辑」所在的 ObjC 方法，整体 swizzle 短路，
+  远胜于 hook `exit` 后用 longjmp/栈切换事后抢救（后者破坏 CF/GCD/UIKit 内部状态，不可恢复）。
+- 靠**类名/方法名**定位的 swizzle 不依赖地址偏移，天然跨目标小版本/机型/系统版本通用。
 
 ## 实操规范
 
@@ -271,6 +300,19 @@ sleep 5 && ssh root@<ip> "ps -ef | grep '<ProcessName>' | grep -v grep"
 - 启动后至少观察 10 秒再判断存活（有些检测有延迟）
 - 如果进程不存在，立即检查 crash log：`ls -lt /var/mobile/Library/Logs/CrashReporter/ | head -5`
 - 下载 crash log 到本地 `tmp/` 用 python 解析（JSON 格式 .ips 文件）
+
+> ⚠️ **必须精确匹配主 App 进程，排除 App Extension（`.appex`）**。很多 App 带常驻
+> 后台扩展进程（如 ABC 的 `group.abc.toolExtension`），进程名/路径包含主 binary 名。
+> 用宽松的 `grep <BinaryName>` 会匹配到扩展进程，把「扩展存活」误判成「主 App 存活」，
+> 从而在**假的存活信号**上反复打补丁——这在 abcbypass 上直接导致多轮结论失效。
+> 正确做法是匹配主可执行文件的完整路径并排除 `PlugIns`：
+>
+> ```bash
+> ps -eo pid,etime,args | grep -E '<BinaryName>\.app/<BinaryName>( |$)' | grep -v PlugIns | grep -v grep
+> ```
+>
+> 把这段固化成一个可复用的测试脚本（参考 `abcbypass/tmp/abctest.sh`：逐秒探测存活 +
+> 对比 CrashReporter 新增判定「崩溃」还是「正常退出」），比每次手敲 grep 可靠得多。
 
 ### Crash log 快速解析
 

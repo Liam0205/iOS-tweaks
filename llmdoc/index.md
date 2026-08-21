@@ -14,7 +14,7 @@
 
 - `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
-- `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构——四阶段 ctor 加载（fishhooks-first 顺序）、MSHookFunction + fishhook 混合策略、CFRunLoopAddTimer 定时器拦截、CFRunLoopRunSpecific longjmp 备用恢复、ARM64 栈切换退出生存、双通道杀死对抗（CFRunLoop timer + GCD dispatch_after）、与 icbcbypass 的关键差异。
+- `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构（2026-08-21 重写为最终方案）——**核心=纯 ObjC swizzle `-[DTFrameworkInterface initRiskManage]` 为空实现**，从源头消除检测退出 block；极简 `%ctor`（7 个 ObjC swizzle + 5 个 Logos hook，无 C 函数 hook）；核心约束「禁一切 C 函数 inline-hook/fishhook/__text patch/Frida，只用 ObjC swizzle」（ABC 有内存完整性自检，libc inline-hook 触发 `0xb5a06000` 崩溃）；已验证 11.1.0/iOS15.4.1 + 11.2.0/iOS16.3.1；版本适配检查顺序与历史教训。
 - `llmdoc/architecture/lianjiabypass-architecture.md`：lianjiabypass 的架构——链家/贝壳找房共用同一检测栈（JGBSDK/du/a/senseid）、四层对抗（文件检测 fishhook + dyld 镜像枚举作用域限定与 vis-map 缓存 + a.framework 注入检测 MSHookFunction + JGBSDK 内联 svc exit 运行时 __text patch）、W^X 权限流程教训、与 abcbypass 的关键差异。
 - `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.2 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、进程存活健康检查、指数退避自动重连、LaunchDaemon 开机持久化、sysctl 孤儿进程检测。
 - `llmdoc/architecture/simtouch-architecture.md`：SimTouch 架构——双路径设计（HID 事件注入 for 常规触摸 + SpringBoard 私有 API for 系统手势）、_BKHandleIOHIDEventFromSender hook + 事件克隆注入、单次 IPC swipe 轨迹生成、gesture arbiter 投递路径限制、录制/回放引擎、Phase 3 新增自定义曲线/键盘输入/多指 pinch。
@@ -31,7 +31,7 @@
 
 - `llmdoc/guides/build-deploy.md`：本地构建、Linux 交叉编译、部署到设备、反向隧道工作流、部署后验证、各 tweak 回归关注点。
 - `llmdoc/guides/ci-cd-release.md`：发版 tag 规则、CI Release/Build workflow、gh-pages 部署流程、macOS CI 缺私有 framework stub 的两种修复路径、CI 矩阵 fail-fast 配置、Logos 跨平台注意事项、发版检查清单。
-- `llmdoc/guides/reverse-engineering-methodology.md`：逆向分析与反检测对抗的实验方法论、诊断顺序与 analysis.md 记录纪律。
+- `llmdoc/guides/reverse-engineering-methodology.md`：逆向分析与反检测对抗的实验方法论、诊断顺序与 analysis.md 记录纪律。含（2026-08-21 补充）进程存活监控必须排除 App Extension（`.appex`）避免误判、「先排除自伤再谈检测」（裸跑对照 + 二分开关 + 固定哨兵地址崩溃识别）、有完整性自检的目标只用 ObjC swizzle。
 
 ## memory/reflections/
 
@@ -44,7 +44,7 @@
 - `llmdoc/memory/reflections/sshtunnel-autossh-development.md`：SSHTunnel 1.1.1-1.2.1 开发周期——autossh 集成的两个关键 bug（PATH 不传播、process group 继承杀死子进程）、iOS posix_spawn 约束总结。
 - `llmdoc/memory/reflections/abcbypass-round1-9.md`：ABCBypass v1-v81（9 轮迭代）——MSHookFunction 内存扫描触发、inline SVC 不可拦截、_Noreturn 栈切换、dispatch queue 损坏绕过、巡逻定时器策略演进。
 - `llmdoc/memory/reflections/abcbypass-round10-12.md`：ABCBypass v86-v95（3 轮迭代）——exit 存活策略全灭（栈损坏/嵌套 RunLoop/longjmp 状态损坏）、CFRunLoop 定时器拦截、SDK 识别为 mPaaS、ctor 重排序消除文件检测、发现第二检测路径（hook 完整性 + GCD dispatch_after）。⚠️ 存活类结论受"grep 匹配到扩展进程"方法论错误影响，见 round13-16 更正。
-- `llmdoc/memory/reflections/abcbypass-round13-16.md`：ABCBypass 第13-16轮（2026-08-21）——**✅ 最终成功**。纠正致命方法论错误（`grep MbapMPaaS` 误匹配扩展进程 `group.abc.toolExtension`，导致大批存活结论失效）；二分定位 `0xb5a06000` 崩溃根因=libc inline-hook 触发完整性自检（自伤而非 ABC 检测）；最终方案=swizzle `-[DTFrameworkInterface initRiskManage]` 从源头消除 native exit，纯 ObjC swizzle 不触发校验，实测进入首页且交互正常。含可推广教训（先验证测量工具、裸跑对照区分自伤、有完整性自检的App只用ObjC swizzle）。
+- `llmdoc/memory/reflections/abcbypass-round13-16.md`：ABCBypass 第13-16轮（2026-08-21）——**✅ 最终成功并收尾**。纠正致命方法论错误（`grep MbapMPaaS` 误匹配扩展进程 `group.abc.toolExtension`，导致大批存活结论失效）；二分定位 `0xb5a06000` 崩溃根因=libc inline-hook 触发完整性自检（自伤而非 ABC 检测）；最终方案=swizzle `-[DTFrameworkInterface initRiskManage]` 从源头消除 native exit，纯 ObjC swizzle 不触发校验。收尾：死代码清理 1660→483 行、跨版本/跨设备验证（11.1.0/iOS15.4.1 + 11.2.0/iOS16.3.1）、长时间运行稳定。含可推广教训（先验证测量工具、裸跑对照区分自伤、有完整性自检的App只用ObjC swizzle）。
 - `llmdoc/memory/reflections/sshtunnel-v132-release.md`：SSHTunnel v1.3.2 发布反思——TCP 探测在 iOS sandbox 下不可用、sysctl(KERN_PROCARGS2) 替代 ps|grep、SSH 自愈参数组合消除外部健康检查需求、文档滞后复发。
 - `llmdoc/memory/reflections/simtouch-phase2-development.md`：SimTouch Phase 2 (v1-v24) 开发反思——事件克隆优于从零创建、Darwin notification 新通道不可靠、backboardd 沙箱写入限制、录制分析方法论、回放无效待查。
 - `llmdoc/memory/reflections/simtouch-phase3-development.md`：SimTouch Phase 3 (v25-v36) 开发反思——pinch 从零创建 vs 克隆的条件性规则、sbreload 不重启 backboardd 部署陷阱、DIAG_NOTIFY 诊断通知从未工作。
