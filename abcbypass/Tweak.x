@@ -1316,12 +1316,11 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
     abc_log("terminateWithSuccess blocked");
 }
 - (void)_terminateWithStatus:(int)status {
+    // 安全网: 源头阻断 (initRiskManage 中和) 后检测退出通常不再触发, 但保留此拦截
+    // 以防其它早期退出路径。<30s 视为检测退出, 直接拦下不 %orig。
     double elapsed = CFAbsoluteTimeGetCurrent() - g_start;
     if (elapsed < 30.0) {
         abc_log("_terminateWithStatus:%d blocked (%.1fs after launch, likely detection)", status, elapsed);
-        g_exit_blocked = 1;
-        install_crash_recovery();
-        install_ui_recovery_timer();
         return;
     }
     abc_log("_terminateWithStatus:%d allowed (%.1fs after launch, likely lifecycle)", status, elapsed);
