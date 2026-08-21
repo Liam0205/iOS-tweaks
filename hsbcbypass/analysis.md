@@ -221,9 +221,49 @@ HSBC 自研 Swift 包装（VIPER 架构），符号里锁定两类可下手点�
 `_dyld_*` 枚举镜像找 tweak。**这些底层输入函数是可 hook 的 libc/dyld 符号**。
 abcbypass 的成功也是靠改检测输入，不是拦退出。
 
-**下一步（探针 v7，输入观测）**：hook 上述输入类函数，记录 App 在 0~450ms 内查询了哪些
-越狱路径 / 做了哪些检测调用，据此定位判定方式，再针对性伪造返回（路径不存在、进程未被调试、
-镜像列表干净）。
-- 注意排除心跳/探针自身产生的调用噪声。
-- 参考 abcbypass 的 `jb_paths[]` 与 fishhook GOT 改写手法（`abcbypass/Tweak.x`）。
+## Round 3（2026-08-21，输入观测 + 调用栈定位 —— 排除误判）
+
+### 教训:libc 文件查询全是注入器噪声，不是汇丰检测
+
+探针 v7/v8 hook 了 `stat/lstat/access/open/fopen/dlopen/sysctl/fork` 并对命中越狱特征路径
+的调用加 `backtrace + dladdr` 回溯。结果那些看似"检测"的查询
+（`/var/jb/usr/lib/TweakInject/*.plist`、`Choicy.dylib`、`/private/preboot`）
+**调用栈来源全是越狱自身组件**：
+
+```
+access("…/TweakInject/HammerIt.plist") ← #1 HSBCBypass.dylib #2 libinjector.dylib
+lstat("/private/preboot")              ← … systemhook.dylib … libinjector.dylib
+open("…/TweakInject/HammerIt.plist")   ← … Choicy.dylib … libinjector.dylib
+```
+
+⇒ 这些是 **ElleKit/Choicy 注入器加载 tweak 列表的正常行为**，被 `hsbc_is_jb_query`
+误当成检测。**汇丰的检测根本不经过 libc 文件符号。**（另外那 1w+ 条 `stat(framework)`
+是 dyld 正常加载。）
+
+### 修正后的判断 —— VASCODSK 内联 syscall 检测
+
+- 检测在 **VASCODSK 的 `__text` 内，用内联 `svc` 直接发 syscall**（`open`/`stat`/`csops`/
+  `sysctl`/`ptrace` 等），不调用 libc 导出符号，所以 hook libc 完全抓不到。这是 OneSpan
+  的强混淆反 hook 手法，与历史"raw syscall 退出"一脉相承。
+- RASPFramework Swift 层（`RASPAppController.init`/`setupSecureModel`）确认**从未进入**，
+  是温和模式 UI，此处未走。
+
+### Frida 可用但被反调试秒杀
+
+- 设备装了 `re.frida.server` 17.17.0（LaunchDaemon，root，默认监听 127.0.0.1:27042）。
+- 本地已装 frida-tools 17.17.0（`~/.frida-venv`），经
+  `ssh -N -L 27042:127.0.0.1:27042 -p 22215` 端口转发可 `frida-ps -H 127.0.0.1:27042`
+  正常列进程。
+- 但 `frida -f cn.com.hsbc.hsbcchina`（spawn）**`Failed to attach: unexpected early
+  end-of-stream`** —— VASCODSK 在 frida 完成注入前就检测到并杀进程。**汇丰也检测 Frida。**
+
+### 下一步（策略选择）
+
+要看 VASCODSK 内联 syscall 的检测逻辑，需绕过其反调试。两条路：
+1. **静态**：`llvm-objdump -d app-binary/VASCODSK`，在 `__text` 里找内联 `svc #0x80`
+   （`0xd4001001`）附近的检测序列 + 比较 + 退出，定位判定分支，再决定 patch/hook 点。
+2. **动态**：让我们的 tweak 先给 VASCODSK 的反调试"消毒"（hook 它依赖的少数 libc 入口 /
+   拦 `ptrace`/`csops`），再放 Frida 进去 trace。风险是触发完整性自检。
+优先走 1（静态反汇编，零风险），必要时配合 tweak 在 syscall 层（`__text` 内联 svc 无法 hook，
+但可尝试 hook `svc` 前的高层封装或用 `MSHookFunction` 拦 VASCODSK 导出的检测入口）。
 - 汇丰香港（含 `.appex`）稍后单独验证是否同一套 VASCODSK。
