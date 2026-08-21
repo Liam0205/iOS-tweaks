@@ -360,3 +360,14 @@ vmRegionInfo: 0x1162f4000-0x1162f8000 [16K] r-x/rwx SM=PRV  "Memory Tag 255"
    可能用内联 svc 直接 syscall 读环境，那样输入也 hook 不了 → 最后手段是 patch 判定函数
    返回值，需先确认无自检或自检可绕）。
 4. 汇丰香港（含 `.appex`）稍后单独验证是否同一套机制。
+
+## 汇丰香港 —— 同源确认（2026-08-21）
+
+汇丰香港 `hk.com.hsbc.hsbchkmobilebanking` 用几乎相同的安全栈：
+`LegacyVASCODSK.framework`（Legacy 版，同源稍旧）、`MobileSecurity.framework`、
+`RASPFramework.framework`、同样的 `UserSecurity*PluginKit`。主二进制加密参数也相同
+（`cryptoff=0x8000 cryptsize=0x1000 cryptid=1`）。
+
+⇒ **两个 App 同一套 OneSpan RASP 机制**。攻破汇丰中国的检测判定后，香港大概率同法可解，
+一份 tweak（两个 bundle filter）有望覆盖两者。香港主二进制同样只 1 页加密，可用相同的
+tweak 内存脱壳法离线分析。
