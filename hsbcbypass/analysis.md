@@ -290,13 +290,50 @@ syscall**。两个进程几乎同时死，略偏向"外部统一 kill / 看门�
 （注：主二进制 China 反汇编中 svc 指令数为 0，说明若是内联 syscall，可能在别的模块或用了
 非常规编码；待子代理反汇编确认。）
 
-### 下一步（策略选择）
+## Round 5（2026-08-21，崩溃日志决定性突破 —— 退出机制确认）
 
-要看 VASCODSK 内联 syscall 的检测逻辑，需绕过其反调试。两条路：
-1. **静态**：`llvm-objdump -d app-binary/VASCODSK`，在 `__text` 里找内联 `svc #0x80`
-   （`0xd4001001`）附近的检测序列 + 比较 + 退出，定位判定分支，再决定 patch/hook 点。
-2. **动态**：让我们的 tweak 先给 VASCODSK 的反调试"消毒"（hook 它依赖的少数 libc 入口 /
-   拦 `ptrace`/`csops`），再放 Frida 进去 trace。风险是触发完整性自检。
-优先走 1（静态反汇编，零风险），必要时配合 tweak 在 syscall 层（`__text` 内联 svc 无法 hook，
-但可尝试 hook `svc` 前的高层封装或用 `MSHookFunction` 拦 VASCODSK 导出的检测入口）。
-- 汇丰香港（含 `.appex`）稍后单独验证是否同一套 VASCODSK。
+### 拿到 China 崩溃日志（root 可读，mobile 读不到）
+
+`sudo cat /var/mobile/Library/Logs/CrashReporter/China-2026-08-21-143428.ips`
+（已存 `tmp/China-crash-143428.ips`）。决定性字段：
+
+```
+exception : {type:EXC_BAD_ACCESS, signal:SIGBUS,
+             subtype:"UNKNOWN_0x32 at 0x1162f4000"}
+termination: {code:10, namespace:SIGNAL, indicator:"Bus error: 10",
+              byProc:"exc handler", byPid:19156}
+faultingThread 触发帧: pc=0x1162f4000, imageIndex=1(全 0 的伪 image),
+   esr="(Instruction Abort) Translation fault"
+vmRegionInfo: 0x1162f4000-0x1162f8000 [16K] r-x/rwx SM=PRV  "Memory Tag 255"
+另有崩溃线程栈: dyld4::RuntimeState::notifyObjCInit
+   → runAllInitializersForMain → start
+```
+
+### 退出机制 = 故意跳 RWX stub 触发指令中止
+
+- OneSpan 检测到越狱后，**把 PC 跳到一块动态分配的 RWX 私有内存
+  (`Memory Tag 255`, 16K, r-x/rwx)去执行**，那里是未正确映射的地址，产生
+  **Instruction Abort（Translation fault）→ SIGBUS/EXC_BAD_ACCESS**。
+  这是**故意的崩溃式退出**，不是 exit/abort，所以 libc 退出 hook 全部落空。
+- `byProc:"exc handler"` 说明有自定义 **mach 异常处理**，可能抢在 BSD signal 之前，
+  这也解释了为什么我们的 `signal()` handler 没抓到（且该崩溃发生在装 handler 之前的早期）。
+- 崩溃在 **dyld `runAllInitializersForMain` / `notifyObjCInit` 阶段**——即某 framework 的
+  **initializer/构造器**里就完成检测并触发跳转，非常早（与"Swift RASPAppController 入口
+  从未进入""约 635ms"一致）。RWX stub 地址每次 mmap 随机，**无法静态 patch**。
+
+### 结论：必须在「检测判定」处下手，不能拦退出
+
+退出是随机地址的故意 fault，拦不住。可行方向回到**检测判定的源头/上层**：
+- ObjC selector `jailbreakStatus:`/`debuggerStatus:`（可 swizzle？待子代理确认类归属）
+- Swift `jailbreak6status`→Bool、`isJailbroken`
+- 检测跑在某 framework 的 initializer 里；候选发起者：`MobileSecurity`、`VASCODSK`、或主
+  二进制自身的 C 检测。等子代理反汇编报告定位判定函数地址与调用链。
+
+### 待办
+1. 等子代理反汇编报告 → 确定 `jailbreakStatus:`/`debuggerStatus:` 类归属和检测判定函数。
+2. 抓一份**装了 mach 异常 handler 的**新崩溃日志（当前 handler 是 BSD signal，抢不过
+   OneSpan 的 mach handler；可用 `task_set_exception_ports` 抢 EXC_BAD_ACCESS 看触发点的
+   完整寄存器/LR，回溯是谁跳的 stub）。
+3. 定位判定函数后，优先 ObjC swizzle / 高层 Swift hook 让其返回"未越狱"，避开完整性自检
+   （abcbypass 经验）。
+4. 汇丰香港（含 `.appex`）稍后单独验证是否同一套机制。
