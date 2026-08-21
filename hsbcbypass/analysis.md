@@ -68,8 +68,37 @@
   - **最可能原因：设备锁屏**。银行 App 常因数据保护（NSFileProtection）/前台策略，在
     锁屏状态下不启动到前台，而系统 App 不受此限。需用户解锁并点亮屏幕后重测。
 
+### 第 0 轮静态分析（汇丰中国 3.72.15 主 binary + framework）
+
+**🔑 重大发现：检测体系已升级，历史"纯 OneSpan + raw syscall 无解"结论对 3.72.15 不成立。**
+
+主 binary 符号（Swift demangle 可见）：
+- `RASPFramework`（汇丰自封装 RASP：`SecureAppModel`/`RASPAppController`/`AppSecurityEvent`/
+  `RASPTrackManager`）
+- **两套可切换 RASP 供应商**：`ActiveOneSpanRASPProvider`（OneSpan/VASCO，`VascoDPSDK`）+
+  `ZimperiumRASPProvider`（Zimperium），经 `RASPCreatorStrategy` 策略模式选择。有
+  `InactiveZimperiumRASPProvider` ⇒ 当前可能只启用 OneSpan。
+- Swift 层越狱判定：`isJailbroken`、`jailbreak6status`、
+  `XChinaJourney.DeviceInfoConfiguration(deviceUUID, isJailbroken, isRooted)`。
+
+RASP 是**独立 framework**（非静态链入主 binary）：`China.app/Frameworks/` 下有
+`RASPFramework.framework`、`VASCODSK.framework`、`MobileSecurity.framework`、
+`UserSecurity*PluginKit.framework`（共 150 个 framework）。
+
+RASPFramework 揭示的检测→响应模型（strings）：
+- 策略类：`JailbrokenStrategy`、`ExitOnStrategy`、`acceptJailbroken`
+- **有越狱弹窗**：`jailbroken_title_stop_ios`、`jailbroken_cta_stop_close`（停止/关闭）、
+  `jailbroken_cta_advised_continue`（建议但可继续）、`rasp_exit_on_body_1/2`、
+  `rooted device detected`、`developer mode detection`、`emulatorDetection`、`debugger`
+- 退出可能走 **`_abort`**（framework 里有 `_abort` 符号），而非纯 raw syscall svc。
+
+⇒ **新假设**：3.72.15 的越狱响应是"检测 → JailbrokenStrategy/ExitOnStrategy → 弹窗 →
+  abort/退出"，且检测判定在 Swift/ObjC 层（`isJailbroken`、`RASPFramework` 类）。
+  若成立，则可在 Swift/ObjC 层 hook 判定或策略类短路（类似 abcbypass 的 initRiskManage
+  思路），比历史的 raw-syscall 悲观结论好办得多。**待裸跑对照验证真实退出方式。**
+
 ## 当前阻塞
 
-- **需用户解锁 2215 设备并保持点亮**：裸跑对照无法完成（App 进程起不来，疑锁屏）。
-  解锁后重跑 `hsbctest.sh cn` / `hk` 观察原始退出行为，再拉主 binary 做静态分析
-  （找 OneSpan 特征、svc #0x80 内联点、检测字符串），判断 HK 是否同为 OneSpan RASP。
+- **需用户解锁 2215 设备并保持点亮**：裸跑对照无法完成（`uiopen` 返回 0 但 App 进程从不
+  出现，疑锁屏 / 数据保护）。解锁后重跑 `hsbctest.sh cn` / `hk`：观察原始退出方式
+  （弹窗？abort？秒退？crash 特征？），验证上面的"Swift/ObjC 层策略退出"新假设。
