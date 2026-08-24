@@ -1838,3 +1838,29 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   a. 确定 nr=294 与 sysctl{1,2} 具体查什么(静态跟 0x240218/0x348dd0 的返回值如何影响判定)。
   b. 关键实验: **在跳板里对 sysctl(202) 的这次调用**观察其返回 buffer, 看是否含 P_TRACED/被判越狱的值。
   c. 若确认 sysctl 是判定输入, 在跳板里改写其返回(OBSERVE_ONLY=0 针对 202) → 最小拦截试。
+
+## Round 58（2026-08-24,返回值观测: 检测 syscall 全部返回正常值; "存活">=12s 实为 99% CPU 自旋)
+
+### 跳板增强: svc 返回后捕获 retval + sysctl 输出缓冲(不拆帧, 保存/恢复 nzcv 保证封装 b.lo 正确)
+- `shared_region_check_np`(294) ×2 → **ret=0**(共享区正常)。
+- `sysctl{1,2}`(202) → ret=0, oldp 前缓冲 = `32 31 2e 34 2e 30 00` = ASCII **"21.4.0"** = **KERN_OSRELEASE**(内核版本串, benign)。
+  ⇒ MIB {1,2} = CTL_KERN, KERN_OSRELEASE。**不是越狱信号**。
+- `mach_msg_trap`(-31) ×7、dyld cache access/open、munmap(73)。**全部正常返回, 无越狱判定值**。
+
+### ★ 纠正"存活"假象: nop-store 下 App 2/3 概率"存活>=15s", 但 `ps` 显示 **99.3% CPU (Rs 自旋)**
+- 不是正常运行到 UI, 是 Round54/55b 的**同一自旋**(状态机进入非终止循环), 偶尔撑过 20s 偶尔 1s 静默退出。
+- nop-store 破坏 0x346c68→0x75bf7c→0x346c7c 安装序列 = 自旋根因。**再次确认 nop-store 不可行**。
+
+### 汇总: 检测性质 = 内存完整性/反 hook, 非文件
+- 观测到的检测 syscall(shared_region_check_np + KERN_OSRELEASE + mach_msg + dyld cache 映射)全部 benign 返回。
+- 说明**真正的越狱判定不在这些 syscall 的返回值里**, 而在别处:
+  1. dyld 共享缓存**比对**(映射磁盘 cache, 与内存中被 ElleKit 改过的 __TEXT/GOT 比对)—— 判定在内存比对逻辑, 不在 syscall。
+  2. 或 mach_msg 背后的 **task_info/vm_region 枚举**(检测非 cache 的可执行内存 = 注入的 tweak/ElleKit)。
+  3. 或**存在不经槽的检测路径**(cache 里干净 libsystem 的 svc, 或直接内联 svc 在别的函数)。
+
+### 结论与转向
+- svc 网关观测已到极限: 判定不体现在经槽的 syscall 返回值; 中途改控制流(nop-store)必自旋。
+- **需换观测层**: 用 debugserver/lldb attach 在 0x75bf7c 状态机里下断点, 单步看"越狱→状态变量"的真实来源
+  (是 dyld cache 内存比对? 还是 vm_region 枚举?)。或用调试器读退出时的调用栈。
+- 或接受: 越狱环境的**根本特征**(ElleKit 注入改了内存 / 存在非 cache 可执行页)无法在不改内核的前提下对 Promon 隐藏,
+  则本机(Dopamine KFD+PPL)可能需要**内核层**隐藏(如 vm_region 过滤), 超出 tweak 能力 → 记录为高难度阻塞。

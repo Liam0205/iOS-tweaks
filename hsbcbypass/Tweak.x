@@ -140,6 +140,32 @@ void hsbc_svc_record(long nr, long a0, long a1, long caller) {
   raw_emit(nr, a0, caller, pathbuf);
 }
 
+// svc 返回后调用: 观测可疑检测 syscall 的返回值 + 输出缓冲(sysctl 202 的 oldp)。
+void hsbc_svc_postrecord(long nr, long retval, long oldp);
+void hsbc_svc_postrecord(long nr, long retval, long oldp) {
+  if (g_fd < 0) return;
+  // 只关心检测判定输入的 syscall: 202(sysctl) / 294(shared_region_check_np) / 169,170(csops) / 336(proc_info)
+  switch (nr) {
+    case 202: case 294: case 169: case 170: case 336: break;
+    default: return;
+  }
+  char b[400]; int p=0;
+  #define QPUTC(c) do{ if(p<(int)sizeof(b)-1) b[p++]=(c);}while(0)
+  #define QPUTS(s) do{const char*_s=(s);while(*_s)QPUTC(*_s++);}while(0)
+  #define QHEX(v) do{unsigned long _v=(unsigned long)(v);QPUTC('0');QPUTC('x');char _t[18];int _n=0; \
+      if(!_v){_t[_n++]='0';}while(_v){int _d=_v&0xf;_t[_n++]=_d<10?'0'+_d:'a'+_d-10;_v>>=4;}while(_n)QPUTC(_t[--_n]);}while(0)
+  QPUTS("  ↳RET nr="); { long v=nr; if(v<0){QPUTC('-');v=-v;} char t[20];int n=0;if(!v){t[n++]='0';}while(v){t[n++]='0'+v%10;v/=10;}while(n)QPUTC(t[--n]); }
+  QPUTS(" ret="); QHEX(retval);
+  // sysctl(202): oldp 指向输出, 前 32 字节 hex, 看是否含进程标志/被判越狱的值
+  if (nr==202 && oldp) {
+    QPUTS(" oldp["); QHEX(oldp); QPUTS("]=");
+    const unsigned char *o=(const unsigned char*)oldp;
+    for (int i=0;i<32;i++){ unsigned char c=o[i]; QPUTC("0123456789abcdef"[c>>4]); QPUTC("0123456789abcdef"[c&0xf]); }
+  }
+  QPUTC('\n');
+  (void)write(g_fd, b, p);
+}
+
 // 真网关运行时地址(ctor 里设 = 0x78befc + slide)。跳板尾调它, 使真正的 svc 在 __TEXT 内执行,
 // 防 Promon 对"发起 svc 的 PC 是否在自身 __TEXT"做检查(我们的跳板在堆上, 自带 svc 会露馅)。
 uintptr_t hsbc_g_realgate = 0;
@@ -147,6 +173,9 @@ uintptr_t hsbc_g_realgate = 0;
 // 汇编跳板: 保存/恢复所有传参寄存器, 调 record, 再 `br 真网关`(真网关=svc #0x80; ret)。
 // 进入时 sp 指向封装 `stp x17,x30,[sp,#-0x10]!` 压入的 [x17,x30], 故 caller=[sp+0xa8]。
 // x17 由封装 save/restore, 可自由 clobber; 尾调后真网关的 ret 用我们恢复的 x30(=封装续点)。
+// 帧布局(0xa0): 0x00 x0/0x08 x1/0x10 x2/0x18 x3/0x20 x4/0x28 x5/0x30 x6/0x38 x7/
+//   0x40 x8/0x48 x16(nr)/0x50 x30(封装续点)/0x58 retval/0x60 nzcv。 [sp+0xa8]=caller。
+// 关键: svc 后不拆帧, 先存 retval+flags, 调 postrecord(读 sysctl 输出缓冲), 再恢复 flags/x0/x30, ret。
 __asm__(
   ".text\n"
   ".align 4\n"
@@ -159,19 +188,33 @@ __asm__(
   "  stp  x6, x7,  [sp, #0x30]\n"
   "  stp  x8, x16, [sp, #0x40]\n"
   "  str  x30,     [sp, #0x50]\n"
-  "  ldr  x3, [sp, #0xa8]\n"    // caller (封装保存的 x30)
-  "  mov  x0, x16\n"            // nr
-  "  ldr  x1, [sp, #0x00]\n"    // a0
-  "  ldr  x2, [sp, #0x08]\n"    // a1
+  "  ldr  x3, [sp, #0xa8]\n"    // caller
+  "  mov  x0, x16\n"
+  "  ldr  x1, [sp, #0x00]\n"
+  "  ldr  x2, [sp, #0x08]\n"
   "  bl   _hsbc_svc_record\n"
+  // 恢复 syscall 传参寄存器(record 已 clobber), 准备 svc
   "  ldp  x0, x1,  [sp, #0x00]\n"
   "  ldp  x2, x3,  [sp, #0x10]\n"
   "  ldp  x4, x5,  [sp, #0x20]\n"
   "  ldp  x6, x7,  [sp, #0x30]\n"
   "  ldp  x8, x16, [sp, #0x40]\n"
-  "  ldr  x30,     [sp, #0x50]\n"
+  "  svc  #0x80\n"              // x0=retval, flags=进位判错
+  // 不拆帧: 存 retval + flags
+  "  str  x0, [sp, #0x58]\n"
+  "  mrs  x9, nzcv\n"
+  "  str  x9, [sp, #0x60]\n"
+  // postrecord(nr, retval, oldp=保存的x2): 观测返回值 + sysctl 输出缓冲
+  "  ldr  x0, [sp, #0x48]\n"    // nr
+  "  ldr  x1, [sp, #0x58]\n"    // retval
+  "  ldr  x2, [sp, #0x10]\n"    // 原始 x2 (sysctl oldp / 缓冲)
+  "  bl   _hsbc_svc_postrecord\n"
+  // 恢复 flags + retval + 封装续点, 拆帧, ret(flags 须活到封装的 b.lo)
+  "  ldr  x9, [sp, #0x60]\n"
+  "  msr  nzcv, x9\n"
+  "  ldr  x0, [sp, #0x58]\n"
+  "  ldr  x30, [sp, #0x50]\n"
   "  add  sp, sp, #0xa0\n"
-  "  svc  #0x80\n"              // 自带 svc(55b 已证明转发正确, 48 syscall 无误)
   "  ret\n"
 );
 extern void hsbc_svc_tramp(void);
@@ -257,7 +300,6 @@ static void *poller(void *arg) {
     (unsigned long)readback,
     readback==(uintptr_t)&hsbc_svc_tramp ? "确认=跳板" : "异常!非跳板");
 
-  pthread_t th;
-  pthread_create(&th, NULL, poller, NULL);
-  pthread_detach(th);
+  // 热路径已同步落盘, 不再需要 poller(之前 poller 读未初始化环尾产生噪声)。
+  (void)poller;
 }
