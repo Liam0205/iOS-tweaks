@@ -1723,3 +1723,34 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 子代理: 追 0x75bf7c 里 syscall 结果 → 状态变量的数据流, 定位"越狱→状态"的转换点。
 - 或运行时探针: hook 0x8510c8 svc 跳板, 记录每次 syscall 的号+参数+返回, 看哪个查越狱、
   返回什么导致走 exit。这个 hook 点是全局槽, 改它的值可重定向所有 syscall(危险)或只观测。
+
+## Round 55（2026-08-24,★ svc 跳板观测器成功 + 证明无网关指针完整性校验)
+
+### 方法: 把 svc 网关槽 0x8510c8 重定向到自建汇编跳板
+- Tweak %ctor 里把 slot[0x8510c8+slide] 写成自建 `_hsbc_svc_tramp`(保存全部传参寄存器→
+  记录 nr/a0/a1/caller→原样 `svc #0x80; ret`)。这样所有 83 个 syscall 封装的 `ldr x17,[slot];blr x17`
+  都经过我的跳板, **首次拿到 Promon 走 raw svc 的 syscall 地面真值**(libc/fishhook hook 全 0 命中的原因)。
+- 关键测得: **%ctor 早于 App 安装点**(slot prior=0x0 = 理想)。但 App 的安装点 0x346c68 的
+  `str x9,[x8,#0xc8]` 在 ctor 之后执行, 会把我的跳板覆盖回真网关 0x78befc。
+  ⇒ 必须 nop 掉 0x346c74 的 str, 我的跳板才留得住。
+
+### 55a(不 nop store): 跳板被覆盖, 3s 静默退出(= pristine 基线), 跳板仅 ctor 后短暂在位。
+### 55b(nop store 0x346c74 → 1f2003d5): 跳板留住, 观测到 syscall, 但 16-20s 看门狗
+- 前 1s: total=48 syscall = `open×4 close×4 access×4 #153(pread)×16 #197(mmap) #199(lseek) sysctl×1 #294×2`,
+  全是 **dyld 共享缓存映射**(`/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e`)。
+- **1s 之后完全静默**(poller 每秒快照, t=2s..t=35s 无任何 syscall 增量)—— **不是 syscall 风暴, 是纯 CPU 自旋**。
+- **全程无一个越狱路径查询经过我的跳板**(★JB 0 命中)。自旋发生在越狱文件检查**之前**。
+
+### ★★ 决定性结论: 二进制里无"网关指针完整性校验"
+- 全 __text 反汇编搜 `add x?,x?,#0xefc`(计算网关地址 0x78befc)—— **全二进制仅 1 处**, 就是安装点 0x346c68。
+- ⇒ 没有任何代码重算网关地址并与 slot 比较。**我的跳板指针按值不会被检测到**。
+- 那 55b 的自旋不是"槽被篡改"检测, 而是 **nop store 破坏了安装序列**本身
+  (`bl 0x346c68 装网关 → bl 0x75bf7c 检测 → bl 0x346c7c 收尾`, 收尾 0x346c7c 是另一个巨型 OLLVM 状态机)。
+- dyld 共享缓存映射是 OneSpan/Promon 常见手法: 从磁盘映射干净 shared cache, 可能用其中干净 stub 发 syscall
+  (绕过 inline hook)。但那些 syscall **也会经过 slot**(封装在 App __text 内, ldr x17,[slot]不变), 故仍应被我捕获——
+  除非检测走了不经 slot 的另一条路(如直接 svc 内联, 或映射的 cache 里的 libSystem)。
+
+### 待验证(下一步)
+1. **不 nop store, 改用 poller 线程在 App 安装后持续重写 slot 为跳板**(赛过 App 的 str), 看能否既留住跳板又不破坏安装序列 → 若这样能观测到越狱路径查询, 说明问题是 nop store 破坏了收尾, 而非跳板本身。
+2. 或: nop store 后, 自旋点定位——在 0x75bf7c/0x346c7c 里加日志或看自旋 PC。
+3. 若确认检测 syscall 根本不经 slot(跳板 0 命中越狱路径), 则 svc 跳板方案对"文件检测"无效, 需换"检测走内联 svc 或映射 cache stub"的假设。

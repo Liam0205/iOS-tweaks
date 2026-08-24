@@ -1,223 +1,212 @@
-// Round 37 探针: 观测 Promon SHIELD 的越狱检测输入(文件探测)
-// 只观测不改行为(除非 OBSERVE_ONLY=0): hook fileExistsAtPath: + libc 文件探测, 记录路径 + 发起模块.
-#define _XOPEN_SOURCE 700
-#include <ucontext.h>
+// Round 55 探针: svc 跳板观测器
+// Promon 的所有 syscall 走数据段网关(槽 0x8510c8 -> 0x78befc = svc#0x80;ret)。
+// 本探针把槽改指向自己的汇编跳板, 记录每次 (syscall号, 路径参数, 调用者PC), 再原样陷入内核。
+// 配套二进制 patch: nop 掉安装点 0x346c74 的 str, 使 App 不再覆盖该槽(否则会盖掉我们的跳板)。
+// 目的: 首次拿到 Promon 到底查了哪些越狱文件/用了哪些反调试 syscall 的地面真值(libc hook 全 0 命中)。
 #import <Foundation/Foundation.h>
-#import <pthread.h>
-#import <dlfcn.h>
-#import <sys/stat.h>
 #import <mach-o/dyld.h>
 #import <string.h>
-#import <objc/runtime.h>
-#import "fishhook.h"
+#import <stdio.h>
+#import <stdint.h>
 
-// 设为 1 = 只观测; 设为 0 = 同时对越狱路径返回"不存在"(实际绕过实验)
 #ifndef OBSERVE_ONLY
-#define OBSERVE_ONLY 1
+#define OBSERVE_ONLY 1   // 1=只观测转发; 0=对越狱路径 syscall 返回 ENOENT/-1(拦截实验)
 #endif
 
-static double g_t0=0;
-static void lg(NSString*l){
-  static NSString*p=nil;
-  if(!p)p=[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"hsbc_probe_%d.log",getpid()]];
-  NSString*e=[l stringByAppendingString:@"\n"];
-  FILE*f=fopen([p fileSystemRepresentation],"a");
-  if(f){fwrite(e.UTF8String,1,strlen(e.UTF8String),f);fclose(f);}
-}
-#define L(fmt,...) do{if(g_t0==0)g_t0=CFAbsoluteTimeGetCurrent();double d=(CFAbsoluteTimeGetCurrent()-g_t0)*1000;lg([NSString stringWithFormat:(@"[+%.0fms] " fmt),d,##__VA_ARGS__]);}while(0)
+// slot / gate 的静态 vmaddr(见 analysis.md Round 52)
+#define SLOT_VMADDR   0x8510c8UL
+#define GATE_VMADDR   0x78befcUL
 
-// 判定一个路径是否是"越狱特征路径"
-static int is_jb_path(const char*p){
-  if(!p)return 0;
-  static const char*keys[]={"Cydia","Sileo","MobileSubstrate","substrate","/var/jb","TweakInject",
-    "/bin/bash","/bin/sh","/usr/sbin/sshd","/etc/apt","/private/var/lib/apt","frida","cynject",
-    "/Applications/Cydia","libhooker","ElleKit","/var/binpack","Zebra","dopamine","/private/preboot",
-    "jailbreak","/usr/lib/TweakInject",".dylib",NULL};
-  for(int i=0;keys[i];i++) if(strstr(p,keys[i])) return 1;
+static double g_t0 = 0;
+static char   g_logpath[256];
+static intptr_t g_slide = 0;
+
+static void lg(const char *s) {
+  FILE *f = fopen(g_logpath, "a");
+  if (f) { fwrite(s, 1, strlen(s), f); fputc('\n', f); fclose(f); }
+}
+#define L(fmt, ...) do{ \
+  if (g_t0==0) g_t0=CFAbsoluteTimeGetCurrent(); \
+  double d=(CFAbsoluteTimeGetCurrent()-g_t0)*1000; \
+  char _b[600]; snprintf(_b,sizeof(_b),"[+%.0fms] " fmt, d, ##__VA_ARGS__); lg(_b); \
+}while(0)
+
+// 越狱特征路径
+static int is_jb_path(const char *p) {
+  if (!p) return 0;
+  static const char *k[] = {"Cydia","Sileo","MobileSubstrate","substrate","/var/jb","TweakInject",
+    "/bin/bash","/bin/sh","/usr/sbin/sshd","/etc/apt","/var/lib/apt","frida","cynject",
+    "libhooker","ElleKit","ellekit","/var/binpack","Zebra","dopamine","/private/preboot",
+    "jailbreak","/usr/lib/Tweak",".dylib","/Library/dpkg","/var/lib/dpkg","/usr/libexec/cydia",NULL};
+  for (int i=0;k[i];i++) if (strstr(p,k[i])) return 1;
   return 0;
 }
-// 发起调用的模块名(是否 hsbcchinax 自己在探). ret0 = 直接调用者(我们的 hook 的调用方).
-static const char* module_of(void*ret){
-  Dl_info info; if(ret&&dladdr(ret,&info)&&info.dli_fname){
-    const char*b=strrchr(info.dli_fname,'/'); return b?b+1:info.dli_fname;
-  }
-  return "?";
-}
-#define CALLER module_of(__builtin_return_address(0))
 
-// ---- libc 文件探测 hook (fishhook GOT, 不改函数头, 不触发反 inline-hook 自检) ----
-static int (*o_stat)(const char*,struct stat*);
-static int (*o_lstat)(const char*,struct stat*);
-static int (*o_access)(const char*,int);
-static int (*o_open)(const char*,int,...);
-static FILE*(*o_fopen)(const char*,const char*);
-
-static void note(const char*fn,const char*path,int jb,const char*m){
-  // 只记 hsbcchinax / Promon 发起的, 或所有越狱路径查询
-  if(jb || (m && strstr(m,"hsbcchinax")))
-    L(@"%s(\"%s\") jb=%d ← %s",fn,path?path:"(null)",jb,m);
-}
-static int my_stat(const char*p,struct stat*s){int jb=is_jb_path(p);note("stat",p,jb,CALLER);
-#if !OBSERVE_ONLY
-  if(jb){errno=ENOENT;return -1;}
-#endif
-  return o_stat(p,s);}
-static int my_lstat(const char*p,struct stat*s){int jb=is_jb_path(p);note("lstat",p,jb,CALLER);
-#if !OBSERVE_ONLY
-  if(jb){errno=ENOENT;return -1;}
-#endif
-  return o_lstat(p,s);}
-static int my_access(const char*p,int m){int jb=is_jb_path(p);note("access",p,jb,CALLER);
-#if !OBSERVE_ONLY
-  if(jb){errno=ENOENT;return -1;}
-#endif
-  return o_access(p,m);}
-static int my_open(const char*p,int fl,...){int jb=is_jb_path(p);note("open",p,jb,CALLER);
-#if !OBSERVE_ONLY
-  if(jb){errno=ENOENT;return -1;}
-#endif
-  mode_t md=0; if(fl&O_CREAT){va_list a;va_start(a,fl);md=(mode_t)va_arg(a,int);va_end(a);}
-  return o_open(p,fl,md);}
-static FILE* my_fopen(const char*p,const char*md){int jb=is_jb_path(p);note("fopen",p,jb,CALLER);
-#if !OBSERVE_ONLY
-  if(jb){errno=ENOENT;return NULL;}
-#endif
-  return o_fopen(p,md);}
-
-// ---- ObjC: -[NSFileManager fileExistsAtPath:] 与 :isDirectory: ----
-static BOOL (*o_fe)(id,SEL,NSString*);
-static BOOL (*o_fed)(id,SEL,NSString*,BOOL*);
-static BOOL my_fe(id self,SEL _cmd,NSString*path){
-  int jb=path?is_jb_path(path.UTF8String):0;
-  const char*m=CALLER;
-  if(jb||(m&&strstr(m,"hsbcchinax"))) L(@"fileExistsAtPath:(\"%@\") jb=%d ← %s",path,jb,m);
-#if !OBSERVE_ONLY
-  if(jb) return NO;
-#endif
-  return o_fe(self,_cmd,path);
-}
-static BOOL my_fed(id self,SEL _cmd,NSString*path,BOOL*isDir){
-  int jb=path?is_jb_path(path.UTF8String):0;
-  const char*m=CALLER;
-  if(jb||(m&&strstr(m,"hsbcchinax"))) L(@"fileExistsAtPath:isDirectory:(\"%@\") jb=%d ← %s",path,jb,m);
-#if !OBSERVE_ONLY
-  if(jb){if(isDir)*isDir=NO;return NO;}
-#endif
-  return o_fed(self,_cmd,path,isDir);
-}
-
-static void* hb(void*a){for(int i=0;;i++){if(i%20==0)L(@"♥ #%d",i);usleep(10000);}return NULL;}
-
-// ---- 加密 stub 槽轮询: 抓 Promon 运行时解密出的真实指针 ----
-// 静态槽 VA(hsbcchinax __TEXT vmaddr=0, 运行时 = slot + slide)
-#define SLOT_7748d8 0x84c000UL
-#define SLOT_775034 0x84c020UL
-static uintptr_t g_slide2=0; static const struct mach_header* g_base=NULL;
-static uintptr_t hsbc_slide(void){
-  if(g_slide2)return g_slide2;
-  uint32_t n=_dyld_image_count();
-  for(uint32_t i=0;i<n;i++){const char*nm=_dyld_get_image_name(i);
-    if(nm&&strstr(nm,"hsbcchinax")){g_base=_dyld_get_image_header(i);g_slide2=_dyld_get_image_vmaddr_slide(i);return g_slide2;}}
-  return 0;
-}
-static void resolve_slot(const char*tag,uintptr_t slotVA){
-  uintptr_t sl=hsbc_slide(); if(!sl)return;
-  uintptr_t*slot=(uintptr_t*)(slotVA+sl);
-  uintptr_t v=*slot;
-  // 合法进程内指针? dladdr 能解析即为已解密
-  Dl_info info;
-  if(v>0x100000000UL && v<0x300000000000UL && dladdr((void*)v,&info)){
-    const char*sym=info.dli_sname?info.dli_sname:"(no-sym)";
-    const char*fn=info.dli_fname?info.dli_fname:"?";
-    const char*b=strrchr(fn,'/'); b=b?b+1:fn;
-    L(@"★解密 %s slot=0x%lx → 0x%lx = %s (%s off+0x%lx)",tag,slotVA,v-sl,sym,b,
-      (unsigned long)((uintptr_t)v-(uintptr_t)info.dli_fbase));
+// arg0 是 char* 路径的 BSD syscall 号(iOS arm64)
+static int arg0_is_path(long nr) {
+  switch (nr) {
+    case 5:   // open
+    case 33:  // access
+    case 58:  // readlink
+    case 188: // stat
+    case 190: // lstat
+    case 220: // getattrlist
+    case 338: // stat64
+    case 340: // lstat64
+    case 398: // open_nocancel
+    case 12:  // chdir
+    case 15:  // chmod
+    case 82:  // pathconf
+    case 157: // statfs (old)
+      return 1;
+    default: return 0;
   }
 }
-// Round47: 监视 Promon 自定位锚点 0x838138 + 0x8493b0(guarded body blr 依赖)
-#define ANCHOR_838138 0x838138UL
-#define PTR_8493b0    0x8493b0UL
-static void* slotpoll(void*a){
-  // 不延迟, 尽早开始抓(pristine 只活 ~374ms)
-  int done7=0,done5=0;
-  uintptr_t last_anchor=0xdeadbeef, last_493=0xdeadbeef;
-  int anchor_logs=0;
-  for(int i=0;i<20000 && !(done7&&done5);i++){ // 高频 poll
-    uintptr_t sl=hsbc_slide();
-    if(sl){
-      uintptr_t*s7=(uintptr_t*)(SLOT_7748d8+sl),*s5=(uintptr_t*)(SLOT_775034+sl);
-      Dl_info di;
-      if(!done7 && *s7>0x100000000UL && dladdr((void*)*s7,&di)){resolve_slot("7748d8",SLOT_7748d8);done7=1;}
-      if(!done5 && *s5>0x100000000UL && dladdr((void*)*s5,&di)){resolve_slot("775034",SLOT_775034);done5=1;}
-      // 锚点监视: 值变化就记(限 30 条)
-      uintptr_t av=*(uintptr_t*)(ANCHOR_838138+sl);
-      uintptr_t pv=*(uintptr_t*)(PTR_8493b0+sl);
-      if((av!=last_anchor || pv!=last_493) && anchor_logs<30){
-        L(@"锚点 [0x838138]=0x%lx  [0x8493b0]=0x%lx  (slide=0x%lx, x8应=0x8493b0值-0x838138值=0x%lx)",
-          av,pv,sl,(unsigned long)(pv-av));
-        last_anchor=av; last_493=pv; anchor_logs++;
-      }
+static const char* nr_name(long nr) {
+  switch (nr) {
+    case 5:return"open"; case 33:return"access"; case 58:return"readlink";
+    case 188:return"stat"; case 190:return"lstat"; case 189:return"fstat";
+    case 220:return"getattrlist"; case 338:return"stat64"; case 340:return"lstat64";
+    case 339:return"fstat64"; case 398:return"open_nc"; case 202:return"sysctl";
+    case 274:return"sysctlbyname"; case 169:return"csops"; case 170:return"csops_at";
+    case 26:return"ptrace"; case 336:return"proc_info"; case 372:return"thread_selfid";
+    case 6:return"close"; case 3:return"read"; case 4:return"write";
+    default:return NULL;
+  }
+}
+
+// ---- 低开销记录: 热路径只做原子计数 + 越狱路径进环形缓冲, 不 fopen(避免拖慢触发看门狗) ----
+#define NR_MAX 600
+static volatile uint64_t g_cnt[NR_MAX];   // 每个 syscall 号的调用次数
+static volatile uint64_t g_total = 0;
+
+// 越狱路径命中环形缓冲(热路径只 memcpy, 由 poller 线程落盘)
+typedef struct { long nr; long caller; double t; char path[220]; } jbhit_t;
+#define JB_RING 256
+static jbhit_t g_ring[JB_RING];
+static volatile uint32_t g_ring_w = 0;   // 写指针(只增)
+
+// 由汇编跳板调用: nr=x16, a0/a1=参数, caller=封装的调用者PC
+void hsbc_svc_record(long nr, long a0, long a1, long caller);
+void hsbc_svc_record(long nr, long a0, long a1, long caller) {
+  __sync_fetch_and_add(&g_total, 1);
+  if (nr >= 0 && nr < NR_MAX) __sync_fetch_and_add(&g_cnt[nr], 1);
+  // 只有"参数0是路径"的 syscall 才检查越狱特征, 命中就存环形缓冲(热路径不落盘)
+  if (arg0_is_path(nr)) {
+    const char *path = (const char*)a0;
+    if (path && is_jb_path(path)) {
+      uint32_t idx = __sync_fetch_and_add(&g_ring_w, 1) % JB_RING;
+      g_ring[idx].nr = nr;
+      g_ring[idx].caller = caller;
+      g_ring[idx].t = (g_t0>0) ? (CFAbsoluteTimeGetCurrent()-g_t0)*1000 : 0;
+      strncpy(g_ring[idx].path, path, sizeof(g_ring[idx].path)-1);
+      g_ring[idx].path[sizeof(g_ring[idx].path)-1] = 0;
     }
-    usleep(200); // 0.2ms 高频, 抓 374ms 窗口内的锚点写入
   }
-  if(!done7)L(@"slot 0x84c000 未解密");
-  if(!done5)L(@"slot 0x84c020 未解密");
+}
+
+// 汇编跳板: 保存/恢复所有传参寄存器, 调 record, 再原样 svc#0x80; ret。
+// 进入时 sp 指向封装 `stp x17,x30,[sp,#-0x10]!` 压入的 [x17,x30], 故 caller=[sp+0xa8]。
+__asm__(
+  ".text\n"
+  ".align 4\n"
+  ".globl _hsbc_svc_tramp\n"
+  "_hsbc_svc_tramp:\n"
+  "  sub  sp, sp, #0xa0\n"
+  "  stp  x0, x1,  [sp, #0x00]\n"
+  "  stp  x2, x3,  [sp, #0x10]\n"
+  "  stp  x4, x5,  [sp, #0x20]\n"
+  "  stp  x6, x7,  [sp, #0x30]\n"
+  "  stp  x8, x16, [sp, #0x40]\n"
+  "  str  x30,     [sp, #0x50]\n"
+  "  ldr  x3, [sp, #0xa8]\n"    // caller (封装保存的 x30)
+  "  mov  x0, x16\n"            // nr
+  "  ldr  x1, [sp, #0x00]\n"    // a0
+  "  ldr  x2, [sp, #0x08]\n"    // a1
+  "  bl   _hsbc_svc_record\n"
+  "  ldp  x0, x1,  [sp, #0x00]\n"
+  "  ldp  x2, x3,  [sp, #0x10]\n"
+  "  ldp  x4, x5,  [sp, #0x20]\n"
+  "  ldp  x6, x7,  [sp, #0x30]\n"
+  "  ldp  x8, x16, [sp, #0x40]\n"
+  "  ldr  x30,     [sp, #0x50]\n"
+  "  add  sp, sp, #0xa0\n"
+  "  svc  #0x80\n"              // svc 与 ret 之间不得改标志(封装靠进位判错)
+  "  ret\n"
+);
+extern void hsbc_svc_tramp(void);
+
+// 找 hsbcchinax 的 slide
+static intptr_t hsbc_slide(void) {
+  uint32_t n = _dyld_image_count();
+  for (uint32_t i=0;i<n;i++) {
+    const char *nm = _dyld_get_image_name(i);
+    if (nm && strstr(nm, "hsbcchinax"))
+      return _dyld_get_image_vmaddr_slide(i);
+  }
+  return 0;
+}
+
+// poller: 每 1s 落盘一次计数快照(每类 syscall 增量)+ 新的越狱路径命中。
+// 这样即使检测阶段是 syscall 风暴, 热路径也只做原子加, 由本线程慢速落盘。
+#include <pthread.h>
+#include <unistd.h>
+static uint64_t g_prev[NR_MAX];
+static uint32_t g_ring_r = 0;
+static void *poller(void *arg) {
+  (void)arg;
+  for (int tick=0; tick<40; tick++) {
+    usleep(1000*1000);
+    // 落盘本秒新增的越狱路径命中
+    uint32_t w = g_ring_w;
+    while (g_ring_r < w) {
+      jbhit_t *h = &g_ring[g_ring_r % JB_RING];
+      L("★JB %s(\"%.200s\") caller=+0x%lx @%.0fms", nr_name(h->nr)?:"?", h->path,
+        (unsigned long)(h->caller - (long)g_slide), h->t);
+      g_ring_r++;
+    }
+    // 每秒的 syscall 增量表(只打非零变化)
+    char line[512]; int p=0;
+    p += snprintf(line+p, sizeof(line)-p, "t=%ds total=%llu Δ{", tick+1, (unsigned long long)g_total);
+    int any=0;
+    for (int nr=0; nr<NR_MAX; nr++) {
+      uint64_t c=g_cnt[nr]; if (c==g_prev[nr]) continue;
+      const char *nm=nr_name(nr);
+      if (nm) p += snprintf(line+p, sizeof(line)-p, "%s=%llu ", nm, (unsigned long long)(c-g_prev[nr]));
+      else    p += snprintf(line+p, sizeof(line)-p, "#%d=%llu ", nr, (unsigned long long)(c-g_prev[nr]));
+      g_prev[nr]=c; any=1;
+      if (p>440) break;
+    }
+    snprintf(line+p, sizeof(line)-p, "}");
+    if (any) L("%s", line);
+  }
   return NULL;
 }
 
-static void install_objc_hook(void){
-  Class c=objc_getClass("NSFileManager");
-  Method me=class_getInstanceMethod(c,@selector(fileExistsAtPath:));
-  if(me){o_fe=(void*)method_getImplementation(me);method_setImplementation(me,(IMP)my_fe);L(@"hooked fileExistsAtPath:");}
-  Method me2=class_getInstanceMethod(c,@selector(fileExistsAtPath:isDirectory:));
-  if(me2){o_fed=(void*)method_getImplementation(me2);method_setImplementation(me2,(IMP)my_fed);L(@"hooked fileExistsAtPath:isDirectory:");}
-}
+%ctor {
+  g_t0 = CFAbsoluteTimeGetCurrent();
+  snprintf(g_logpath, sizeof(g_logpath), "%s/hsbc_probe_%d.log",
+           NSTemporaryDirectory().fileSystemRepresentation, getpid());
+  FILE *f = fopen(g_logpath, "w"); if (f) fclose(f);
 
-// ---- SIGSEGV/SIGBUS handler: 抓崩溃精确 PC/LR (相对 hsbcchinax) ----
-#include <signal.h>
-static void crash_handler(int sig, siginfo_t*info, void*uap){
-  ucontext_t*uc=(ucontext_t*)uap;
-  uintptr_t sl=hsbc_slide();
-  #if defined(__arm64__)||defined(__aarch64__)
-  _STRUCT_MCONTEXT64*mc=(_STRUCT_MCONTEXT64*)uc->uc_mcontext;
-  uintptr_t pc=mc->__ss.__pc, lr=mc->__ss.__lr, fp=mc->__ss.__fp;
-  uintptr_t x8=mc->__ss.__x[8], x9=mc->__ss.__x[9], x19=mc->__ss.__x[19];
-  uintptr_t fault=(uintptr_t)info->si_addr;
-  L(@"💥SIG%d fault=0x%lx PC=0x%lx(off+0x%lx) LR=0x%lx(off+0x%lx) x8=0x%lx x9=0x%lx x19=0x%lx",
-    sig,fault,pc,(sl&&pc>sl)?pc-sl:pc,lr,(sl&&lr>sl)?lr-sl:lr,x8,x9,x19);
-  // 抓调用栈: 沿 fp 链回溯几层
-  uintptr_t*f=(uintptr_t*)fp;
-  for(int i=0;i<8 && f;i++){
-    uintptr_t ret=f[1], nfp=f[0];
-    L(@"  bt[%d] ret=0x%lx (off+0x%lx)",i,ret,(sl&&ret>sl)?ret-sl:ret);
-    if(nfp<=(uintptr_t)f) break; f=(uintptr_t*)nfp;
-  }
-  _exit(42); // 主动退出, 避免 corpse 清零现场后我们啥也看不到
-  #endif
-}
-static void install_crash_handler(void){
-  struct sigaction sa; memset(&sa,0,sizeof(sa));
-  sa.sa_sigaction=crash_handler; sa.sa_flags=SA_SIGINFO;
-  sigaction(SIGSEGV,&sa,NULL); sigaction(SIGBUS,&sa,NULL);
-  sigaction(SIGILL,&sa,NULL); sigaction(SIGTRAP,&sa,NULL);
-  L(@"crash handler 已装(SEGV/BUS/ILL/TRAP)");
-}
+  g_slide = hsbc_slide();
+  L("ctor: hsbcchinax slide=0x%lx OBSERVE_ONLY=%d", (unsigned long)g_slide, OBSERVE_ONLY);
 
-%ctor{
-  @autoreleasepool{
-    L(@"注入 pid=%d (Round37 输入探针 OBSERVE_ONLY=%d)",getpid(),OBSERVE_ONLY);
-    struct rebinding r[]={
-      {"stat",my_stat,(void*)&o_stat},
-      {"lstat",my_lstat,(void*)&o_lstat},
-      {"access",my_access,(void*)&o_access},
-      {"open",my_open,(void*)&o_open},
-      {"fopen",my_fopen,(void*)&o_fopen},
-    };
-    rebind_symbols(r,5);
-    L(@"fishhook 已装 (stat/lstat/access/open/fopen)");
-    install_objc_hook();
-    install_crash_handler();
-    pthread_t t; pthread_create(&t,NULL,hb,NULL); pthread_detach(t);
-    pthread_t t3; pthread_create(&t3,NULL,slotpoll,NULL); pthread_detach(t3);
-  }
+  if (!g_slide) { L("ctor: 未找到 hsbcchinax, 放弃"); return; }
+
+  volatile uintptr_t *slot = (volatile uintptr_t *)(SLOT_VMADDR + g_slide);
+  uintptr_t prior = *slot;
+  uintptr_t realgate = GATE_VMADDR + g_slide;
+  // 记录先后顺序: prior==0 说明我们早于 App 安装点(好); ==realgate 说明 App 已装(晚, 检测可能已跑)
+  L("ctor: slot@0x%lx prior=0x%lx realgate=0x%lx tramp=0x%lx (%s)",
+    (unsigned long)slot, (unsigned long)prior, (unsigned long)realgate,
+    (unsigned long)&hsbc_svc_tramp,
+    prior==0 ? "早于App安装(理想)" : (prior==realgate ? "App已安装(晚)" : "未知值"));
+
+  *slot = (uintptr_t)&hsbc_svc_tramp;
+  L("ctor: 已把 svc 网关重定向到本探针跳板");
+
+  pthread_t th;
+  pthread_create(&th, NULL, poller, NULL);
+  pthread_detach(th);
 }

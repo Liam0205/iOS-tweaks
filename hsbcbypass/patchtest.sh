@@ -6,7 +6,7 @@ set -u
 PROJ=/home/liam/iOS-dev/iOS-tweaks/hsbcbypass
 PRISTINE=$PROJ/app-binary/hsbcchinax
 WORK=/tmp/hsbcchinax.patched
-SSH="ssh -p 22315 -o StrictHostKeyChecking=no -o ConnectTimeout=6 mobile@localhost"
+SSH="ssh -p 2215 -o StrictHostKeyChecking=no -o ConnectTimeout=6 mobile@localhost"
 OFF="${1:?需要 file_offset(hex, 不带0x 或带都行)}"
 NEW="${2:?需要 new_bytes(hex, 如 00008052)}"
 SECS="${3:-25}"
@@ -25,7 +25,7 @@ PY
 [ $? -ne 0 ] && { echo "patch 失败"; exit 1; }
 
 echo "=== 2. 推送未签名 patch 到设备 (在设备上用原生 ldid 签, 保证 sha256-only 且被 trustcache 接受) ==="
-scp -P 22315 -o StrictHostKeyChecking=no "$WORK" mobile@localhost:/tmp/hsbcchinax.patched >/dev/null || { echo "scp 失败"; exit 1; }
+scp -P 2215 -o StrictHostKeyChecking=no "$WORK" mobile@localhost:/tmp/hsbcchinax.patched >/dev/null || { echo "scp 失败"; exit 1; }
 
 echo "=== 3+4. 设备端: 原生 ldid 重签 → 部署 → 重建 trustcache → 启动 → 观测 ==="
 $SSH "SECS=$SECS bash -s" <<'DEV'
