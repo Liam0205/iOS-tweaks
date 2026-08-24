@@ -1883,3 +1883,27 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - **(B) 接受内核层结论**: 检测=内存完整性(dyld cache 比对/vm_region 枚举检测 ElleKit 注入页), tweak 层无法隐藏,
   需内核层(KFD/PPL 已有)做 vm_region 过滤 —— 工程量大, 记为高难阻塞。
 - 倾向先试 (A): 一次 Stalker trace 可能直接定位判定点, 性价比高。
+
+## Round 60（2026-08-24,★★★ 颠覆性发现: 0x75bf7c 正常返回, 退出不走任何标准 exit 路径)
+
+### 用 ElleKit MSHookFunction hook 多个退出点(不 nop-store, 真实序列)
+- hook: 0x1f05dc(网关exit封装), 0x75bf7c(状态机), libc exit/_exit/abort/pthread_kill/pthread_exit/kill。
+- 结果(pristine 真实序列, App 3s 主动退出/无崩溃):
+  - **[ENTER-0x75bf7c] t=452ms → [RETURN-0x75bf7c] t=455ms**: 状态机**正常返回, 只跑 3ms, 没在里面 exit!**
+  - **其余所有 exit hook 一个没命中。** App 却在 3s 主动退出(无崩溃日志=非信号/看门狗)。
+
+### ★★★ 推翻 Round 52-59 的核心假设
+- **0x75bf7c 不是退出点**。它 3ms 就返回, 里面 4 个 exit(1) 是死代码(本次未走)。
+- 之前"nop 4 个 exit 调用致自旋""patch 0x1f05dc 改行为"的因果链**站不住**——那些改动的副作用来自破坏 init 序列, 不是拦到了真实退出。
+- 真实退出(~3s)**不经**: 0x1f05dc / libc exit / _exit / abort / pthread_kill / pthread_exit / kill。
+
+### 退出机制的新假设(待验证)
+1. **raw svc 直接 exit**(不用 0x1f05dc 封装, 别处内联 `mov x16,#1; svc`)—— 需 hook 网关槽抓 nr=1(但那需 nop-store)。
+2. **Mach 终止**: task_terminate / thread_terminate_self(经 mach_msg 或 mach trap), 不走 BSD exit。
+3. **系统杀**: Promon 让 App 不 checkin/不渲染, 被 SpringBoard/backboardd 正常终止(非崩溃)。3s ≈ 启动 checkin 超时。
+4. 退出发生在 **0x75bf7c 返回之后**(455ms)到 3s 之间, 即 init[42] 后续(0x346c7c 收尾 / 0x43e0f8 blr x8)或更晚的检测层。
+
+### 下一步
+- hook 0x75bf7c 之后 init[42] 的调用: 0x346c7c(收尾状态机) + 0x43e0f8 的 blr x8 目标。
+- hook mach: task_terminate/thread_terminate(dlsym) + exit 的所有别名(__exit/exit_group?)。
+- 或回到网关观测(nop-store)但**只抓 nr=1(exit)的调用者**, 看退出的 caller(即使自旋, exit 前的 caller 也能抓到)。

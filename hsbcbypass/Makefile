@@ -12,6 +12,7 @@ TWEAK_NAME = HSBCBypass
 
 HSBCBypass_FILES = Tweak.x
 HSBCBypass_CFLAGS = -fobjc-arc
+HSBCBypass_LIBRARIES = substrate
 ifeq ($(shell uname),Linux)
 HSBCBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
 endif
