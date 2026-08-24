@@ -2126,3 +2126,20 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   就跳到下一个非注入区域返回(或合并进相邻合法区域), 使遍历者看不到注入物。
 - 保留自身: 本 bypass tweak 的区域也要隐藏(否则被扫到)。可行, 因为 hook 后自己也在过滤逻辑里。
 - 验证: 若这样能绕过 3s 退出 → PoC 成立, 且是用户态可发布方案。
+
+## Round 71 / PoC阶段A3（2026-08-24,vm_region_recurse_64 过滤有效但仍退出: 检测不(只)靠这个 walk）
+
+### 确认 Promon 用 vm_region_recurse_64(非 mach_vm_region_recurse): vrr64 400+ 次, mvrr 0 次
+### hook vm_region_recurse_64 过滤注入区域: skip 日志证明**确实跳过了 30+ 个注入 dylib 区域**
+- 跳过的是经典 dylib 4段签名(0x8000 r-x + 3×0x4000), dladdr 正确识别为 procursus 注入物。
+- **但 App 仍 3s 退出**。⇒ 隐藏注入 dylib 区域**不足以**绕过。
+
+### 关键推论: vm_region walk 不是(唯一)verdict 来源
+- 要么 vrr64 walk 用途不是越狱判定(可能是别的初始化), 要么有**更早/并行**的检测路径决定 3s 退出。
+- vrr64 walk 在 t=541ms; 但 3s 退出的 init[42] verdict 可能在别处、更早。
+- 注意: Round70 观测到 vrr64 walk 时 App 也是 3s 退出的(观测本身不改变), 说明 walk 与退出可能不直接因果。
+
+### 下一步: 确定 3s 退出的真正检测源(回到 init[42] verdict 的数据来源)
+- vm_region 这条是干扰项还是真检测? 需在 init[42] 的 verdict(0x43ebc4)触发前, 看它读的状态从哪来。
+- 结合 Round67(SKS哈希结构): init[42] 的 SKS 收集可能不是 vm_region walk, 是别的(读 dyld/mach header)。
+- 或: 3s 退出根本是另一个更早的检测(在 vrr64 walk 之前就判了)。需 hook init[42] verdict + 加时间戳定位。

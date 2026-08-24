@@ -1,74 +1,52 @@
-// Round 70 / PoC 阶段A2: 测"检测=vm_region 遍历"假设。
-// hook mach_vm_region_recurse / vm_region_recurse_64 / mach_vm_region, 记录 Promon 是否调、扫哪些区域。
-// 若 Promon 用它枚举内存找注入的可执行区(非cache/非app的 rwx 或 file-backed),
-// 则可在此 hook 里过滤掉注入区域(用户态中等方案), 或据此定内核过滤点。
+// Round 71 / PoC 阶段A3: 用户态 vm_region_recurse_64 过滤, 隐藏注入 dylib 区域。
+// Promon 用 vm_region_recurse_64 遍历全地址空间找注入 dylib(Round70 确认)。
+// 本 hook: 当原函数返回的区域属于"注入 dylib"(dladdr 判路径含 procursus/var jb/TweakInject/ellekit),
+// 就用该区域末尾作为新起点再查, 循环跳过, 直到拿到非注入区域返回 → 遍历者看不到注入物。
+// 保留自身: HSBCBypass 也会被跳过(它路径也在 procursus)。
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <mach/mach.h>
-#import <dlfcn.h>
 
 extern void MSHookFunction(void *symbol, void *replace, void **result);
-// mach_vm 类型(theos SDK 禁 mach_vm.h, 手工声明)
 typedef uint64_t mach_vm_address_t;
-typedef uint64_t mach_vm_size_t;
 
+#ifndef PROBE_LOG
+#define PROBE_LOG 1
+#endif
 static int g_fd=-1; static double g_t0=0;
-static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
-static void emitf(const char*fmt,...){char b[400];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);if(g_fd>=0)(void)write(g_fd,b,strlen(b));}
-static double now_ms(void){return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*1000:0;}
+static void emit(const char*s){if(PROBE_LOG&&g_fd>=0)(void)write(g_fd,s,strlen(s));}
 
-// hook mach_vm_region_recurse
-static kern_return_t (*o_mvrr)(vm_map_t,mach_vm_address_t*,mach_vm_size_t*,natural_t*,vm_region_recurse_info_t,mach_msg_type_number_t*);
-static int c_mvrr=0;
-static kern_return_t my_mvrr(vm_map_t t,mach_vm_address_t*addr,mach_vm_size_t*sz,natural_t*depth,vm_region_recurse_info_t info,mach_msg_type_number_t*cnt){
-  mach_vm_address_t in_addr = addr?*addr:0;
-  kern_return_t r = o_mvrr(t,addr,sz,depth,info,cnt);
-  c_mvrr++;
-  if(c_mvrr<=40){
-    struct vm_region_submap_info_64 *si=(struct vm_region_submap_info_64*)info;
-    emitf("[mvrr#%d] in=0x%llx → addr=0x%llx sz=0x%llx prot=%c%c%c t=%.0fms\n",
-      c_mvrr,(unsigned long long)in_addr,(unsigned long long)(addr?*addr:0),(unsigned long long)(sz?*sz:0),
-      (r==0&&si)?((si->protection&1)?'r':'-'):'?',
-      (r==0&&si)?((si->protection&2)?'w':'-'):'?',
-      (r==0&&si)?((si->protection&4)?'x':'-'):'?', now_ms());
+// 某地址是否属于注入物(据 dladdr 的 image 路径)
+static int addr_is_injected(unsigned long a){
+  Dl_info di;
+  if(dladdr((void*)a,&di) && di.dli_fname){
+    if(strstr(di.dli_fname,"procursus")||strstr(di.dli_fname,"/var/jb")||
+       strstr(di.dli_fname,"TweakInject")||strstr(di.dli_fname,"ellekit")||
+       strstr(di.dli_fname,"MobileSubstrate")) return 1;
   }
-  return r;
+  return 0;
 }
-// hook vm_region_recurse_64
+
+// vm_region_recurse_64 过滤
 static kern_return_t (*o_vrr64)(vm_map_t,vm_address_t*,vm_size_t*,natural_t*,vm_region_recurse_info_t,mach_msg_type_number_t*);
-static int c_vrr64=0;
-static kern_return_t my_vrr64(vm_map_t t,vm_address_t*addr,vm_size_t*sz,natural_t*depth,vm_region_recurse_info_t info,mach_msg_type_number_t*cnt){
-  kern_return_t r=o_vrr64(t,addr,sz,depth,info,cnt); c_vrr64++;
-  // 标注该区域是否属于注入 dylib(用 dladdr 判断返回地址所属 image)
-  if(c_vrr64<=400 && r==0 && addr){
-    unsigned long a=(unsigned long)*addr;
-    Dl_info di; const char*owner="?"; int inj=0;
-    if(dladdr((void*)a,&di) && di.dli_fname){
-      const char*b=strrchr(di.dli_fname,'/'); owner=b?b+1:di.dli_fname;
-      if(strstr(di.dli_fname,"procursus")||strstr(di.dli_fname,"/var/jb")||strstr(di.dli_fname,"TweakInject")||strstr(di.dli_fname,"ellekit")) inj=1;
-    }
-    struct vm_region_submap_info_64 *si=(struct vm_region_submap_info_64*)info;
-    char pr[4]={'-','-','-',0};
-    if(si){ if(si->protection&1)pr[0]='r'; if(si->protection&2)pr[1]='w'; if(si->protection&4)pr[2]='x'; }
-    emitf("[vrr64#%d] 0x%lx sz=0x%lx %s %s%s\n",c_vrr64,a,(unsigned long)(sz?*sz:0),pr, inj?"★INJ ":"", owner);
-  }
-  return r;
-}
-// hook proc_regionfilename(有些检测用它拿区域对应文件名)
-static int (*o_prf)(int,uint64_t,void*,uint32_t);
-static int c_prf=0;
-static int my_prf(int pid,uint64_t addr,void*buf,uint32_t sz){
-  int r=o_prf?o_prf(pid,addr,buf,sz):0; c_prf++;
-  // 全部记录, 特别标注注入路径
-  if(r>0&&buf){
-    const char*fn=(const char*)buf;
-    int inj = strstr(fn,"/procursus")||strstr(fn,"/var/jb")||strstr(fn,"TweakInject")||strstr(fn,"ellekit");
-    emitf("[prf#%d] addr=0x%llx → %s%s\n",c_prf,(unsigned long long)addr, inj?"★INJ ":"", fn);
+static int c_skip=0;
+static kern_return_t my_vrr64(vm_map_t task,vm_address_t*addr,vm_size_t*sz,natural_t*depth,vm_region_recurse_info_t info,mach_msg_type_number_t*cnt){
+  kern_return_t r = o_vrr64(task,addr,sz,depth,info,cnt);
+  // 循环跳过注入区域
+  int guard=0;
+  while(r==KERN_SUCCESS && addr && sz && *sz>0 && addr_is_injected((unsigned long)*addr) && guard<2000){
+    c_skip++;
+    if(c_skip<=30){char b[128];snprintf(b,sizeof(b),"[skip#%d] 0x%lx sz=0x%lx\n",c_skip,(unsigned long)*addr,(unsigned long)*sz);emit(b);}
+    vm_address_t next = *addr + *sz;   // 跳到本区域末尾
+    *addr = next;
+    r = o_vrr64(task,addr,sz,depth,info,cnt);
+    guard++;
   }
   return r;
 }
@@ -77,10 +55,8 @@ static int my_prf(int pid,uint64_t addr,void*buf,uint32_t sz){
   g_t0=CFAbsoluteTimeGetCurrent();
   char path[256];snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
   FILE*f=fopen(path,"w");if(f)fclose(f); g_fd=open(path,O_WRONLY|O_APPEND);
-  emit("A2: hook vm 枚举原语\n");
-
-  void*p;
-  if((p=dlsym(RTLD_DEFAULT,"mach_vm_region_recurse"))){ MSHookFunction(p,(void*)my_mvrr,(void**)&o_mvrr); emit("  hooked mach_vm_region_recurse\n"); }
-  if((p=dlsym(RTLD_DEFAULT,"vm_region_recurse_64"))){ MSHookFunction(p,(void*)my_vrr64,(void**)&o_vrr64); emit("  hooked vm_region_recurse_64\n"); }
-  if((p=dlsym(RTLD_DEFAULT,"proc_regionfilename"))){ MSHookFunction(p,(void*)my_prf,(void**)&o_prf); emit("  hooked proc_regionfilename\n"); }
+  emit("A3: 安装 vm_region_recurse_64 过滤(隐藏注入区域)\n");
+  void*p=dlsym(RTLD_DEFAULT,"vm_region_recurse_64");
+  if(p){ MSHookFunction(p,(void*)my_vrr64,(void**)&o_vrr64); emit("A3: hooked vm_region_recurse_64\n"); }
+  else emit("A3: 找不到 vm_region_recurse_64\n");
 }
