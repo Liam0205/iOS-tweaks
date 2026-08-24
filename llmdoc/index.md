@@ -26,6 +26,7 @@
 - `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、SDK 识别与 exit 源头静态分析。**⚠️ 含 2026-08-21 第 15 轮重大更正**：可信基线（裸跑主 App ~13s 正常退出、全量 hook ~1s 崩溃）、`0xb5a06000` 崩溃根因 = libc 函数 inline-hook 被完整性自检发现、唯一安全手段为 ObjC swizzle；旧 v95"双通道杀死/覆盖成功"多为误判（存活检测匹配到扩展进程），已标注作废。
 - `llmdoc/reference/lianjiabypass-detection-vectors.md`：链家/贝壳找房检测栈（JGBSDK 核心引擎 + du/senseid 指纹采集器 + a.framework 注入检测）、JGBSDK XxxCheck selector 与越狱特征字符串、DynamicLibraries 目录扫描、a.framework 主线程慢扫描机制、29 处内联 svc #0x80 退出点、anti-frida、当前覆盖状态（四层全覆盖，两 App 均验证）。
 - `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径、单次 IPC swipe 消除合并竞态、gesture arbiter 投递路径限制迫使系统手势走 SpringBoard API、edge mask 诊断用途）+ Phase 3（从零创建多指事件、cubic-bezier、HID keyboard、killall backboardd）。
+- `llmdoc/reference/hsbc-china-detection-vectors.md`：汇丰中国（`cn.com.hsbc.hsbcchina` 3.72.15）检测向量——SDK 识别为 **Promon SHIELD**（更正早期 OneSpan/ThreatMetrix 误判）、私有 svc 网关机制（全局槽跳板绕开 libSystem 具名符号致符号级 hook 全失效）、init[42] CFF 状态机 verdict、`mach_vm_read_overwrite` 读库头识别注入库（`systemhook.dylib`）、已排除向量清单、当前未绕过（PoC 阶段）。
 
 ## guides/
 
@@ -35,7 +36,8 @@
 
 ## memory/reflections/
 
-- `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 分析经验反思。
+- `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 早期分析方法论反思（10+ 轮）。**结论已被 [[hsbc-china-promon-poc]] 更正（SDK 身份 OneSpan→Promon SHIELD）**，仅存档参考。
+- `llmdoc/memory/reflections/hsbc-china-promon-poc.md`：汇丰中国 Promon SHIELD 检测定位与绕过 PoC 反思（第 55-76 轮）——追错函数 8 轮的教训（`0x75bf7c` 实测与退出无关）、SDK 身份更正为 Promon SHIELD、私有 svc 网关机制与 `mach_vm_read_overwrite` 读库头识别 `systemhook.dylib` 的完整检测链路、多 SDK 并存误判排除过程、用户态干预效果（3s→17s，未达净启动）。
 - `llmdoc/memory/reflections/icbcbypass-v1.0.0-release.md`：icbcbypass v1.0.0 发布反思——嵌套 RunLoop 死锁教训、fishhook 替代 MSHookFunction 约束、semaphore 区分策略。
 - `llmdoc/memory/reflections/icbc-3090-adaptation.md`：ICBC 3.0.90 适配反思——全局阻断框架方法的隐性退化、速率限制优于时间门控、sched_yield 缓解忙循环。
 - `llmdoc/memory/reflections/anti-detection-deep-analysis.md`：MSHookFunction 风险决策、inline SVC 对抗哲学、fishhook 被禁极端场景分析、发版配置教训。

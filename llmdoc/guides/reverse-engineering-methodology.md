@@ -179,6 +179,18 @@
 - Mach VM 层检测：优先观察并 Hook `vm_region` / `mach_vm_region` 等接口
 - Raw syscall 退出：通常无法在普通用户态稳定拦截，应转向 binary patch 或隐藏更上游检测源头
 
+**私有 svc 网关场景的特殊判别**：部分强 RASP（如 Promon SHIELD）不直接调用 libSystem 里
+的具名 syscall/mach 函数，而是把封装收进私有数据段/BSS 槽的跳板（形如
+`ldr x17, [全局槽]; blr x17`，槽指向一段 `svc #0x80` 数据）。这种设计下：
+
+- fishhook（GOT rebind）、`MSHookFunction` 挂 libSystem 函数、Shadow 之类基于符号解析的
+  工具级 hook **全部无效**，因为调用根本不经过 libSystem 的具名符号入口
+- 唯一可行的用户态拦截点是**目标二进制自己的封装函数入口**（ElleKit inline hook 该
+  `__text` 内的封装函数），需要先靠静态分析定位该入口的地址；如果连这一层都定位不到，
+  才应该转向内核层方案
+- 判断是否处于这种场景的信号：对标准 libc 函数（`exit`/`stat`/`open` 等）做符号级 hook
+  完全 0 命中，但目标行为（文件检测、退出）确实在发生
+
 这里的关键原则是：
 
 - 先判断层级，再写对抗代码
@@ -261,6 +273,35 @@ inline-hook / GOT 改写 / `__text` patch。对这类目标：
 - **最优解常在 ObjC 层**：定位「检测判定 / 退出逻辑」所在的 ObjC 方法，整体 swizzle 短路，
   远胜于 hook `exit` 后用 longjmp/栈切换事后抢救（后者破坏 CF/GCD/UIKit 内部状态，不可恢复）。
 - 靠**类名/方法名**定位的 swizzle 不依赖地址偏移，天然跨目标小版本/机型/系统版本通用。
+
+### patch 前先用运行时证据证明因果
+
+不要在"看起来像检测逻辑"的疑似关键函数上反复 patch/nop。补丁前必须先用运行时手段
+（ElleKit/Frida hook + fp-chain 栈回溯、crash tag）证明该函数确实处于退出/判定的调用链
+上，而不是仅凭函数体积大、控制流复杂就假定它是检测核心。
+
+汇丰中国分析中，`0x75bf7c` 是个典型反例：因为它体积大、混淆重，被当成退出点围绕它
+patch/nop 了 8 轮，实测用 hook + fp-chain 回溯后发现它只运行约 3ms 就正常返回，与退出
+完全无关；真正的 verdict 在另一处的 CFF 状态机里。
+
+- 判断"是否在退出路径上"的最小实验：在疑似函数入口/出口打 hook，记录它是否在崩溃/退出
+  前的时间窗口内被调用
+- 只有证据支持"该函数在退出前的调用链上"，才值得对它做进一步 patch 实验
+
+### 多个安全 SDK 并存时，核对调用方身份再归因
+
+一个 App 可能同时集成多个安全 SDK（如汇丰中国同时有 Promon SHIELD 与另一个疑似
+TuringShield/RASPFramework 的 SDK）。观测到某个可疑 API（如内存枚举、文件检测函数）被
+频繁调用，不能直接归因于当前分析的目标二进制——它可能来自进程内另一个并存的 SDK。
+
+在下结论前，用以下方式核对调用方身份：
+
+- 用 `dladdr` 判断调用返回地址所属的 image（哪个 dylib/binary）
+- 检查目标二进制自己的 bind/lazy-bind 表，确认它是否真的导入/调用了这个 API
+
+汇丰中国分析中，`vm_region_recurse_64` 被调用 400+ 次、能跳过 30+ 个注入区域，一度被
+当成目标 SDK 的检测向量；核对目标主 binary 的 bind 表后发现它根本不导入任何内存枚举类
+libSystem 函数，那次调用其实来自进程内另一个并存的安全 SDK。
 
 ## 实操规范
 
