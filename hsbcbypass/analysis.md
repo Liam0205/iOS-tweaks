@@ -1509,3 +1509,40 @@ B. **换 patch 层级**:不强制 clean 走 guarded body,而是找"让 caller �
   只有"真正没被 patch/正常启动"时才建立的运行时状态(associated object / 解密指针)。
   可能需要回到"不改 verdict 而是让检测输入为 clean"(即检测函数真的判定未越狱),
   这样 guarded body 的前置状态由正常流程建立。
+
+## Round 46（2026-08-24,★★ 探针实测 —— 检测不走 libc + 崩溃根因=Promon 自定位锚点 0x838138)
+
+### 探针实测结论1:Promon 检测完全不走 libc 文件层(彻底排除文件 hook 路线)
+观测探针(fishhook stat/lstat/access/open/fopen + swizzle fileExistsAtPath:)实测:
+- 所有 jb 路径命中的 caller **全是注入器**:libinjector(52)/systemhook(23)/Choicy(18)/libsandy(1)。
+- **hsbcchinax 发起的文件查询:0 条。** ⇒ Promon 检测不调 libc 文件 API(印证 Round3)。
+  hook 文件探测/fileExistsAtPath: 对绕过无用。
+
+### 探针实测结论2:★加密 stub 槽解密后指向 hsbcchinax 内部函数(非系统 API)
+- slot 0x84c000(0x7748d8) → **hsbcchinax+0x3bbef4**
+- slot 0x84c020(0x775034) → **hsbcchinax+0x4365d4**
+⇒ Promon 把内部调用也加密成 stub 表(多层)。0x3bbef4 又是薄封装:
+  `mov x16,#6; blr [0x8510c8]`(再经 0x851000 页的加密 stub),继续套娃。纯静态无限层。
+
+### ★★ 崩溃根因锁定:Promon 自定位锚点 0x838138 未初始化
+guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
+```
+0x5d87ac ldr x19,[0x8493b0]      ; x19 = 0x3aeb1ff8 (存储的偏移)
+0x5d87c8 strb wzr,[0x838138]     ; (某分支)清零锚点
+0x5d87cc ldr x8,[0x838138]       ; x8 = *(0x838138)
+0x5d87d0 sub x8,x19,x8           ; x8 = 0x3aeb1ff8 - [0x838138]
+0x5d87d4 blr x8                  ; 崩:[0x838138]=0 → x8=0x3aeb1ff8 裸偏移(无slide)→野地址
+```
+- **0x838138 是 Promon 全局自定位锚点**(0x838000 页被引用 1434 次)。惯用法
+  `真实地址 = 存储值 - [0x838138]`(见 0x79c88 同款代码)。正常时它存某修正值(约 -slide),
+  让 sub 得到正确运行时地址;崩溃时=0 → 裸偏移 → 野指针。
+- ⇒ **我在 0x712e10 强制 clean,跳过了 Promon 初始化锚点 0x838138 的那一步**,导致 guarded
+  body 的自定位计算失败。**问题不是检测,是绕过方式破坏了 Promon 初始化时序。**
+
+### 策略(下一步)
+- 纯静态解多层自定位混淆=无限套娃,放弃。
+- 运行时观测:pristine 正常启动(探针只读),dump 0x838138 正常被写成什么值/何时写,
+  以及 0x8493b0/两个检测函数的真实行为。有正确锚点值→判断补状态 or 换 patch 点。
+- 更根本方向重新浮现:**abcbypass 成功路径=让检测输入真判定未越狱**(而非事后翻 verdict),
+  这样 Promon 走完整正常初始化,锚点/stub 表都正确建立,guarded body 不崩。
+  但 Round46 已知检测不走 libc → 需定位 Promon 检测"读环境"的真实手段(可能内联更深层)。
