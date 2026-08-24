@@ -271,6 +271,21 @@ static void *poller(void *arg) {
   return NULL;
 }
 
+// 紧凑重断言线程: 不 nop-store(不破坏安装序列), 持续把槽写回跳板, 抢在 App 的 str 之后、
+// 0x75bf7c 检测用槽期间在位。两个指针值(跳板/真网关)都能正常发 syscall, 反复覆盖不破坏逻辑。
+// 这样能观测**完整、未破坏的真实检测序列**(含最终 exit(1)), 而非 nop-store 的自旋。
+static volatile uintptr_t *g_slot = NULL;
+static void *reassert(void *arg) {
+  (void)arg;
+  uintptr_t tramp = (uintptr_t)&hsbc_svc_tramp;
+  // 头 3 秒(检测在 ~0-3s)高频重写; 之后降频, 避免长期 100% CPU
+  for (long i=0; i<20000000; i++) {
+    if (g_slot) *g_slot = tramp;
+    if ((i & 0xffff)==0) { /* 偶尔让出 */ }
+  }
+  return NULL;
+}
+
 %ctor {
   g_t0 = CFAbsoluteTimeGetCurrent();
   snprintf(g_logpath, sizeof(g_logpath), "%s/hsbc_probe_%d.log",
@@ -300,6 +315,11 @@ static void *poller(void *arg) {
     (unsigned long)readback,
     readback==(uintptr_t)&hsbc_svc_tramp ? "确认=跳板" : "异常!非跳板");
 
-  // 热路径已同步落盘, 不再需要 poller(之前 poller 读未初始化环尾产生噪声)。
+  // 热路径已同步落盘, 不再需要 poller。
   (void)poller;
+  // 启动重断言线程(不 nop-store, 观测未破坏的真实检测序列直到 exit)
+  g_slot = slot;
+  pthread_t th;
+  pthread_create(&th, NULL, reassert, NULL);
+  pthread_detach(th);
 }

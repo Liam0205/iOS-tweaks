@@ -1864,3 +1864,22 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   (是 dyld cache 内存比对? 还是 vm_region 枚举?)。或用调试器读退出时的调用栈。
 - 或接受: 越狱环境的**根本特征**(ElleKit 注入改了内存 / 存在非 cache 可执行页)无法在不改内核的前提下对 Promon 隐藏,
   则本机(Dopamine KFD+PPL)可能需要**内核层**隐藏(如 vm_region 过滤), 超出 tweak 能力 → 记录为高难度阻塞。
+
+## Round 59（2026-08-24,重断言线程无法赢得竞争: 检测在 init[42] 主线程同步完成)
+
+### 尝试: 不 nop-store, 后台线程紧凑重写槽回跳板, 想观测未破坏的真实检测序列(含 exit)
+- 结果: 跳板 **0 命中**, App 正常 3s 退出。
+- 根因: 安装序列 `0x43e0bc bl 0x346c68(store) → 0x43e0c0 bl 0x75bf7c(检测+exit)` 在**同一 init[42] 主线程上背靠背同步执行**, 微秒级。
+  App 的 str 覆盖我的跳板后, 检测立即用真网关跑完并 exit(1), 我的后台线程根本没被调度到就退了。
+
+### ★ 决定性工程结论: svc 网关观测法对"真实检测路径"根本无效
+- 要么 nop-store(破坏序列 → 自旋, 拿不到真实 exit 路径)。
+- 要么不 nop-store(真实序列微秒级跑完, 后台线程赢不了竞争, 0 观测)。
+- 二者不可兼得。**svc 网关观测到此为止**(已榨干: 确认检测 syscall footprint + 全 benign 返回 + 无文件查询)。
+
+### 下一步(换观测层, 二选一)
+- **(A) Frida Stalker trace 0x75bf7c**: 设备有 /var/jb/usr/sbin/frida-server。用 Stalker 记录 0x75bf7c 实际执行的指令流 +
+  越狱判定分支处的寄存器值, 直接看"判定输入从哪来"。风险: Promon 反 Frida, 可能 attach 即变行为; 但 trace 到 exit 前的分支即可。
+- **(B) 接受内核层结论**: 检测=内存完整性(dyld cache 比对/vm_region 枚举检测 ElleKit 注入页), tweak 层无法隐藏,
+  需内核层(KFD/PPL 已有)做 vm_region 过滤 —— 工程量大, 记为高难阻塞。
+- 倾向先试 (A): 一次 Stalker trace 可能直接定位判定点, 性价比高。
