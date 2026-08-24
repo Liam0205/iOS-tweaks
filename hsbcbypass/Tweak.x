@@ -1,73 +1,86 @@
-// Round 69 / PoC 阶段A1: 验证"检测=dyld image 枚举"假设。
-// 在 %ctor 早期改 _dyld_all_image_infos.infoArray, 把 /var/jb(/private/preboot) 注入的 dylib 条目
-// 从数组里"摘掉"(用列表末尾的合法条目覆盖, 缩短 count), 使 Promon 枚举 image 时看不到注入物。
-// 若这样能绕过 3s 退出 → 检测就是 image 枚举, 问题大幅简化(可能纯用户态解, 不必内核)。
+// Round 70 / PoC 阶段A2: 测"检测=vm_region 遍历"假设。
+// hook mach_vm_region_recurse / vm_region_recurse_64 / mach_vm_region, 记录 Promon 是否调、扫哪些区域。
+// 若 Promon 用它枚举内存找注入的可执行区(非cache/非app的 rwx 或 file-backed),
+// 则可在此 hook 里过滤掉注入区域(用户态中等方案), 或据此定内核过滤点。
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
-#import <mach-o/dyld_images.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <mach/mach.h>
-#import <mach/task.h>
-#import <sys/mman.h>
+#import <dlfcn.h>
 
-static int g_fd=-1;
+extern void MSHookFunction(void *symbol, void *replace, void **result);
+// mach_vm 类型(theos SDK 禁 mach_vm.h, 手工声明)
+typedef uint64_t mach_vm_address_t;
+typedef uint64_t mach_vm_size_t;
+
+static int g_fd=-1; static double g_t0=0;
 static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
-static void emitf(const char*fmt,...){char b[512];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);if(g_fd>=0)(void)write(g_fd,b,strlen(b));}
+static void emitf(const char*fmt,...){char b[400];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);if(g_fd>=0)(void)write(g_fd,b,strlen(b));}
+static double now_ms(void){return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*1000:0;}
 
-// 判断路径是否是"越狱注入物"(要隐藏的)
-static int is_injected(const char*p){
-  if(!p) return 0;
-  if(strstr(p,"/private/preboot/") && strstr(p,"/procursus/")) return 1; // rootless jb 前缀
-  if(strstr(p,"/var/jb/")) return 1;
-  if(strstr(p,"TweakInject")||strstr(p,"ellekit")||strstr(p,"MobileSubstrate")) return 1;
-  return 0;
+// hook mach_vm_region_recurse
+static kern_return_t (*o_mvrr)(vm_map_t,mach_vm_address_t*,mach_vm_size_t*,natural_t*,vm_region_recurse_info_t,mach_msg_type_number_t*);
+static int c_mvrr=0;
+static kern_return_t my_mvrr(vm_map_t t,mach_vm_address_t*addr,mach_vm_size_t*sz,natural_t*depth,vm_region_recurse_info_t info,mach_msg_type_number_t*cnt){
+  mach_vm_address_t in_addr = addr?*addr:0;
+  kern_return_t r = o_mvrr(t,addr,sz,depth,info,cnt);
+  c_mvrr++;
+  if(c_mvrr<=40){
+    struct vm_region_submap_info_64 *si=(struct vm_region_submap_info_64*)info;
+    emitf("[mvrr#%d] in=0x%llx → addr=0x%llx sz=0x%llx prot=%c%c%c t=%.0fms\n",
+      c_mvrr,(unsigned long long)in_addr,(unsigned long long)(addr?*addr:0),(unsigned long long)(sz?*sz:0),
+      (r==0&&si)?((si->protection&1)?'r':'-'):'?',
+      (r==0&&si)?((si->protection&2)?'w':'-'):'?',
+      (r==0&&si)?((si->protection&4)?'x':'-'):'?', now_ms());
+  }
+  return r;
 }
-
-// 取 dyld_all_image_infos(通过 task_info TASK_DYLD_INFO)
-static struct dyld_all_image_infos* get_all_image_infos(void){
-  task_dyld_info_data_t info;
-  mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-  if(task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &cnt)!=KERN_SUCCESS) return NULL;
-  return (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
+// hook vm_region_recurse_64
+static kern_return_t (*o_vrr64)(vm_map_t,vm_address_t*,vm_size_t*,natural_t*,vm_region_recurse_info_t,mach_msg_type_number_t*);
+static int c_vrr64=0;
+static kern_return_t my_vrr64(vm_map_t t,vm_address_t*addr,vm_size_t*sz,natural_t*depth,vm_region_recurse_info_t info,mach_msg_type_number_t*cnt){
+  kern_return_t r=o_vrr64(t,addr,sz,depth,info,cnt); c_vrr64++;
+  // 标注该区域是否属于注入 dylib(用 dladdr 判断返回地址所属 image)
+  if(c_vrr64<=400 && r==0 && addr){
+    unsigned long a=(unsigned long)*addr;
+    Dl_info di; const char*owner="?"; int inj=0;
+    if(dladdr((void*)a,&di) && di.dli_fname){
+      const char*b=strrchr(di.dli_fname,'/'); owner=b?b+1:di.dli_fname;
+      if(strstr(di.dli_fname,"procursus")||strstr(di.dli_fname,"/var/jb")||strstr(di.dli_fname,"TweakInject")||strstr(di.dli_fname,"ellekit")) inj=1;
+    }
+    struct vm_region_submap_info_64 *si=(struct vm_region_submap_info_64*)info;
+    char pr[4]={'-','-','-',0};
+    if(si){ if(si->protection&1)pr[0]='r'; if(si->protection&2)pr[1]='w'; if(si->protection&4)pr[2]='x'; }
+    emitf("[vrr64#%d] 0x%lx sz=0x%lx %s %s%s\n",c_vrr64,a,(unsigned long)(sz?*sz:0),pr, inj?"★INJ ":"", owner);
+  }
+  return r;
+}
+// hook proc_regionfilename(有些检测用它拿区域对应文件名)
+static int (*o_prf)(int,uint64_t,void*,uint32_t);
+static int c_prf=0;
+static int my_prf(int pid,uint64_t addr,void*buf,uint32_t sz){
+  int r=o_prf?o_prf(pid,addr,buf,sz):0; c_prf++;
+  // 全部记录, 特别标注注入路径
+  if(r>0&&buf){
+    const char*fn=(const char*)buf;
+    int inj = strstr(fn,"/procursus")||strstr(fn,"/var/jb")||strstr(fn,"TweakInject")||strstr(fn,"ellekit");
+    emitf("[prf#%d] addr=0x%llx → %s%s\n",c_prf,(unsigned long long)addr, inj?"★INJ ":"", fn);
+  }
+  return r;
 }
 
 %ctor {
-  char path[256];
-  snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
+  g_t0=CFAbsoluteTimeGetCurrent();
+  char path[256];snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
   FILE*f=fopen(path,"w");if(f)fclose(f); g_fd=open(path,O_WRONLY|O_APPEND);
+  emit("A2: hook vm 枚举原语\n");
 
-  struct dyld_all_image_infos *aii = get_all_image_infos();
-  if(!aii){ emit("A1: 拿不到 all_image_infos\n"); return; }
-  emitf("A1: all_image_infos @%p, infoArrayCount=%u infoArray=%p\n",
-        aii, aii->infoArrayCount, aii->infoArray);
-
-  // infoArray 是 const, 需临时改可写. 先统计要隐藏的
-  const struct dyld_image_info *arr = aii->infoArray;
-  uint32_t n = aii->infoArrayCount;
-  if(!arr||!n){ emit("A1: infoArray 空\n"); return; }
-
-  // 原地压缩数组: 把非注入的条目前移, 注入的丢弃, 缩短 count。
-  // infoArray 内存通常在 dyld 的可写数据区; 尝试直接写, 失败则 mprotect。
-  size_t page = getpagesize();
-  uintptr_t start = (uintptr_t)arr & ~(page-1);
-  uintptr_t end = ((uintptr_t)(arr+n) + page-1) & ~(page-1);
-  mprotect((void*)start, end-start, PROT_READ|PROT_WRITE);
-
-  struct dyld_image_info *warr = (struct dyld_image_info*)arr;
-  uint32_t w=0, hidden=0;
-  for(uint32_t i=0;i<n;i++){
-    const char*fp = warr[i].imageFilePath;
-    if(is_injected(fp)){ emitf("  hide[%u] %s\n", i, fp?fp:"?"); hidden++; continue; }
-    if(w!=i) warr[w]=warr[i];
-    w++;
-  }
-  // 缩短 count(改 all_image_infos.infoArrayCount)
-  mprotect((void*)((uintptr_t)aii & ~(page-1)), page*2, PROT_READ|PROT_WRITE);
-  aii->infoArrayCount = w;
-  emitf("A1: 原 %u 条 → 保留 %u 条, 隐藏 %u 条注入 image\n", n, w, hidden);
-  emit("A1: 完成(若 Promon 走 image 枚举, 应看不到注入物)\n");
+  void*p;
+  if((p=dlsym(RTLD_DEFAULT,"mach_vm_region_recurse"))){ MSHookFunction(p,(void*)my_mvrr,(void**)&o_mvrr); emit("  hooked mach_vm_region_recurse\n"); }
+  if((p=dlsym(RTLD_DEFAULT,"vm_region_recurse_64"))){ MSHookFunction(p,(void*)my_vrr64,(void**)&o_vrr64); emit("  hooked vm_region_recurse_64\n"); }
+  if((p=dlsym(RTLD_DEFAULT,"proc_regionfilename"))){ MSHookFunction(p,(void*)my_prf,(void**)&o_prf); emit("  hooked proc_regionfilename\n"); }
 }

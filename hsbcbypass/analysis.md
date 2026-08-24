@@ -2105,3 +2105,24 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - A1(纯用户态隐藏 image 列表)证伪 → 简单用户态解不成立, 更可能需 vm_region 层或内核层。
 - 但需先确定是 (a) 还是 (c): 若是 vm_region, 可试用户态 hook mach_vm_region 过滤注入区域(仍用户态, 中等);
   若非 image-based, 回到内存哈希(Round67)那条更难的线。
+
+## Round 70 / PoC阶段A2（2026-08-24,★★★ 突破: 检测向量 = vm_region_recurse_64 遍历内存区域找注入 dylib）
+
+### hook vm 枚举原语, 确认 Promon 用 vm_region_recurse_64 扫全地址空间
+- `vm_region_recurse_64` 被调 **400+ 次**(遍历全部 VM region), 从 0x100304000(主程序)开始, t=541ms。
+- 命中所有注入 dylib 的区域(★INJ): Crane.dylib(0x103c8c000)、AppSyncUnified-FrontBoard、
+  BioProtectPhotosProtection 等, 每个都是经典 dylib 段签名: r-x(TEXT)+r--+rw-(DATA)+r--。
+- `proc_regionfilename` 只调 1 次(主程序 China)。⇒ Promon 主要靠 **vm_region_recurse_64 遍历**,
+  识别注入 dylib 区域(可能读 region 起始的 Mach-O 头 / 查 share_mode/object_id / 或路径)。
+
+### ★★ 关键: 这是**用户态可拦截**的向量!
+- 检测不是内核直读, 是走 libSystem 的 `vm_region_recurse_64`(经 mach_msg 到内核, 但调用在用户态)。
+- ⇒ **hook vm_region_recurse_64, 跳过/隐藏注入 dylib 的区域**(遇到注入区就替换成下一个非注入区),
+  Promon 就扫不到注入物。**纯用户态方案, 不必内核!** 这大幅简化 PoC。
+- 修正 PoC 计划: 从"内核 VM 过滤"降级为"用户态 vm_region_recurse_64 过滤"(阶段 C1 用户态)。
+
+### 下一步(PoC 阶段 A3): 实现 vm_region_recurse_64 过滤
+- hook vm_region_recurse_64: 当返回的区域属于注入 dylib(dladdr 判 image 路径含 procursus/var jb),
+  就跳到下一个非注入区域返回(或合并进相邻合法区域), 使遍历者看不到注入物。
+- 保留自身: 本 bypass tweak 的区域也要隐藏(否则被扫到)。可行, 因为 hook 后自己也在过滤逻辑里。
+- 验证: 若这样能绕过 3s 退出 → PoC 成立, 且是用户态可发布方案。
