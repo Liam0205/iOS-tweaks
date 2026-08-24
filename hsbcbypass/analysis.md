@@ -2185,3 +2185,17 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 需先确认 4808 到底是 read_overwrite(读内存内容→哈希) 还是 region(枚举布局):
   若是 read 内存内容, 则检测=对内存内容哈希(改内存必被抓, 需内核返回原始字节);
   若是 region 枚举, 则检测=找注入区域布局(隐藏区域即可)。
+
+## Round 72c（2026-08-24,★★★ 解出 mach_vm_read(4808) 参数: 读各区域头32字节查Mach-O身份）
+- msgh_id=4808 = mach_vm_read/read_overwrite。body = [taskport-desc][address][size]。
+- 读的地址+size: 0x1bf368000 sz=0x140; 然后一批 0x1028xxxxx/0x102fxxxxx **sz=0x20(32字节)**。
+- 这些地址 = Round71 vm walk 里的各区域基址(PluginKit/注入dylib)。**读 32 字节 = 读区域头部的 Mach-O header**。
+- ⇒ Promon 检测法: 枚举区域 → mach_vm_read 每个区域头 32 字节 → 查 Mach-O magic/身份, 识别注入 dylib。
+  0x1bf368000(读320字节)可能是 dyld 结构或 shared cache 头。
+
+### ★ 精确拦截目标锁定
+- Promon 经 svc 网关发 mach_vm_read(4808) 读内存内容。要绕过:
+  - **内核层**(issue #1 首选): 拦该进程的 mach_vm_read RPC, 对注入区域地址返回伪造(全0/合法头); 或
+  - 让注入 dylib 的区域头看起来像合法系统库。
+- 这是**读内存内容**(非仅枚举), 印证 Round67 的哈希; 但读的是**区域头**(身份识别), 不是全区域哈希。
+  ⇒ 只需让被读的头部字节看起来非注入即可(改内核 vm_read 返回, 或让注入dylib头部伪装)。

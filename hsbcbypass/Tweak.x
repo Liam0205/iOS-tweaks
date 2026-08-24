@@ -143,8 +143,15 @@ void hsbc_svc_record(long nr, long a0, long a1, long caller) {
     else if(msgid>=3400&&msgid<3500) svc="task";
     else if(msgid>=200&&msgid<300) svc="host";
     else if(msgid>=3200&&msgid<3300) svc="thread";
-    snprintf(b,sizeof(b),"MACH nr=%ld msgh_id=%u(%s) port=0x%x caller=+0x%lx\n",
-      nr, msgid, svc, hdr[2], (unsigned long)(caller-(long)g_slide));
+    // mach_vm RPC 请求体: 头(size随msg) 后是参数。简单 RPC(非complex)参数从偏移 0x18 起。
+    // mach_vm_read/read_overwrite/region: 参数含 target address(u64) + size(u64)。
+    // dump 头后 6 个 u64, 人工判断 address/size。
+    uint64_t *body = (uint64_t*)a0;
+    snprintf(b,sizeof(b),"MACH id=%u(%s) port=0x%x bits=0x%x sz=%u | body: %llx %llx %llx %llx %llx caller=+0x%lx\n",
+      msgid, svc, hdr[2], hdr[0], hdr[1],
+      (unsigned long long)body[3],(unsigned long long)body[4],(unsigned long long)body[5],
+      (unsigned long long)body[6],(unsigned long long)body[7],
+      (unsigned long)(caller-(long)g_slide));
     (void)write(g_fd,b,strlen(b));
     return;
   }
