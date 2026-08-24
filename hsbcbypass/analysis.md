@@ -1978,3 +1978,18 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 ### Round 62 实测: patch 0x43ea2c(检测决策→w0=0) 仍 2s 退出
 - w24=0 后仍退出 ⇒ 要么还有第二 verdict(0x43e938 用别的输入), 要么 w24 有其他写入, 要么 0x7753c4 有副作用。
 - init[42] 有 2 个 verdict(0x43e938/0x43ebc0), 可能走另一条。需要子代理的系统性数据流(state→state 完整图)才能理清多路 verdict。
+
+## Round 63（2026-08-24,子代理未回文但产出CFF切片; 手工建 init[42] 6检测点map)
+
+### init[42] 6 个检测决策点(bl 加密stub; cmp w0,#0; cset 布尔)
+| # | 检测调用 | 结果 | 布尔寄存器 |
+|---|---|---|---|
+| 1 | 0x43e468: bl 0x7753e8 | cmp@0x43e46c | - |
+| 2 | 0x43e528: bl 0x77540c | cmp@0x43e52c | - |
+| 3 | 0x43e600: bl 0x7753c4 | cset@0x43e608 | w8 |
+| 4 | 0x43e680: bl 0x7753f4 | cset@0x43e688 | w21 |
+| 5 | 0x43e7e8: bl 0x775418 | cmp@0x43e7ec | w8 |
+| 6 | 0x43ea2c: bl 0x7753c4 | cset@0x43ea34 | w24(→0x43e910 tst 决定 verdict) |
+- 检测函数全走加密 stub 表(0x84c000, RC4 运行时解密), 静态不知目标。有些(如 0x775418)可能是状态解码helper非检测。
+- 单 patch 0x43ea2c(#6)无效(Round62): 多检测点, 需知道**哪个真是越狱检测**。
+- ⇒ 下一步: 运行时 probe 读加密表槽(0x84c000+off), 拿各 stub 的真实解析地址, 判断哪个是 access/stat/sysctl 等越狱检测。
