@@ -1473,3 +1473,39 @@ caller 0x5d8758:`bl 0x712668`(dispatcher)→ `tbnz w0,#0,0x5d87e0`(0x5d87a4):
   但 body 内 computed blr + 整条 +load 的收敛只能设备验。
 - **静态分析到此完备**。patch 机理正确、单一用途、dispatcher 层双验证、caller 语义正确。
   唯一验证手段 = `./patchtest.sh 712e10 1f2003d5 25`(设备)。
+
+## Round 45（2026-08-24,★ 首次设备实测 0x712e10 patch —— 越过自旋,暴露 guarded body 崩溃)
+
+### 设备重连
+隧道端口变更 22215→22315(设备/服务器几天间隔重连)。已更新 patchtest.sh。
+设备重启导致 /tmp/*.orig 备份丢失,已从本地 pristine(app-binary/hsbcchinax, md5 91d77d..)恢复。
+
+### 实测结果:patch 生效(越过自旋),但 clean 路径的 guarded body 崩溃
+`./patchtest.sh 712e10 1f2003d5 28`:
+- **不再 20s 自旋看门狗**(dispatcher patch 按 Round43 预测生效,走了 clean 态)——这是进步。
+- 但 **~2s 内 SIGSEGV**(China-2026-08-24-110020.ips):
+  - EXC_BAD_ACCESS / SIGSEGV / KERN_INVALID_ADDRESS at 0x0(空指针)
+  - isCorpse=1, triggered thread **0 帧, PC/LR=None, 寄存器几乎全 0**(x0=0,x1=0,x8=3)
+  - 栈损坏无回溯 = 跳到 NULL/野地址执行(computed blr 目标坏)。
+
+### 印证 Round 44 的残余风险
+- clean(w0=0)让 caller 0x5d8758 **不跳过** guarded body,执行 0x5d87b4-0x5d87dc:
+  - 0x5d87d4 `blr x8`(x8 = x19 - [0x838138], x19=[0x849000+0x3b0], associated-object 键控)。
+- 这个 computed blr 在我们环境下算出坏地址 → 崩。**dispatcher 层已解决,问题下移到 caller
+  的 guarded body computed call。**
+
+### 与历史对照
+- Round 33 `mov w0,#0`(也强制 clean 语义)→ +504ms SIGSEGV 栈损坏,**同一现象**。
+- ⇒ 强制 clean 会触发 guarded body 的坏 computed call。这不是 dispatcher 的问题,是
+  "正常设备该跑的 init"在被 patch 的越狱环境下缺了某前置状态。
+
+### 下一步(两条路)
+A. **观测 guarded body 的 blr**:探针 hook 0x5d87d4 前读 x8/x19/[0x838138]/[0x849000+0x3b0],
+   看 x8 算成什么、正常应指向哪。Round38 探针(stub 槽轮询)已编译,加 caller 观测点。
+B. **换 patch 层级**:不强制 clean 走 guarded body,而是找"让 caller 认为 clean 但跳过
+   guarded body"或"让 dispatcher 返回 clean 且 guarded body 前置条件满足"的点。
+   但 Round44 已知 guarded body 是正常 init(不能简单跳过,跳过可能缺初始化)。
+- 关键新认知:**光 patch 检测 verdict 不够**;guarded body 的 computed call 依赖某个
+  只有"真正没被 patch/正常启动"时才建立的运行时状态(associated object / 解密指针)。
+  可能需要回到"不改 verdict 而是让检测输入为 clean"(即检测函数真的判定未越狱),
+  这样 guarded body 的前置状态由正常流程建立。
