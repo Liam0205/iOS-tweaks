@@ -1,68 +1,70 @@
-// Round 67(方向2): 逆 Promon 内存比对。决策函数 0x7753c4(w0, bufA=x1, bufB=x2) 返回 0 却仍退出,
-// 说明 verdict 在别处比对收集到的数据。本探针 hook 0x7753c4, dump 它的 3 个参数(w0 值 + 两个缓冲区内存),
-// 看 Promon 收集/比对的到底是什么(dyld cache? 内存页? 校验和?)。
+// Round 68(内核PoC前置诊断): 从 China 进程内部, 报告 Promon 可能哈希到的"异常":
+//   1) 所有加载的 image(找注入物: ellekit/substrate/tweak, 及 /var/jb 路径);
+//   2) dyld 共享缓存的若干关键 libSystem 函数, 其内存首字节 vs. 该函数应有的 pristine 序言,
+//      判断是否被 inline hook 改过(= Promon 内存比对会抓到的差异)。
+// 目的: 确定"零注入自研tweak"时, 到底什么内存被改了 → 决定内核 VM 过滤要伪装哪块。
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
+#import <mach-o/dyld_images.h>
+#import <dlfcn.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <fcntl.h>
 #import <unistd.h>
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
-
-static int g_fd=-1; static intptr_t g_slide=0; static double g_t0=0;
+static int g_fd=-1;
 static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
-static double now_ms(void){return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*1000:0;}
-// dump 内存 n 字节为 hex(带 ASCII)
-static void dumpmem(const char*tag, const void*p, int n){
-  char b[600];int q=0;const char*t=tag;while(*t)b[q++]=*t++;
-  b[q++]='@';unsigned long v=(unsigned long)p;b[q++]='0';b[q++]='x';
-  {char tb[18];int m=0;unsigned long vv=v;if(!vv)tb[m++]='0';while(vv){int d=vv&0xf;tb[m++]=d<10?'0'+d:'a'+d-10;vv>>=4;}while(m)b[q++]=tb[--m];}
-  b[q++]=' ';
-  if(!p){b[q++]='(';b[q++]='0';b[q++]=')';b[q++]='\n';if(g_fd>=0)(void)write(g_fd,b,q);return;}
-  const unsigned char*u=(const unsigned char*)p;
-  for(int i=0;i<n && q<560;i++){ b[q++]="0123456789abcdef"[u[i]>>4]; b[q++]="0123456789abcdef"[u[i]&0xf]; if((i&3)==3)b[q++]=' ';}
-  b[q++]='\n'; if(g_fd>=0)(void)write(g_fd,b,q);
+static void emitf(const char*fmt,...){
+  char b[512];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);
+  if(g_fd>=0)(void)write(g_fd,b,strlen(b));
 }
 
-typedef long(*fn4)(long,long,long,long);
-static fn4 orig_dec=0;   // 0x7753c4
-static int dec_calls=0;
-static long my_dec(long w0,long bufA,long bufB,long a3){
-  dec_calls++;
-  if(dec_calls<=6){
-    char h[64];snprintf(h,sizeof(h),"[7753c4] #%d w0=0x%lx t=%.0fms\n",dec_calls,(unsigned long)w0,now_ms());emit(h);
-    // bufA/bufB 是栈缓冲, dump 前 48 字节
-    if(bufA>0x100000000L && bufA<0x200000000L) dumpmem("  bufA", (void*)bufA, 48);
-    if(bufB>0x100000000L && bufB<0x200000000L) dumpmem("  bufB", (void*)bufB, 48);
-  }
-  long r = orig_dec? orig_dec(w0,bufA,bufB,a3):0;
-  if(dec_calls<=6){char h[48];snprintf(h,sizeof(h),"  → ret=0x%lx\n",(unsigned long)r);emit(h);}
-  return r;
+// 判断一个函数入口 16 字节里是否有典型 inline-hook 蹦床(adrp+br / ldr+br / b imm)
+static int looks_hooked(const void*fn){
+  const uint32_t*p=(const uint32_t*)fn;
+  uint32_t i0=p[0], i1=p[1];
+  // b/bl imm26: 高6位 000101(b)/100101(bl)
+  if((i0&0xfc000000)==0x14000000) return 1;          // b
+  // adrp x16 (i0) + br x16 常见蹦床
+  if((i0&0x9f00001f)==0x90000010 && (p[2]&0xfffffc1f)==0xd61f0000) return 2;
+  // ldr x16,[pc..]; br x16
+  if((i0&0xff00001f)==0x58000010 && (i1&0xfffffc1f)==0xd61f0000) return 3;
+  return 0;
 }
-
-// 也 hook 数据收集器 774fec, dump 它返回的缓冲
-static fn4 orig_gat=0;  // 0x774fec
-static int gat_calls=0;
-static long my_gat(long a0,long a1,long a2,long a3){
-  gat_calls++;
-  long r=orig_gat?orig_gat(a0,a1,a2,a3):0;
-  if(gat_calls<=3){
-    char h[64];snprintf(h,sizeof(h),"[774fec] #%d ret=0x%lx t=%.0fms\n",gat_calls,(unsigned long)r,now_ms());emit(h);
-    if(r>0x100000000L && r<0x180000000L) dumpmem("  gathered", (void*)r, 64);
-  }
-  return r;
-}
-
-static intptr_t hsbc_slide(void){uint32_t n=_dyld_image_count();for(uint32_t i=0;i<n;i++){const char*nm=_dyld_get_image_name(i);if(nm&&strstr(nm,"hsbcchinax"))return _dyld_get_image_vmaddr_slide(i);}return 0;}
 
 %ctor {
-  g_t0=CFAbsoluteTimeGetCurrent();
-  char path[256];snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
+  char path[256];
+  snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
   FILE*f=fopen(path,"w");if(f)fclose(f); g_fd=open(path,O_WRONLY|O_APPEND);
-  g_slide=hsbc_slide(); if(!g_slide){emit("no slide\n");return;}
-  MSHookFunction((void*)(0x7753c4+g_slide),(void*)my_dec,(void**)&orig_dec);
-  MSHookFunction((void*)(0x774fec+g_slide),(void*)my_gat,(void**)&orig_gat);
-  emit("ctor: hooked 0x7753c4(决策) + 0x774fec(收集)\n");
+
+  // 1) 枚举加载的 image, 标注非 /System 非 cache 的注入物
+  uint32_t n=_dyld_image_count();
+  emitf("=== 加载的 image 共 %u; 非系统注入物: ===\n", n);
+  int injected=0;
+  for(uint32_t i=0;i<n;i++){
+    const char*nm=_dyld_get_image_name(i);
+    if(!nm) continue;
+    // 系统库/cache 跳过, 只报注入物
+    if(strncmp(nm,"/System/",8)==0 || strncmp(nm,"/usr/lib/",9)==0) continue;
+    if(strstr(nm,"/China.app/") ) continue;  // app 自身
+    emitf("  [inj] %s\n", nm);
+    injected++;
+  }
+  emitf("=== 注入物计数(非系统/非app): %d ===\n", injected);
+
+  // 2) 抽查若干 libSystem 常用函数, 看入口是否被 inline hook(shared cache 被改)
+  const char*fns[]={"open","stat","access","read","close","sysctl","exit","mmap",
+                    "objc_msgSend","malloc","strcmp","fopen","dlopen","task_self_trap",NULL};
+  emit("=== libSystem/常用函数入口 hook 检查(shared cache 完整性) ===\n");
+  int hooked=0;
+  for(int i=0;fns[i];i++){
+    void*p=dlsym(RTLD_DEFAULT, fns[i]);
+    if(!p){ emitf("  %s: 未解析\n", fns[i]); continue; }
+    int h=looks_hooked(p);
+    if(h){ emitf("  %s @%p: ★HOOKED(type%d) 首字=%08x\n", fns[i], p, h, *(uint32_t*)p); hooked++; }
+    else  emitf("  %s @%p: clean 首字=%08x\n", fns[i], p, *(uint32_t*)p);
+  }
+  emitf("=== 被 hook 的函数数: %d ===\n", hooked);
+  emit("=== 诊断结束 ===\n");
 }

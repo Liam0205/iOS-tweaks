@@ -2067,3 +2067,23 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 都是大工程。已把检测追到**最底层机制**(内存哈希完整性), 这是 Promon SHIELD 的核心防线。
 - 单机 tweak 层要骗过内存哈希极难(改内存必然改哈希; 除非在哈希读取时返回原始字节=内核层 VM 过滤)。
 - ⇒ **方向2 与方向3 收敛到同一点**: 需在"哈希读取内存"时让它看到未被改的原始字节。tweak 层做不到(哈希直接读物理页), 指向 issue #1 的内核方案。
+
+## Round 68（2026-08-24,内核PoC前置诊断: ★ 检测目标 = 注入的 dylib, 非 shared cache hook)
+
+### 从 China 进程内诊断(枚举image + 抽查libSystem函数入口)
+- **955 个 image, 其中 11 个注入物**(非系统非app): libinjector/libellekit/Choicy/Crane/Cephei/
+  AppSyncUnified/BioProtect×2/FLEXList/FLEXFramework/HSBCBypass, 全从 /private/preboot/.../jb-0/procursus 加载。
+- **14 个常用 libSystem 函数(open/stat/access/sysctl/exit/objc_msgSend/malloc...)入口全 clean**(首字 d503237f=pacibsp),
+  **0 个被 inline hook**。⇒ ElleKit 对这些用 GOT/rebind, 不改 shared cache __TEXT。
+
+### ★ 修正 Round67 结论: 检测目标更可能是"注入的 dylib 存在", 非 shared cache 内存改动
+- shared cache 关键函数没被改 → Promon 的内存哈希若比 cache 应该匹配。真正异常 = **11 个来自 /var/jb 的注入 image**。
+- 这些注入物(injector/ellekit/其他无关tweak)在**任何 ElleKit 越狱设备上都存在**, 且**先于 Choicy 过滤加载** →
+  解释了"pristine 二进制 + 零自研tweak 仍 3s 退出"(越狱注入基建本身就在进程里)。
+- Choicy 给 China 配 tweakInjectionDisabled 未见减少 image(格式待确认/加载时序早于过滤), 仍 2s 退出。
+
+### ⇒ 内核 VM 过滤 PoC 的目标明确
+- 要隐藏的 = 进程里 11 个注入 dylib(在 dyld image 列表 / vm region / mach-o load 结构里)。
+- 关键待确认: Promon 怎么枚举到这些 image(读 dyld_all_image_infos? 遍历 vm_region? 读 mach header?),
+  决定内核层过滤哪个结构。SKS 哈希结构(Round67)可能就是对这些 image 的描述/校验。
+- 挑战: 要隐藏其他注入物但**保留自己的 bypass tweak**(否则没法工作)。
