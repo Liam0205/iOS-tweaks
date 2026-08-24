@@ -54,37 +54,30 @@ static long my_wrap(void* msg, long a1,long a2,long a3,long a4,long a5,long a6,l
   uint64_t req_addr = (msg)? body[4] : 0;   // 经验偏移(Round72c: body[4]=address)
   uint64_t req_size = (msg)? body[5] : 0;
 
-  // 请求体快照(调用前, 因 reply 会覆盖 buffer)
-  uint64_t req_snapshot[8]={0};
-  if(msg && msgid_in==4808) for(int i=0;i<8;i++) req_snapshot[i]=body[i];
+  int inj = (msgid_in==4808) ? addr_is_injected((unsigned long)req_addr) : 0;
+#if !defined(OBSERVE_ONLY) || OBSERVE_ONLY==0
+  // ★ 拦截(调用前改源地址): 注入库的读 → 把源地址重定向到一个合法已加载库(hsbcchinax 基址),
+  // 使 Promon 读到真实、合法、签名正常的 dylib 头, 而非注入库。避免清零致解析失败自旋。
+  if(inj && msg){
+    uint64_t legit = (uint64_t)(0x8000 + g_slide) & ~0x3fffULL;  // hsbcchinax mach header 页(vmaddr 0)
+    // 用 hsbcchinax 的镜像基址(合法系统外但已签名的 App 库)。更稳妥用主程序基址。
+    extern const struct mach_header* _dyld_get_image_header(uint32_t);
+    const struct mach_header* mh0 = _dyld_get_image_header(0); // 主程序 China
+    if(mh0) legit = (uint64_t)mh0;
+    body[4] = legit + (req_addr & 0x0);   // 读合法库头(偏移0)
+  }
+#endif
 
   long r = o_wrap(msg,a1,a2,a3,a4,a5,a6,a7);
 
   if(msgid_in==4808){
     c_4808++;
-    if(c_4808<=8) emitf("  REQ body: %llx %llx %llx %llx %llx %llx %llx %llx\n",
-      (unsigned long long)req_snapshot[0],(unsigned long long)req_snapshot[1],(unsigned long long)req_snapshot[2],
-      (unsigned long long)req_snapshot[3],(unsigned long long)req_snapshot[4],(unsigned long long)req_snapshot[5],
-      (unsigned long long)req_snapshot[6],(unsigned long long)req_snapshot[7]);
-    int inj = addr_is_injected((unsigned long)req_addr);
     Dl_info di; const char*owner="?";
     if(req_addr && dladdr((void*)req_addr,&di) && di.dli_fname){const char*b=strrchr(di.dli_fname,'/');owner=b?b+1:di.dli_fname;}
-    if(c_4808<=60)
-      emitf("[4808#%d] addr=0x%llx sz=0x%llx inj=%d owner=%s t=%.0fms\n",
-        c_4808,(unsigned long long)req_addr,(unsigned long long)req_size, inj, owner, now_ms());
-    // mach_vm_read_overwrite: body[4]=源地址, body[5]=size, body[6]=输出缓冲(数据落这)。
-    uint64_t out_buf = req_snapshot[6];
-#if !defined(OBSERVE_ONLY) || OBSERVE_ONLY==0
-    // 拦截: 注入区域读 → 事后改输出缓冲, 抹掉 Mach-O magic(使 Promon 认不出注入 dylib)。
-    if(inj && r==0 && out_buf){
-      uint32_t *dd=(uint32_t*)out_buf;
-      uint32_t old=dd[0];
-      dd[0]=0;   // Mach-O magic 0xfeedfacf → 0
-      if(c_4808<=20) emitf("  ↳拦截: out_buf 0x%llx magic %x→0\n",(unsigned long long)out_buf,old);
-    }
-#else
-    if(inj && c_4808<=20 && out_buf) emitf("  out_buf=0x%llx magic=%x\n",(unsigned long long)out_buf,*(uint32_t*)out_buf);
-#endif
+    if(c_4808<=40)
+      emitf("[4808#%d] addr=0x%llx sz=0x%llx inj=%d owner=%s%s t=%.0fms\n",
+        c_4808,(unsigned long long)req_addr,(unsigned long long)req_size, inj, owner,
+        inj?" →重定向到合法库":"", now_ms());
   }
   return r;
 }

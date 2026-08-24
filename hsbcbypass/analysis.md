@@ -2238,3 +2238,22 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 改拦截: 对 systemhook 区域的读, 返回一个**合法系统库的 Mach-O 头**(如某 /System 框架的头字节), 而非清零。
 - 或让读返回的头 = 一个正常 dylib 头但路径/UUID 指向系统库。观测能否从自旋变正常启动。
 - 可能还有其他注入库要一起处理(目前只 systemhook 被读到, 但 UI 阶段可能查更多)。
+
+## Round 75 / PoC方案U续（2026-08-24,伪装 systemhook 头两法都未完全成功, 但确证检测点）
+- 法1(清零 magic, Round74): 绕过 3s 退出 → 但 100% CPU 自旋(Promon 解析失败循环)。
+- 法2(重定向源地址到主程序 China 头): 撑到 ~15s 才退(比 3s 长), 但仍退 —— Promon 可能校验头里的
+  加载地址字段与区域基址一致性, 读到 China 头对不上 systemhook 区域 → 判异常。
+- systemhook 被读多次(#5 头, #29-32 重复 + 完整 loadcmds 0x6b0), 需一致处理所有读。
+
+### 确证但未竟: 检测点 = mach_vm_read_overwrite 读 systemhook 头(已 100% 定位)
+- 拦这个点确实能改变 3s 退出结局(法1 撑过、法2 延后), 证明**这就是判定输入**。
+- 但"伪装成什么"没找对: 清零→自旋; 拷主程序头→地址不符。
+- 需要: 构造一个"合法 dylib 头, 且其自述加载地址/大小与 systemhook 区域匹配, 但身份是系统库"的伪装,
+  或让 systemhook 区域的读**返回一个真实系统库在相同布局的头**。
+
+### 下一步候选
+1. 深究自旋: 法1 自旋是 Promon 循环还是 app 别处? hook 看自旋 PC(可能还有第二检测)。
+2. 更真实的伪装: 读 systemhook 时返回一个"改了路径/UUID 但结构完整"的头(保留 magic/cputype/ncmds,
+   只改 LC_ID_DYLIB 的路径字符串为 /usr/lib/system 系)。
+3. 或接受: systemhook 是 Dopamine 核心, 可能有多重检测; 评估是否换"从 dyld 层不加载 systemhook 到该进程"
+   (但那会破坏注入基建)。
