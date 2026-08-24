@@ -2199,3 +2199,21 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   - 让注入 dylib 的区域头看起来像合法系统库。
 - 这是**读内存内容**(非仅枚举), 印证 Round67 的哈希; 但读的是**区域头**(身份识别), 不是全区域哈希。
   ⇒ 只需让被读的头部字节看起来非注入即可(改内核 vm_read 返回, 或让注入dylib头部伪装)。
+
+## Round 73 / PoC方案U（2026-08-24,★ hook mach封装 0x40c698 成功, 拿到 mach_vm_read 全部请求）
+- MSHookFunction hook 0x40c698(mach 封装)成功, 不破坏安装序列(restore 模式, 无 nop-store)。
+- 拿到全部 mach_vm_read(4808)请求地址: 先读 China 主程序头, 然后**逐个读每个加载库的头 32 字节**:
+  systemhook.dylib、AnalyticsConvertlab、各 PluginKit... 再对部分读完整 header+loadcmds(sz=0x5038 等)。
+- ⇒ Promon 遍历所有映射库, mach_vm_read 读头部, 识别/哈希。**systemhook.dylib(Dopamine注入核心)在其中** = 异常项。
+- 注入判定 bug: systemhook 路径含 procursus 应匹配但显示 inj=0(dladdr 可能返回 /usr/lib/systemhook.dylib 或 fakelib 短路径)。
+
+### 关键: Promon 读所有库头, 注入库(systemhook + 各tweak)是"多出来的"
+- 检测可能不是"头部 magic 异常", 而是"存在预期外的库"(systemhook/tweaks 不在 HSBC 正常库清单)。
+- 若如此, 篡改头部 magic 没用; 要么让这些库不被 mach_vm_read 到(隐藏区域/使地址读失败),
+  要么让 Promon 遍历库列表时跳过它们(回到"库枚举来源"问题)。
+- systemhook.dylib 路径: /private/preboot/.../procursus/basebin/systemhook.dylib(也有 /usr/lib/ 与 .fakelib/ 别名)。
+
+### 下一步
+- 确认 Promon 怎么得到"要读哪些库地址"的列表(它读 China+每个库头, 说明它有库基址列表)——
+  这个列表来源就是真正的枚举点(可能是 dyld 内部 image 链表, 非 infoArray)。hook/改那个枚举, 比改每个读更根本。
+- 或: 方案U 里对 systemhook + tweak 区域的 mach_vm_read, 让 reply 返回错误(KERN_INVALID_ADDRESS)或全0, 看 Promon 反应。

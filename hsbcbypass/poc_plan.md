@@ -57,7 +57,41 @@
 3. **多检测向量**：可能 image 列表只是其一，还有 dyld cache 哈希等；A1 验证会证伪或缩小范围。
 4. **内核操作安全**：C2 若需改 vm_map，panic 风险高，先在非关键字段试，做好回滚。
 
+## PoC 进展与最终定位（Round 68-72c）
+
+分水岭实验结论（A1→A3）：
+- **A1**（隐藏 dyld_all_image_infos.infoArray）→ 无效。检测不看 infoArray。
+- **A3**（hook libSystem vm_region_recurse_64 过滤注入区域）→ 确实跳过 30+ 注入区域, 但仍退出。
+- **根因**（Round 72）：hsbcchinax **不导入任何内存枚举 libSystem 函数**；vm_region_recurse_64 walk 是
+  **别的并存 SDK**（TuringShield/RASP 等）做的, 与 Promon 3s 退出无关。
+
+**最终精确定位（Round 72b/72c）**：Promon 经**私有 svc 网关**发 `mach_msg(msgh_id=4808 = mach_vm_read)`,
+在 `mach_task_self`(port=0x203) 上**读各内存区域头部 32 字节**（0x20），检查 Mach-O magic/身份来识别注入 dylib。
+调用点 = mach 封装 `0x40c698`（caller +0x40c738）, 读的地址正是各 PluginKit/注入 dylib 的区域基址。
+完全绕开 libSystem（所以 A3 的 libSystem hook 无效）。
+
+## 修正后的拦截方案（三选一, 按可行性排序）
+
+### 方案 U（用户态, 优先试）: hook 0x40c698 mach 封装, 过滤 mach_vm_read 结果
+- `0x40c698` 是 hsbcchinax __TEXT 内的 mach 封装函数（Round 60 已证 inline hook 不触发完整性检测）。
+- hook 它: 让真实 mach_vm_read 执行, 然后**改 reply 缓冲**——若读的地址属于注入 dylib 区域,
+  把返回的 32 字节 Mach-O 头改成"非 dylib"或全 0（使 Promon 认不出是注入）。
+- 优点: 纯用户态, 不碰内核, 不 nop-store（不破坏安装序列, 不自旋）。
+- 风险: 0x40c698 也承载其他 mach 调用（不只 4808）; 需按 msgh_id + 地址精确过滤。
+  且要在 init[42] 跑之前 hook 上（%ctor 时序, Round 60 证明 MSHookFunction 能在 ctor 挂上）。
+
+### 方案 K（内核层, 兜底 = issue #1）: 拦该进程 mach_vm_read RPC / 改 vm_map
+- 若方案 U 的 hook 时序赢不了 init[42], 或 0x40c698 有反 hook, 走内核。
+- libjailbreak 有 proc_for_pid + kreadbuf/kwritebuf; 可改 China 的 vm_map_entry 使注入区域
+  的 backing/头部读出来是合法的; 或 hook 内核 mach_vm_read 路径。
+
+### 方案 S（svc 网关精细化）: 只在 4808 的 reply 后改数据, 不 nop-store
+- 之前 nop-store 观测会自旋是因为破坏安装序列; 若用 ElleKit 精确 hook 0x40c698 而非改网关槽, 可避免。
+- 实际上方案 U 就是 S 的干净实现。
+
 ## 第一步（本次要做）
-实现 **阶段 A1**：用户态 tweak 早期隐藏 `dyld_all_image_infos` 里的 11 个注入 image，
-观测是否绕过 3s 退出。这是整个 PoC 的分水岭——用最小代价证实/证伪"检测=image 枚举"这一核心假设，
-决定后续走用户态（C1，简单）还是内核（C2，复杂）。
+实现 **方案 U**：ElleKit hook `0x40c698`（mach 封装）, 对 `mach_vm_read`(msgh_id 4808) 读注入 dylib
+区域头部的调用, 篡改 reply 使返回的 Mach-O 头看起来非注入（改 magic / 清零）。观测是否绕过 3s 退出。
+这是当前最可能用纯用户态拿下的方案, 且不破坏安装序列（避免自旋）。
+- 保留自身: HSBCBypass 自己的区域也要在过滤范围内（否则被 Promon 读到）。
+- 判定注入区域: dladdr(address) 的 image 路径含 procursus/var jb/TweakInject/ellekit。
