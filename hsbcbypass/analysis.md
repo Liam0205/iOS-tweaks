@@ -2087,3 +2087,21 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 关键待确认: Promon 怎么枚举到这些 image(读 dyld_all_image_infos? 遍历 vm_region? 读 mach header?),
   决定内核层过滤哪个结构。SKS 哈希结构(Round67)可能就是对这些 image 的描述/校验。
 - 挑战: 要隐藏其他注入物但**保留自己的 bypass tweak**(否则没法工作)。
+
+## Round 69 / PoC阶段A1（2026-08-24,隐藏 dyld image 列表无效: 检测不(只)靠 infoArray 枚举）
+
+### A1: %ctor 改 _dyld_all_image_infos.infoArrayCount 955→944, 摘掉 11 个注入 image 条目
+- 11 个注入 dylib 都在数组末尾(idx 944-954), 压缩+缩短 count 干净完成。
+- 结果: **仍 3s 退出**。⇒ Promon **不(仅)靠 dyld_all_image_infos.infoArray 枚举**发现注入。
+
+### 收窄检测向量: 排除最简单的用户态 image 列表
+- 剩余候选: (a) mach_vm_region 遍历找非cache可执行页(经典查注入法); (b) 直接遍历 dyld 内部链表(非infoArray);
+  (c) 读内核 vm_map; (d) 检测根本不是 image-based(而是别的环境特征)。
+- Round57 观测到 mach_msg_trap×13, 可能就是 mach_vm_region/task_info 系列(经 mach_msg 到内核)。
+- 下一步: 探针在 Promon 收集器 0x774fec 里看它遍历/读什么内存(是 vm_region? dyld 链表?),
+  或 hook mach_vm_region 看它扫到哪些区域/是否用返回的 region 信息判越狱。
+
+### PoC 影响
+- A1(纯用户态隐藏 image 列表)证伪 → 简单用户态解不成立, 更可能需 vm_region 层或内核层。
+- 但需先确定是 (a) 还是 (c): 若是 vm_region, 可试用户态 hook mach_vm_region 过滤注入区域(仍用户态, 中等);
+  若非 image-based, 回到内存哈希(Round67)那条更难的线。

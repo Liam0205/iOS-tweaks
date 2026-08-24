@@ -1,36 +1,38 @@
-// Round 68(内核PoC前置诊断): 从 China 进程内部, 报告 Promon 可能哈希到的"异常":
-//   1) 所有加载的 image(找注入物: ellekit/substrate/tweak, 及 /var/jb 路径);
-//   2) dyld 共享缓存的若干关键 libSystem 函数, 其内存首字节 vs. 该函数应有的 pristine 序言,
-//      判断是否被 inline hook 改过(= Promon 内存比对会抓到的差异)。
-// 目的: 确定"零注入自研tweak"时, 到底什么内存被改了 → 决定内核 VM 过滤要伪装哪块。
+// Round 69 / PoC 阶段A1: 验证"检测=dyld image 枚举"假设。
+// 在 %ctor 早期改 _dyld_all_image_infos.infoArray, 把 /var/jb(/private/preboot) 注入的 dylib 条目
+// 从数组里"摘掉"(用列表末尾的合法条目覆盖, 缩短 count), 使 Promon 枚举 image 时看不到注入物。
+// 若这样能绕过 3s 退出 → 检测就是 image 枚举, 问题大幅简化(可能纯用户态解, 不必内核)。
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
 #import <mach-o/dyld_images.h>
-#import <dlfcn.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <mach/mach.h>
+#import <mach/task.h>
+#import <sys/mman.h>
 
 static int g_fd=-1;
 static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
-static void emitf(const char*fmt,...){
-  char b[512];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);
-  if(g_fd>=0)(void)write(g_fd,b,strlen(b));
+static void emitf(const char*fmt,...){char b[512];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);if(g_fd>=0)(void)write(g_fd,b,strlen(b));}
+
+// 判断路径是否是"越狱注入物"(要隐藏的)
+static int is_injected(const char*p){
+  if(!p) return 0;
+  if(strstr(p,"/private/preboot/") && strstr(p,"/procursus/")) return 1; // rootless jb 前缀
+  if(strstr(p,"/var/jb/")) return 1;
+  if(strstr(p,"TweakInject")||strstr(p,"ellekit")||strstr(p,"MobileSubstrate")) return 1;
+  return 0;
 }
 
-// 判断一个函数入口 16 字节里是否有典型 inline-hook 蹦床(adrp+br / ldr+br / b imm)
-static int looks_hooked(const void*fn){
-  const uint32_t*p=(const uint32_t*)fn;
-  uint32_t i0=p[0], i1=p[1];
-  // b/bl imm26: 高6位 000101(b)/100101(bl)
-  if((i0&0xfc000000)==0x14000000) return 1;          // b
-  // adrp x16 (i0) + br x16 常见蹦床
-  if((i0&0x9f00001f)==0x90000010 && (p[2]&0xfffffc1f)==0xd61f0000) return 2;
-  // ldr x16,[pc..]; br x16
-  if((i0&0xff00001f)==0x58000010 && (i1&0xfffffc1f)==0xd61f0000) return 3;
-  return 0;
+// 取 dyld_all_image_infos(通过 task_info TASK_DYLD_INFO)
+static struct dyld_all_image_infos* get_all_image_infos(void){
+  task_dyld_info_data_t info;
+  mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+  if(task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &cnt)!=KERN_SUCCESS) return NULL;
+  return (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
 }
 
 %ctor {
@@ -38,33 +40,34 @@ static int looks_hooked(const void*fn){
   snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",NSTemporaryDirectory().fileSystemRepresentation,getpid());
   FILE*f=fopen(path,"w");if(f)fclose(f); g_fd=open(path,O_WRONLY|O_APPEND);
 
-  // 1) 枚举加载的 image, 标注非 /System 非 cache 的注入物
-  uint32_t n=_dyld_image_count();
-  emitf("=== 加载的 image 共 %u; 非系统注入物: ===\n", n);
-  int injected=0;
-  for(uint32_t i=0;i<n;i++){
-    const char*nm=_dyld_get_image_name(i);
-    if(!nm) continue;
-    // 系统库/cache 跳过, 只报注入物
-    if(strncmp(nm,"/System/",8)==0 || strncmp(nm,"/usr/lib/",9)==0) continue;
-    if(strstr(nm,"/China.app/") ) continue;  // app 自身
-    emitf("  [inj] %s\n", nm);
-    injected++;
-  }
-  emitf("=== 注入物计数(非系统/非app): %d ===\n", injected);
+  struct dyld_all_image_infos *aii = get_all_image_infos();
+  if(!aii){ emit("A1: 拿不到 all_image_infos\n"); return; }
+  emitf("A1: all_image_infos @%p, infoArrayCount=%u infoArray=%p\n",
+        aii, aii->infoArrayCount, aii->infoArray);
 
-  // 2) 抽查若干 libSystem 常用函数, 看入口是否被 inline hook(shared cache 被改)
-  const char*fns[]={"open","stat","access","read","close","sysctl","exit","mmap",
-                    "objc_msgSend","malloc","strcmp","fopen","dlopen","task_self_trap",NULL};
-  emit("=== libSystem/常用函数入口 hook 检查(shared cache 完整性) ===\n");
-  int hooked=0;
-  for(int i=0;fns[i];i++){
-    void*p=dlsym(RTLD_DEFAULT, fns[i]);
-    if(!p){ emitf("  %s: 未解析\n", fns[i]); continue; }
-    int h=looks_hooked(p);
-    if(h){ emitf("  %s @%p: ★HOOKED(type%d) 首字=%08x\n", fns[i], p, h, *(uint32_t*)p); hooked++; }
-    else  emitf("  %s @%p: clean 首字=%08x\n", fns[i], p, *(uint32_t*)p);
+  // infoArray 是 const, 需临时改可写. 先统计要隐藏的
+  const struct dyld_image_info *arr = aii->infoArray;
+  uint32_t n = aii->infoArrayCount;
+  if(!arr||!n){ emit("A1: infoArray 空\n"); return; }
+
+  // 原地压缩数组: 把非注入的条目前移, 注入的丢弃, 缩短 count。
+  // infoArray 内存通常在 dyld 的可写数据区; 尝试直接写, 失败则 mprotect。
+  size_t page = getpagesize();
+  uintptr_t start = (uintptr_t)arr & ~(page-1);
+  uintptr_t end = ((uintptr_t)(arr+n) + page-1) & ~(page-1);
+  mprotect((void*)start, end-start, PROT_READ|PROT_WRITE);
+
+  struct dyld_image_info *warr = (struct dyld_image_info*)arr;
+  uint32_t w=0, hidden=0;
+  for(uint32_t i=0;i<n;i++){
+    const char*fp = warr[i].imageFilePath;
+    if(is_injected(fp)){ emitf("  hide[%u] %s\n", i, fp?fp:"?"); hidden++; continue; }
+    if(w!=i) warr[w]=warr[i];
+    w++;
   }
-  emitf("=== 被 hook 的函数数: %d ===\n", hooked);
-  emit("=== 诊断结束 ===\n");
+  // 缩短 count(改 all_image_infos.infoArrayCount)
+  mprotect((void*)((uintptr_t)aii & ~(page-1)), page*2, PROT_READ|PROT_WRITE);
+  aii->infoArrayCount = w;
+  emitf("A1: 原 %u 条 → 保留 %u 条, 隐藏 %u 条注入 image\n", n, w, hidden);
+  emit("A1: 完成(若 Promon 走 image 枚举, 应看不到注入物)\n");
 }
