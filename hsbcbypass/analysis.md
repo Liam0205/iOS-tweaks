@@ -1613,3 +1613,24 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
    但 Round46 已知检测不走 libc 文件, verdict 在解密后的 0x3bbef4/0x4365d4 内部函数。
 4. 重新聚焦: 探针 hook 解密后的 0x3bbef4(检测函数A, 被调3次)入口, 看它返回什么、
    改返回值能否让 App 活(运行时改, 非磁盘 patch, 避开可能的校验)。
+
+## Round 50（2026-08-24,★★★ 决定性: 无 __TEXT 完整性校验, binary patch 可行!)
+
+### 决定性对照: 改 __cstring 数据字节 → 3s 干净退出(同 pristine)
+- 改 0x7c33bc('clock_ge...' 错误串, 100% 不执行) 1 字节 → **App ~3s 干净退出, 无崩溃**。
+- ⇒ **Promon SHIELD 无 __TEXT 完整性校验!** 改任意不执行的字节无感。
+- ⇒ 之前 0x29b1ec 崩 / 0x29b1f0 自旋 / 0x712e10 崩/自旋 **全是逻辑破坏(改到被执行指令)**,
+  不是反篡改自毁。**binary patch 路线仍可行**, 只是要 patch 对点、不破坏控制流。
+
+### 修正认知
+- 0x29b1ec/0x29b1f0 看似 padding nop, 实在 OLLVM 执行路径上(对齐跳板/被执行), 改了破坏流。
+- 0x712e10 改 dispatcher verdict 消费, 让状态机走 clean 分支 → 但 clean 分支的 guarded body
+  computed blr 依赖某未建立状态 → 崩(Round45)。不是校验, 是时序/状态依赖。
+
+### 下一步: patch 真正的 verdict 判定点(更上游, 不碰 dispatcher)
+- Round46 探针实测: 检测原语 = 解密后的 0x3bbef4(被调3次)/0x4365d4。
+- 0x3bbef4 逻辑: `mov x16,#6; blr [0x8510c8](加密stub); b.lo 0x3bbf18(ret) / b 0x2a74a0`。
+  → verdict 在 blr 返回后的 b.lo 分支。若强制走 ret 分支(未越狱)可能比改 dispatcher 干净。
+- 但需先搞清 0x2a74a0 是什么(退出? 还是正常返回路径)。且 0x3bbef4 是薄封装, 真检测在
+  0x8510c8 解密后的目标 + 0x2a74a0。
+- 更优: 运行时探针 hook 0x3bbef4 入口, 记录它返回值 + 调用者如何用, 定位 verdict 布尔。
