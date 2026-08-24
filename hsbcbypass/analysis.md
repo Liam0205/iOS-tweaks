@@ -2170,3 +2170,18 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 确认 Promon 到底用哪个 mach 操作查 vm(mach_vm_region? task_info TASK_DYLD_INFO? host?):
   在 svc 网关观测法(Round55 Tweak.x.round58svc)基础上, 只记 mach_msg 的 msgh_id + 目标, 看查的是哪个内核服务。
 - 据此定内核拦截点。
+
+## Round 72b（2026-08-24,★★★ 确认 Promon 用 mach_msg(msgh_id=4808, mach_vm 子系统) 查自身内存）
+- svc 网关观测(nop-store) + 解 mach_msg msgh_id: **8 次 msgh_id=4808(mach_vm 子系统), port=0x203(=task自身)**,
+  全来自 caller +0x40c738(Round57 那个 mach 封装 0x40c698)。
+- port=0x203 与 Round58 决策函数 0x7753c4 的 w0=0x203 吻合 = mach_task_self 端口。
+- msgh_id 4808 = mach_vm 子系统 +8。mach_vm.defs 顺序推测 4808≈mach_vm_read_overwrite(读内存)
+  或 region 系。**关键: Promon 经 svc 网关用 mach_vm RPC 读/枚举自身内存做完整性哈希**, 绕开 libSystem。
+- ⇒ A3(hook libSystem vm_region_recurse_64)失败根因确证: Promon 不走 libSystem, 走 raw mach_msg。
+
+### 精确拦截点(二选一)
+1. **svc 网关过滤**: 拦 msgh_id=4808 的 mach_msg, 改其 reply(隐藏注入区域/返回原始字节)。挑战: 网关观测需nop-store会自旋; 要精细化只在mach_msg reply后改数据, 不破坏安装序列。
+2. **内核层**: 拦该进程的 mach_vm RPC 或直接改 vm_map(issue #1)。
+- 需先确认 4808 到底是 read_overwrite(读内存内容→哈希) 还是 region(枚举布局):
+  若是 read 内存内容, 则检测=对内存内容哈希(改内存必被抓, 需内核返回原始字节);
+  若是 region 枚举, 则检测=找注入区域布局(隐藏区域即可)。
