@@ -1780,3 +1780,29 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - (C) 接受"检测输入=文件系统真实状态"的现实: 既然改控制流一律崩/旋, 改用**文件系统层面伪装**——
   把设备上越狱特征路径(/var/jb 等)对该 App 的沙箱视图隐藏(bind mount / RootHide 式), 使真实 syscall 返回 clean。
   这是 RootHide/Dopamine 生态的既有能力, 可能比对抗 Promon 状态机更实际。
+
+## Round 56（2026-08-24,★ 关键负结果: Shadow 全 hook 集(含 Hook_Syscall)对 Promon 无效)
+
+### 设备已装 Shadow(me.jjolano) + Choicy + ellekit + libhooker
+- Shadow 偏好 me.jjolano.shadow.plist 里 **HSBC 早有条目但全部 hook 关闭**(`cn.com.hsbc.hsbcchina: []`)。
+- 对比: 税务 App `cn.gov.tax.its` 开了**全 18 项 hook**(含 Hook_Syscall/Hook_AntiDebugging/Hook_Sandbox/
+  Hook_MachBootstrap/Hook_Memory 等)—— 说明有人为税务 App 精调过, 但 HSBC 放弃了(空配置)。
+
+### 实验: 把 HSBC 的 Shadow 配置设为税务 App 的全 18 项 hook, 禁用自研 tweak, 恢复 pristine 二进制
+- 结果: **仍 3s 静默退出, 无变化, 无崩溃**。
+- ⇒ **Shadow 的 Hook_Syscall 覆盖不到 Promon 的检测路径**。印证: Promon 走私有数据段 svc 网关(0x8510c8→
+  0x78befc)发 `svc #0x80`, 不经 libSystem 具名 syscall 符号, 故 Shadow(hook 具名符号/syscall() 封装)拦不到。
+- 已还原 Shadow 配置(hsbc 恢复空), 备份在设备 .bak.*。
+
+### 战略结论(3 条路已排除, 收敛下一步)
+1. ❌ 中途改控制流(verdict/exit/nop) → 一律自旋或崩(Round 49-54)。
+2. ❌ Shadow/文件系统与 syscall 层伪装 → 覆盖不到 Promon 私有 svc 网关(本轮)。
+3. ✅ 仅剩: **svc 跳板观测法**(Round 55, 机制已证可用: readback+FIRST-CALL 确认跳板被调),
+   需解决非确定性 + 同步落盘, 拿到"越狱路径探测 → 状态变量"的完整数据流, 在**判定输入层**做最小改动。
+   - 或: debugserver/lldb 在 0x75bf7c 下断点单步(设备有无 debugserver 待确认, basebin 里是 idownloadd/jailbreakd)。
+
+### 下一步(具体)
+- 修 svc 跳板观测的两个工程问题, 拿到确定、完整的检测 syscall 轨迹:
+  a. 跳板热路径**同步落盘前 ~400 条**(小 fd 直写, 不靠 1s poller), 确保 3s 内就拿到完整轨迹。
+  b. 不 nop-store(避免破坏安装序列致自旋); 改由**独立 busy 线程持续把槽写回跳板**, 抢在 0x75bf7c 检测用槽期间在位。
+  c. 若拿到"越狱路径 open/access 返回值 → 状态变量"链, 则在跳板里对**这些特定路径**返回 ENOENT(OBSERVE_ONLY=0), 试最小拦截。
