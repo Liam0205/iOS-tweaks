@@ -2217,3 +2217,24 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 确认 Promon 怎么得到"要读哪些库地址"的列表(它读 China+每个库头, 说明它有库基址列表)——
   这个列表来源就是真正的枚举点(可能是 dyld 内部 image 链表, 非 infoArray)。hook/改那个枚举, 比改每个读更根本。
 - 或: 方案U 里对 systemhook + tweak 区域的 mach_vm_read, 让 reply 返回错误(KERN_INVALID_ADDRESS)或全0, 看 Promon 反应。
+
+## Round 74 / PoC方案U（2026-08-24,★★★★ 重大突破: 拦 mach_vm_read_overwrite 改 systemhook 头 → 绕过 3s 退出!）
+
+### 解出 4808 = mach_vm_read_overwrite, 输出缓冲在请求 body[6]
+- 请求体: body[4]=源地址, body[5]=size, body[6]=**输出缓冲地址**(数据写到 Promon 自己内存)。
+- Promon 逐个 mach_vm_read_overwrite 读每个映射库的 Mach-O 头(32B)+ loadcmds, 识别注入库。
+- **systemhook.dylib(Dopamine 注入核心)是唯一被读到的注入库**(magic=0xfeedfacf), 其存在触发越狱判定。
+
+### ★★★★ 拦截成功: hook 0x40c698, 事后把 systemhook 头的输出缓冲 magic 0xfeedfacf→0
+- 结果: **App 不再 3s 退出, 存活 >=15s!** 确证 systemhook.dylib 的检测就是 3s 退出的原因。
+- 这是纯用户态方案(ElleKit hook 0x40c698, 不 nop-store, 不破坏安装序列, 不碰内核)。
+
+### 但仍 100% CPU 自旋(非正常运行)
+- 把 magic 清 0 后, Promon/app 100% CPU 自旋(Rs), 未正常渲染 UI。
+- 推测: magic=0 使 Promon 解析头失败 → 循环重试/下游卡死。
+- ⇒ 不该清零, 应让 systemhook 头**看起来像合法系统库**(拷贝一个真实系统 dylib 的头), 使 Promon 接受为 benign。
+
+### 下一步(接近成功)
+- 改拦截: 对 systemhook 区域的读, 返回一个**合法系统库的 Mach-O 头**(如某 /System 框架的头字节), 而非清零。
+- 或让读返回的头 = 一个正常 dylib 头但路径/UUID 指向系统库。观测能否从自旋变正常启动。
+- 可能还有其他注入库要一起处理(目前只 systemhook 被读到, 但 UI 阶段可能查更多)。

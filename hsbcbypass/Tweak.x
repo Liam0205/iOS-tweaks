@@ -14,6 +14,9 @@
 extern void MSHookFunction(void *symbol, void *replace, void **result);
 
 #define WRAP_OFF 0x40c698   // mach_msg 封装(mov x16,#-0x1f; blr gate)
+#ifndef OBSERVE_ONLY
+#define OBSERVE_ONLY 0      // 0=拦截(抹注入库头magic); 1=只观测
+#endif
 
 static int g_fd=-1; static intptr_t g_slide=0; static double g_t0=0;
 static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
@@ -23,9 +26,16 @@ static double now_ms(void){return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*100
 static int addr_is_injected(unsigned long a){
   Dl_info di;
   if(a && dladdr((void*)a,&di) && di.dli_fname){
-    if(strstr(di.dli_fname,"procursus")||strstr(di.dli_fname,"/var/jb")||
-       strstr(di.dli_fname,"TweakInject")||strstr(di.dli_fname,"ellekit")||
-       strstr(di.dli_fname,"MobileSubstrate")) return 1;
+    const char*f=di.dli_fname;
+    if(strstr(f,"procursus")||strstr(f,"/var/jb")||strstr(f,"TweakInject")||
+       strstr(f,"ellekit")||strstr(f,"MobileSubstrate")||strstr(f,"basebin")||
+       strstr(f,"fakelib")||strstr(f,"systemhook")||strstr(f,"Substrate")||
+       strstr(f,"/Cephei")||strstr(f,"Choicy")||strstr(f,"Crane")||strstr(f,"FLEX")||
+       strstr(f,"BioProtect")||strstr(f,"AppSync")||strstr(f,"HSBCBypass"))
+      return 1;
+    // 短名 /usr/lib/systemhook.dylib 之类
+    const char*b=strrchr(f,'/'); b=b?b+1:f;
+    if(strcmp(b,"systemhook.dylib")==0) return 1;
   }
   return 0;
 }
@@ -44,35 +54,37 @@ static long my_wrap(void* msg, long a1,long a2,long a3,long a4,long a5,long a6,l
   uint64_t req_addr = (msg)? body[4] : 0;   // 经验偏移(Round72c: body[4]=address)
   uint64_t req_size = (msg)? body[5] : 0;
 
+  // 请求体快照(调用前, 因 reply 会覆盖 buffer)
+  uint64_t req_snapshot[8]={0};
+  if(msg && msgid_in==4808) for(int i=0;i<8;i++) req_snapshot[i]=body[i];
+
   long r = o_wrap(msg,a1,a2,a3,a4,a5,a6,a7);
 
   if(msgid_in==4808){
     c_4808++;
+    if(c_4808<=8) emitf("  REQ body: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+      (unsigned long long)req_snapshot[0],(unsigned long long)req_snapshot[1],(unsigned long long)req_snapshot[2],
+      (unsigned long long)req_snapshot[3],(unsigned long long)req_snapshot[4],(unsigned long long)req_snapshot[5],
+      (unsigned long long)req_snapshot[6],(unsigned long long)req_snapshot[7]);
     int inj = addr_is_injected((unsigned long)req_addr);
     Dl_info di; const char*owner="?";
     if(req_addr && dladdr((void*)req_addr,&di) && di.dli_fname){const char*b=strrchr(di.dli_fname,'/');owner=b?b+1:di.dli_fname;}
     if(c_4808<=60)
       emitf("[4808#%d] addr=0x%llx sz=0x%llx inj=%d owner=%s t=%.0fms\n",
         c_4808,(unsigned long long)req_addr,(unsigned long long)req_size, inj, owner, now_ms());
-    // reply 里 mach_vm_read 的数据是 out-of-line: reply body 有个 descriptor 指向数据地址。
-    // 复杂消息(bits&0x80000000): body 首个 descriptor = {address(u64), size(u32), ...}。
-    if(inj && (hdr[0]&0x80000000)){
-      // 复杂消息: 头后是 descriptor count(u32) + descriptors。
-      // ool descriptor: address@+0, size@+8(u32), 之后。
-      uint32_t *p = (uint32_t*)((uint8_t*)msg + sizeof(mach_msg_header_t));
-      uint32_t desc_cnt = p[0];
-      if(desc_cnt>=1){
-        uint64_t *d = (uint64_t*)(p+1);   // 第一个 descriptor
-        uint64_t data_addr = d[0];
-        if(data_addr && c_4808<=20) emitf("  ↳ool data@0x%llx, 篡改头32B为0\n",(unsigned long long)data_addr);
-        // 把读到的注入区域头部数据清零/改 magic, 使 Promon 认不出 Mach-O
-        if(data_addr){
-          uint32_t *dd=(uint32_t*)data_addr;
-          // Mach-O magic 0xfeedfacf → 改成 0(非 Mach-O)
-          dd[0]=0;
-        }
-      }
+    // mach_vm_read_overwrite: body[4]=源地址, body[5]=size, body[6]=输出缓冲(数据落这)。
+    uint64_t out_buf = req_snapshot[6];
+#if !defined(OBSERVE_ONLY) || OBSERVE_ONLY==0
+    // 拦截: 注入区域读 → 事后改输出缓冲, 抹掉 Mach-O magic(使 Promon 认不出注入 dylib)。
+    if(inj && r==0 && out_buf){
+      uint32_t *dd=(uint32_t*)out_buf;
+      uint32_t old=dd[0];
+      dd[0]=0;   // Mach-O magic 0xfeedfacf → 0
+      if(c_4808<=20) emitf("  ↳拦截: out_buf 0x%llx magic %x→0\n",(unsigned long long)out_buf,old);
     }
+#else
+    if(inj && c_4808<=20 && out_buf) emitf("  out_buf=0x%llx magic=%x\n",(unsigned long long)out_buf,*(uint32_t*)out_buf);
+#endif
   }
   return r;
 }
