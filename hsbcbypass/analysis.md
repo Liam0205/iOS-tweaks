@@ -2143,3 +2143,30 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - vm_region 这条是干扰项还是真检测? 需在 init[42] 的 verdict(0x43ebc4)触发前, 看它读的状态从哪来。
 - 结合 Round67(SKS哈希结构): init[42] 的 SKS 收集可能不是 vm_region walk, 是别的(读 dyld/mach header)。
 - 或: 3s 退出根本是另一个更早的检测(在 vrr64 walk 之前就判了)。需 hook init[42] verdict + 加时间戳定位。
+
+## Round 72 / PoC关键修正（2026-08-24,★★★ vm_region walk 是别的SDK; Promon 走 svc 网关直接 mach_msg）
+
+### hsbcchinax 几乎不导入内存枚举原语
+- hsbcchinax 的 bind/lazy-bind **只有**: mach_task_self_、_pthread_mach_thread_np、_mach_port_destroy、
+  _dyld_register_func_for_remove_image、__dyld_find_unwind_sections。
+- **无 vm_region_recurse_64 / task_info / proc_* / csops / sysctl 具名导入!**
+- ⇒ Round70-71 观测/过滤的 vm_region_recurse_64 walk **是别的安全 SDK**(TuringShield/RASPFramework/
+  MobileSecurity 等并存 SDK), **不是** hsbcchinax 的 Promon 层。过滤它当然不影响 Promon 的 3s 退出。
+
+### ★★★ Promon 的内存检查走 svc 网关 + mach_msg(Round52/57 印证)
+- Promon 用私有 svc 网关(0x8510c8→0x78befc)发 mach_msg_trap(-31), 直接对内核做
+  mach_vm_region / task_info 等, **完全绕开 libSystem 具名函数** → libSystem hook 拦不到(A3 失败根因)。
+- init[42] 决策函数 0x7753c4 读 [0x80c058]=mach_task_self_(task 端口), 印证它用 mach 接口查自己的 vm。
+- SKS 结构(Round67)= Promon 经 mach_msg 收集的 vm region/内存描述 + 哈希。
+
+### ⇒ 过滤必须在 svc网关/mach_msg 层 或 内核层
+- 用户态 libSystem hook 无效(Promon 不用它)。三个可行拦截点:
+  1. **svc 网关**(0x78befc): 之前 Round55 观测法, 但改它会破坏安装序列致自旋; 需精细化(只改 mach_vm_region 返回)。
+  2. **mach_msg 到内核的 vm_map 查询**: 内核层拦截该进程的 vm_region mach trap, 过滤注入区域。
+  3. **内核 vm_map 直改**(issue #1): 改注入 dylib 的 vm_map_entry, 使其看起来合法。
+- 回到内核方案(issue #1)的正当性更强了: 用户态确实拦不到 Promon 的 mach 查询。
+
+### 下一步
+- 确认 Promon 到底用哪个 mach 操作查 vm(mach_vm_region? task_info TASK_DYLD_INFO? host?):
+  在 svc 网关观测法(Round55 Tweak.x.round58svc)基础上, 只记 mach_msg 的 msgh_id + 目标, 看查的是哪个内核服务。
+- 据此定内核拦截点。
