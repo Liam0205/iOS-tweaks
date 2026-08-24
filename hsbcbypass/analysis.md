@@ -1634,3 +1634,20 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 但需先搞清 0x2a74a0 是什么(退出? 还是正常返回路径)。且 0x3bbef4 是薄封装, 真检测在
   0x8510c8 解密后的目标 + 0x2a74a0。
 - 更优: 运行时探针 hook 0x3bbef4 入口, 记录它返回值 + 调用者如何用, 定位 verdict 布尔。
+
+## Round 51（2026-08-24,验算 guarded body blr 目标 = 非法巨大地址)
+
+### 0x712e10 崩溃的 blr 目标验算(用 Round47 实测值)
+- guarded body 0x5d87d4 `blr x8`: x8 = [0x8493b0] - [0x838138] = 0x13c93dff8 - 0 = 0x13c93dff8。
+- 减 slide(0x101a8c000) = **0x3aeb1ff8** —— **远超 hsbcchinax 大小(~0x8a5000)! 约 1GB 偏移, 非法。**
+- ⇒ [0x8493b0] 存的不是指向 hsbcchinax 的正常指针。Round47 我误判"正常 rebase", 实际
+  0x3aeb1ff8 本身就是非法巨大偏移。这个槽在(强制clean的)执行流里值是错的。
+- 但注意: 探针在 +23ms 读的快照, 崩溃在 ~2s 后, 值可能被改写。需崩溃瞬间的值才准。
+
+### 含义
+- 0x8493b0 是另一个 Promon 运行时填充的槽(类似加密 stub 表)。强制 clean 走到 guarded body
+  时它没被正确初始化 → blr 非法地址 → 崩。
+- 印证: 强制 dispatcher verdict = clean 破坏了 Promon 的正常初始化序列, 使某些运行时槽
+  (0x8493b0 等)未按正常流程填充。**中途改 verdict 治标不治本。**
+- ⇒ 更确信正解是"让检测源头判定未越狱"(让 Promon 自己走完正常 clean 初始化, 所有槽正确填充),
+  而非中途翻 verdict。等子代理定位检测源头 patch 点。
