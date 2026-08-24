@@ -87,33 +87,57 @@ typedef struct { long nr; long a0; long caller; double t; char path[200]; } trac
 static trace_t g_ring[TRACE_RING];
 static volatile uint32_t g_ring_w = 0;   // 写指针(只增)
 
+// 预开的原始 fd(ctor 里 open, O_APPEND), 热路径用 write() 同步落盘。
+// 关键: 用 write(fd) 而非 fopen/stdio, 避免 stdio 锁(psynch)递归, 且检测秒退也不丢数据(poller 会漏)。
+#include <fcntl.h>
+#include <unistd.h>
+static int g_fd = -1;
+
+// 极简同步落盘一行(热路径)。自建 itoa/hex, 不用 snprintf(避免其内部 locale/锁开销)。
+static void raw_emit(long nr, long a0, long caller, const char *path) {
+  if (g_fd < 0) return;
+  char b[300]; int p=0;
+  const char *nm = nr_name(nr);
+  // "nr=NNN name a0=0xXXXX caller=+0xXXXX path\n"
+  #define PUTC(c) do{ if(p<(int)sizeof(b)-1) b[p++]=(c); }while(0)
+  #define PUTS(s) do{ const char*_s=(s); while(*_s) PUTC(*_s++); }while(0)
+  #define PUTHEX(v) do{ unsigned long _v=(unsigned long)(v); PUTC('0');PUTC('x'); \
+      char _t[18]; int _n=0; if(!_v){_t[_n++]='0';} while(_v){int _d=_v&0xf; _t[_n++]=_d<10?'0'+_d:'a'+_d-10; _v>>=4;} \
+      while(_n) PUTC(_t[--_n]); }while(0)
+  #define PUTDEC(v) do{ long _v=(v); if(_v<0){PUTC('-');_v=-_v;} char _t[20]; int _n=0; if(!_v){_t[_n++]='0';} \
+      while(_v){_t[_n++]='0'+(_v%10); _v/=10;} while(_n) PUTC(_t[--_n]); }while(0)
+  PUTS("nr="); PUTDEC(nr);
+  if (nm) { PUTC(' '); PUTS(nm); }
+  PUTS(" caller=+"); PUTHEX((unsigned long)(caller - (long)g_slide));
+  if (path && path[0]) { PUTS(" \""); PUTS(path); PUTC('"'); }
+  else { PUTS(" a0="); PUTHEX(a0); }
+  PUTC('\n');
+  (void)write(g_fd, b, p);
+}
+
 // 由汇编跳板调用: nr=x16, a0/a1=参数, caller=封装的调用者PC
 void hsbc_svc_record(long nr, long a0, long a1, long caller);
 void hsbc_svc_record(long nr, long a0, long a1, long caller) {
   (void)a1;
   __sync_fetch_and_add(&g_total, 1);
   if (nr >= 0 && nr < NR_MAX) __sync_fetch_and_add(&g_cnt[nr], 1);
-  // 跳过高频 IO 噪声(read/write/close/pread/mmap/lseek), 其余全记进轨迹环
+  // 跳过高频 IO 噪声(read/write/close/pread/mmap/lseek)。注意: 不能跳过 psynch(285-296),
+  // 那是检测线程的同步原语, 要看它是否卡住。
   switch (nr) {
     case 3: case 4: case 6: case 153: case 197: case 199: return;
     default: break;
   }
   uint32_t idx = __sync_fetch_and_add(&g_ring_w, 1);
-  if (idx == 0) {   // 第一次被调用就同步落一行(不依赖 poller), 证明跳板确被使用
-    FILE *f = fopen(g_logpath, "a");
-    if (f) { fprintf(f, "[FIRST-CALL] trampoline 首次命中 nr=%ld caller=+0x%lx\n",
-                     nr, (unsigned long)(caller-(long)g_slide)); fclose(f); }
-  }
-  if (idx >= TRACE_RING) return;   // 只记前 TRACE_RING 个, 满了不覆盖(保留最早的分流现场)
-  trace_t *h = &g_ring[idx];
-  h->nr = nr; h->a0 = a0; h->caller = caller;
-  h->t = (g_t0>0) ? (CFAbsoluteTimeGetCurrent()-g_t0)*1000 : 0;
-  h->path[0] = 0;
+  if (idx >= TRACE_RING) return;   // 只记前 TRACE_RING 个
+  // 路径类 syscall 取路径, 同步落盘
+  char pathbuf[200]; pathbuf[0]=0;
   if (arg0_is_path(nr) && a0) {
     const char *path = (const char*)a0;
-    strncpy(h->path, path, sizeof(h->path)-1);
-    h->path[sizeof(h->path)-1] = 0;
+    // 防御性: a0 可能非法, 但检测查的路径都是有效指针; 直接拷
+    strncpy(pathbuf, path, sizeof(pathbuf)-1);
+    pathbuf[sizeof(pathbuf)-1]=0;
   }
+  raw_emit(nr, a0, caller, pathbuf);
 }
 
 // 真网关运行时地址(ctor 里设 = 0x78befc + slide)。跳板尾调它, 使真正的 svc 在 __TEXT 内执行,
@@ -209,6 +233,8 @@ static void *poller(void *arg) {
   snprintf(g_logpath, sizeof(g_logpath), "%s/hsbc_probe_%d.log",
            NSTemporaryDirectory().fileSystemRepresentation, getpid());
   FILE *f = fopen(g_logpath, "w"); if (f) fclose(f);
+  // 打开原始 fd 供热路径同步落盘(与 g_logpath 同一文件, O_APPEND 原子追加)
+  g_fd = open(g_logpath, O_WRONLY|O_APPEND);
 
   g_slide = hsbc_slide();
   L("ctor: hsbcchinax slide=0x%lx OBSERVE_ONLY=%d", (unsigned long)g_slide, OBSERVE_ONLY);

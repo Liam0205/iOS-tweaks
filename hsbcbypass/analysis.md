@@ -1806,3 +1806,35 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   a. 跳板热路径**同步落盘前 ~400 条**(小 fd 直写, 不靠 1s poller), 确保 3s 内就拿到完整轨迹。
   b. 不 nop-store(避免破坏安装序列致自旋); 改由**独立 busy 线程持续把槽写回跳板**, 抢在 0x75bf7c 检测用槽期间在位。
   c. 若拿到"越狱路径 open/access 返回值 → 状态变量"链, 则在跳板里对**这些特定路径**返回 ENOENT(OBSERVE_ONLY=0), 试最小拦截。
+
+## Round 57（2026-08-24,★★ 同步落盘拿到完整检测 syscall 轨迹, 发现: 检测不查越狱文件!)
+
+### 修复: 热路径用预开 fd 的 write() 同步落盘(不靠 poller), 秒退也不丢数据
+- 之前 poller 1s 落盘, 检测常在 1s 内退出 → 拿不到轨迹。改为跳板→hsbc_svc_record→raw_emit(write fd)。
+- 本轮 App **存活 >=12s**(未触看门狗), 日志 3129B, 拿到检测全程 syscall。
+
+### ★★ 检测的完整 syscall footprint(经 svc 网关, 退出前):极小, 且**无一个越狱文件查询**
+| syscall | 次数 | 调用点 | 说明 |
+|---|---|---|---|
+| nr=294 (BSD) | 2 | +0x44ef20, +0x6dd618 | 封装 0x240218; 294=? (待定, 非文件) |
+| nr=202 sysctl | 1 | +0x348e3c | 封装 0x348da4; MIB={1,2}(CTL_KERN.?), 256B 输出 |
+| nr=-31 mach_msg_trap | 13 | +0x40c738 | 封装 0x40c698 (mov x16,#-0x1f); Mach IPC |
+| nr=5/33 dyld缓存 | 8 | +0x693b08 等 | 映射 /System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e |
+| nr=73 munmap | 1 | +0x3aa78c | 解映射 |
+
+- **关键: 没有任何 /var/jb、Cydia、/bin/bash、apt、substrate 等越狱路径查询经过网关!**
+- ⇒ 3s 退出的越狱判定**不是靠查越狱文件**。可能来自:
+  1. **sysctl {1,2}**(CTL_KERN 子项, 查进程信息/调试标志 P_TRACED?), 或
+  2. **mach_msg_trap + Mach IPC**(task_info/vm_region 查注入库、host 信息), 或
+  3. **dyld 共享缓存比对**(映射磁盘干净 cache, 与内存中被 hook 的库比对, 检测 inline hook/注入)。
+- dyld cache 映射高度可疑: OneSpan/Promon 已知手法 = 映射干净 cache 后**用其中的干净 syscall stub**发检测调用,
+  这些调用**不经 App __text 的槽**(用的是 cache 里 libsystem 的 svc), 故我的网关观测不到真正的文件检测!
+  这解释了"无越狱文件查询": 文件检测可能走了 cache 里的干净 stub。
+
+### 战略转折
+- 若检测靠 sysctl/mach(不查文件), 则文件系统伪装(Shadow)天然无效(已被 Round56 证实)。
+- 若检测靠 dyld-cache-clean-stub 发文件查询, 则我的网关观测不到, 需 hook cache stub 或在更底层(内核/系统调用入口)拦。
+- **下一步**: 
+  a. 确定 nr=294 与 sysctl{1,2} 具体查什么(静态跟 0x240218/0x348dd0 的返回值如何影响判定)。
+  b. 关键实验: **在跳板里对 sysctl(202) 的这次调用**观察其返回 buffer, 看是否含 P_TRACED/被判越狱的值。
+  c. 若确认 sysctl 是判定输入, 在跳板里改写其返回(OBSERVE_ONLY=0 针对 202) → 最小拦截试。
