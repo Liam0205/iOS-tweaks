@@ -19,6 +19,7 @@ extern void MSHookFunction(void *symbol, void *replace, void **result);
 #endif
 
 static int g_fd=-1; static intptr_t g_slide=0; static double g_t0=0;
+static uint64_t g_legit_dylib=0;   // 一个合法系统 dylib 的运行时基址(伪装用)
 static void emit(const char*s){if(g_fd>=0)(void)write(g_fd,s,strlen(s));}
 static void emitf(const char*fmt,...){char b[400];va_list ap;va_start(ap,fmt);vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);if(g_fd>=0)(void)write(g_fd,b,strlen(b));}
 static double now_ms(void){return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*1000:0;}
@@ -55,20 +56,32 @@ static long my_wrap(void* msg, long a1,long a2,long a3,long a4,long a5,long a6,l
   uint64_t req_size = (msg)? body[5] : 0;
 
   int inj = (msgid_in==4808) ? addr_is_injected((unsigned long)req_addr) : 0;
-#if !defined(OBSERVE_ONLY) || OBSERVE_ONLY==0
-  // ★ 拦截(调用前改源地址): 注入库的读 → 把源地址重定向到一个合法已加载库(hsbcchinax 基址),
-  // 使 Promon 读到真实、合法、签名正常的 dylib 头, 而非注入库。避免清零致解析失败自旋。
-  if(inj && msg){
-    uint64_t legit = (uint64_t)(0x8000 + g_slide) & ~0x3fffULL;  // hsbcchinax mach header 页(vmaddr 0)
-    // 用 hsbcchinax 的镜像基址(合法系统外但已签名的 App 库)。更稳妥用主程序基址。
-    extern const struct mach_header* _dyld_get_image_header(uint32_t);
-    const struct mach_header* mh0 = _dyld_get_image_header(0); // 主程序 China
-    if(mh0) legit = (uint64_t)mh0;
-    body[4] = legit + (req_addr & 0x0);   // 读合法库头(偏移0)
-  }
-#endif
+  uint64_t snap_out = (msgid_in==4808 && msg) ? body[6] : 0;   // 输出缓冲(读后数据落这)
 
   long r = o_wrap(msg,a1,a2,a3,a4,a5,a6,a7);
+
+#if !defined(OBSERVE_ONLY) || OBSERVE_ONLY==0
+  // ★ 拦截(调用后改输出缓冲): 保留完整 Mach-O 结构, 只把 out_buf 里 systemhook 的
+  // install-name 路径字符串(procursus/basebin/systemhook)改成系统库路径, 使 Promon 路径黑名单不命中。
+  // 不动 magic/filetype/ncmds → 不破坏解析(避免 Round74 清零致自旋)。
+  if(inj && r==0 && snap_out && req_size>0){
+    char *buf=(char*)snap_out;
+    size_t blen=(req_size>0x8000)?0x8000:(size_t)req_size;
+    // 在读到的字节里找 systemhook 特征路径, 逐字节替换成合法路径(等长覆盖)。
+    static const char sig[]="systemhook";
+    for(size_t i=0;i+sizeof(sig)-1<blen;i++){
+      if(memcmp(buf+i,sig,sizeof(sig)-1)==0){
+        memcpy(buf+i,"CoreFounda",sizeof(sig)-1);  // 等长(10字节)伪装
+      }
+    }
+    // 也改 procursus/basebin 前缀特征
+    static const char sig2[]="procursus";
+    for(size_t i=0;i+sizeof(sig2)-1<blen;i++){
+      if(memcmp(buf+i,sig2,sizeof(sig2)-1)==0) memcpy(buf+i,"SystemLib",sizeof(sig2)-1);
+    }
+    if(c_4808<=20) emitf("  ↳拦截: 改 out_buf 0x%llx 内路径特征(保结构)\n",(unsigned long long)snap_out);
+  }
+#endif
 
   if(msgid_in==4808){
     c_4808++;
@@ -89,6 +102,16 @@ static long my_wrap(void* msg, long a1,long a2,long a3,long a4,long a5,long a6,l
   uint32_t n=_dyld_image_count();
   for(uint32_t i=0;i<n;i++){const char*nm=_dyld_get_image_name(i);if(nm&&strstr(nm,"hsbcchinax")){g_slide=_dyld_get_image_vmaddr_slide(i);break;}}
   if(!g_slide){emit("no slide\n");return;}
+  // 选一个合法系统 dylib 的基址(filetype=MH_DYLIB, 签名正常, 非注入)做伪装源。
+  for(uint32_t i=0;i<n;i++){
+    const char*nm=_dyld_get_image_name(i);
+    if(nm && strcmp(nm,"/usr/lib/libobjc.A.dylib")==0){ g_legit_dylib=(uint64_t)_dyld_get_image_header(i); break; }
+  }
+  if(!g_legit_dylib){ // 回退: 找任意 /usr/lib 的 dylib
+    for(uint32_t i=0;i<n;i++){const char*nm=_dyld_get_image_name(i);
+      if(nm && strncmp(nm,"/usr/lib/",9)==0 && strstr(nm,".dylib")){g_legit_dylib=(uint64_t)_dyld_get_image_header(i);break;}}
+  }
+  emitf("ctor: g_legit_dylib=0x%llx\n",(unsigned long long)g_legit_dylib);
   MSHookFunction((void*)(WRAP_OFF+g_slide),(void*)my_wrap,(void**)&o_wrap);
   emitf("U: hooked mach封装 0x40c698 @0x%lx\n",(unsigned long)(WRAP_OFF+g_slide));
 }

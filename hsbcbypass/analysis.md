@@ -2257,3 +2257,20 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
    只改 LC_ID_DYLIB 的路径字符串为 /usr/lib/system 系)。
 3. 或接受: systemhook 是 Dopamine 核心, 可能有多重检测; 评估是否换"从 dyld 层不加载 systemhook 到该进程"
    (但那会破坏注入基建)。
+
+## Round 76 / PoC方案U（2026-08-24,路径特征替换: 3s→17s 但仍退, systemhook 头存在性检测未覆盖）
+- 拦 mach_vm_read_overwrite 后改 out_buf 里的 systemhook/procursus 路径字符串(等长覆盖, 保 Mach-O 结构)。
+- 结果: **3s → ~17s 才退**(路径替换有效延后), 但仍退。命中确认(0x6b0 loadcmds 读改了路径)。
+- 剩余: systemhook 的 **32字节头读(无路径, 仅 magic/cputype/filetype/ncmds)**被读多次(#5/#29-31);
+  Promon 可能靠"该区域有 Mach-O 但不在预期库列表"判定(与路径无关)——这解释 A1(隐藏infoArray)也无效。
+
+### PoC 进展总评(Round 68-76)
+- ✅ **完全定位检测**: Promon 经 svc 网关 mach_vm_read_overwrite(4808) 逐库读 Mach-O 头, systemhook.dylib 触发。
+- ✅ **确证可干预**: 改 systemhook 头(清零→绕过exit但自旋; 路径替换→3s延到17s), 证明这就是判定输入。
+- ⚠️ **未达净启动**: 清零致自旋; 路径替换/重定向致延后退出。Promon 对 systemhook 有**多重/存在性校验**,
+  单改头字段/路径不足。可能需: 让 systemhook 区域读**完全返回另一个合法库的自洽镜像**(头+loadcmds+地址全一致),
+  或从根上不让 systemhook 加载进该进程(改注入基建), 或内核层让该区域读出来是合法库。
+
+### 结论
+- 纯用户态拦 mach_vm_read 能**扰动**检测(3s→17s), 但 Promon 的库存在性/一致性校验较严, 净启动未达成。
+- 已把 PoC 推进到: 精确检测点 + 可干预点 + 干预效果曲线。下一步是"构造自洽的合法库伪装"或回内核层(issue #1)。
