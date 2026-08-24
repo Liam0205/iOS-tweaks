@@ -1,91 +1,74 @@
-// Round 64 探针: 解析 init[42] 的加密 stub 表(0x84c000), 拿 6 个检测函数的真实目标,
-// 判断哪个是真越狱检测。策略: hook init[42] 主体 0x43e188 入口, 里面 stub 表此时可能还没解密;
-// 故改为 hook 各检测点 bl 的目标封装, 或用后台轮询读表槽直到非零/解密。
-// 更稳: hook 0x775418/0x7753c4 等 stub 本身(它们 br x16, x16=[表槽]); 命中时 dladdr(x16) 看真身。
+// Round 65 探针: PRMShieldEventManager 是 Promon 的 ObjC 入口类, 有 performSecurityChecks 方法。
+// 策略(abcbypass 式纯 ObjC swizzle, 不碰 __TEXT, 不触发自旋):
+//   1) 记录 performSecurityChecks 是否被调、何时;
+//   2) 试 no-op 它, 看能否跳过检测(OBSERVE_ONLY 控制)。
+// 注意 init[42] 的 C 初始化检测独立于此 ObjC 方法(3s 退出来自那), 此法可能只覆盖后续检测层, 但 ObjC hook 干净, 值得试。
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #import <mach-o/dyld.h>
-#import <dlfcn.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <fcntl.h>
 #import <unistd.h>
-#import <pthread.h>
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
+#ifndef NEUTRALIZE
+#define NEUTRALIZE 0   // 0=只观测(调 orig); 1=no-op(跳过检测)
+#endif
 
 static int g_fd = -1;
-static intptr_t g_slide = 0;
-
+static double g_t0 = 0;
 static void emit(const char *s){ if(g_fd>=0)(void)write(g_fd,s,strlen(s)); }
-static void emitv(const char *label, unsigned long v){
-  char b[128]; int p=0; const char*l=label; while(*l)b[p++]=*l++;
-  b[p++]='0';b[p++]='x'; char t[18];int n=0; if(!v){t[n++]='0';} while(v){int d=v&0xf;t[n++]=d<10?'0'+d:'a'+d-10;v>>=4;}
-  while(n)b[p++]=t[--n]; b[p++]='\n'; if(g_fd>=0)(void)write(g_fd,b,p);
+static void emitv(const char*label,unsigned long v){
+  char b[128];int p=0;const char*l=label;while(*l)b[p++]=*l++;b[p++]='0';b[p++]='x';
+  char t[18];int n=0;if(!v){t[n++]='0';}while(v){int d=v&0xf;t[n++]=d<10?'0'+d:'a'+d-10;v>>=4;}
+  while(n)b[p++]=t[--n];b[p++]='\n';if(g_fd>=0)(void)write(g_fd,b,p);
 }
-// 解析一个运行时地址属于哪个 image + 符号
-static void resolve(const char *tag, void *addr){
-  char b[300]; int p=0; const char*t=tag; while(*t)b[p++]=*t++;
-  b[p++]='=';
-  unsigned long v=(unsigned long)addr;
-  b[p++]='0';b[p++]='x'; char tb[18];int n=0; unsigned long vv=v; if(!vv){tb[n++]='0';} while(vv){int d=vv&0xf;tb[n++]=d<10?'0'+d:'a'+d-10;vv>>=4;} while(n)b[p++]=tb[--n];
-  Dl_info info;
-  if(addr && dladdr(addr,&info)){
-    b[p++]=' '; b[p++]='(';
-    const char*fn=info.dli_fname? (strrchr(info.dli_fname,'/')?strrchr(info.dli_fname,'/')+1:info.dli_fname):"?";
-    while(*fn && p<250)b[p++]=*fn++;
-    if(info.dli_sname){ b[p++]=':'; const char*sn=info.dli_sname; while(*sn && p<290)b[p++]=*sn++; }
-    b[p++]=')';
-  }
-  b[p++]='\n'; if(g_fd>=0)(void)write(g_fd,b,p);
-}
+static double now_ms(void){ return (g_t0>0)?(CFAbsoluteTimeGetCurrent()-g_t0)*1000:0; }
 
-static intptr_t hsbc_slide(void){
-  uint32_t n=_dyld_image_count();
-  for(uint32_t i=0;i<n;i++){const char*nm=_dyld_get_image_name(i);
-    if(nm&&strstr(nm,"hsbcchinax"))return _dyld_get_image_vmaddr_slide(i);}
-  return 0;
-}
+// 保存原 IMP
+static void (*orig_perform)(id,SEL);
 
-// 后台轮询: 反复读加密表槽, 一旦非零(已解密)就 resolve 出真身, 记录后退出
-static const struct { const char *name; unsigned long off; } g_slots[] = {
-  {"stub_7753e8_off0xb0",  0xb0},
-  {"stub_77540c_off0xf70", 0xf70},
-  {"stub_7753c4_off0x100", 0x100},
-  {"stub_7753f4_off0x48",  0x48},
-  {"stub_775418_off0xf8",  0xf8},
-  {NULL,0}
-};
-static void *poller(void *arg){
-  (void)arg;
-  unsigned long tablebase = 0x84c000 + g_slide;
-  int done[8]={0};
-  for(int tick=0; tick<3000; tick++){   // ~3s, 每 1ms
-    for(int i=0; g_slots[i].name; i++){
-      if(done[i]) continue;
-      volatile uintptr_t *slot=(volatile uintptr_t*)(tablebase+g_slots[i].off);
-      uintptr_t v=*slot;
-      if(v && v!=0 && (v>>40)==0){   // 非零且像合法地址(高位为0)
-        resolve(g_slots[i].name, (void*)v);
-        done[i]=1;
-      }
-    }
-    usleep(1000);
-  }
-  emit("poller: 结束\n");
-  return NULL;
+static void my_perform(id self, SEL _cmd){
+  emitv("[performSecurityChecks] 被调 t_ms=", (unsigned long)now_ms());
+#if NEUTRALIZE
+  emit("  → NEUTRALIZE: 跳过(不调 orig)\n");
+  return;
+#else
+  emit("  → observe: 调 orig\n");
+  if(orig_perform) orig_perform(self,_cmd);
+  emit("  ← orig 返回\n");
+#endif
 }
 
 %ctor {
+  g_t0 = CFAbsoluteTimeGetCurrent();
   char path[256];
   snprintf(path,sizeof(path),"%s/hsbc_probe_%d.log",
            NSTemporaryDirectory().fileSystemRepresentation, getpid());
   FILE*f=fopen(path,"w"); if(f)fclose(f);
   g_fd=open(path,O_WRONLY|O_APPEND);
-  g_slide=hsbc_slide();
-  emitv("ctor: slide=", (unsigned long)g_slide);
-  if(!g_slide){ emit("no hsbcchinax\n"); return; }
-  emitv("ctor: 加密表基址 0x84c000+slide=", (unsigned long)(0x84c000+g_slide));
+  emitv("ctor: NEUTRALIZE=", NEUTRALIZE);
 
-  pthread_t th; pthread_create(&th,NULL,poller,NULL); pthread_detach(th);
+  // 等 PRMShieldEventManager 类注册(它有 +load, 应在早期已注册)
+  Class cls = objc_getClass("PRMShieldEventManager");
+  if(!cls){ emit("ctor: PRMShieldEventManager 未注册(可能还没load)\n"); }
+  else {
+    SEL sel = sel_registerName("performSecurityChecks");
+    Method m = class_getInstanceMethod(cls, sel);
+    if(m){
+      orig_perform = (void(*)(id,SEL))method_getImplementation(m);
+      method_setImplementation(m, (IMP)my_perform);
+      emit("ctor: 已 swizzle -[PRMShieldEventManager performSecurityChecks]\n");
+    } else {
+      // 也可能是类方法
+      Method cm = class_getClassMethod(cls, sel);
+      if(cm){
+        orig_perform=(void(*)(id,SEL))method_getImplementation(cm);
+        method_setImplementation(cm,(IMP)my_perform);
+        emit("ctor: 已 swizzle +[PRMShieldEventManager performSecurityChecks]\n");
+      } else emit("ctor: 找不到 performSecurityChecks 方法\n");
+    }
+  }
 }

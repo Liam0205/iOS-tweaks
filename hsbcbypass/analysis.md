@@ -2009,3 +2009,25 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 ### 战略评估: 已到"需完整逆向 Promon 检测算法"的深度
 - 中途 patch 一律自旋(铁律); 单点 patch 无效(多 verdict); 检测函数是内部混淆逻辑(非简单 syscall)。
 - 继续微观追每个内部函数可能不收敛。需要更高层策略。
+
+## Round 65（2026-08-24,PRMShieldEventManager ObjC层 performSecurityChecks 不是3s退出的触发)
+
+### swizzle -[PRMShieldEventManager performSecurityChecks] 观测: 3s 窗口内**从未被调用**
+- Promon 的 ObjC 入口类 PRMShieldEventManager(+performSecurityChecks/setUpdateCallbacks:/ShieldCallbackManager)
+  是**运行时(app启动后)**的检测层, 不是 init 期 3s 退出的触发。
+- ⇒ 3s 退出 100% 来自 native init[42] C 初始化器, 早于任何 ObjC app 代码。ObjC 层 bypass 治不了它。
+
+## 阶段性结论（Round 55-65 汇总, 2026-08-24)
+汇丰中国 = **Promon SHIELD**, 极难。已彻底确认:
+1. 检测=内存完整性/反hook(比对dyld cache等), 非文件; 走私有数据段 svc 网关, 绕开所有 libc/ObjC hook 点。
+2. 3s 静默退出来自 native init[42] 的 OLLVM CFF 状态机, verdict `w9==0x144ab99a→exit(1)`(经 0x1f05dc)。
+3. init[42] 内 ≥2 个 verdict、6 个检测决策点(bl 加密stub→cmp w0→cset 布尔), 检测函数是 Promon 内部混淆函数。
+4. **铁律: 中途改控制流(verdict/exit/nop)一律 100% CPU 自旋**(CFF 要求状态变量自然值)。
+5. Shadow(含Hook_Syscall)/ObjC swizzle(performSecurityChecks)/Frida 注入 —— 全部无效或被拦。
+6. 无 __TEXT 完整性校验(binary patch 本身可行), 但要让状态机自然走 clean 需同时中和多个内部检测的**输入**。
+
+### 可能的下一步(需较大投入或换层)
+- (A) 运行时把 6 个检测点的**输入布尔**同时中和(hook 每个内部检测函数返回 clean), 让状态机自然走 —— 需逐个确认哪些是真检测、副作用。
+- (B) 内核层(Dopamine KFD/PPL)隐藏越狱环境(改 vm/文件视图), 使 Promon 的内存比对看到 clean —— 工程量大。
+- (C) 深逆 Promon 检测算法(dyld cache 比对逻辑), 找它到底比对什么, 针对性伪装那块内存。
+- 现实评估: 这是业界公认最难的 RASP 之一, 单机 tweak 层完全绕过需要大量逆向; 已把问题定位到指令级, 但完全解决未达成。
