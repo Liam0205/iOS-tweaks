@@ -1,5 +1,7 @@
 // Round 37 探针: 观测 Promon SHIELD 的越狱检测输入(文件探测)
 // 只观测不改行为(除非 OBSERVE_ONLY=0): hook fileExistsAtPath: + libc 文件探测, 记录路径 + 发起模块.
+#define _XOPEN_SOURCE 700
+#include <ucontext.h>
 #import <Foundation/Foundation.h>
 #import <pthread.h>
 #import <dlfcn.h>
@@ -132,21 +134,34 @@ static void resolve_slot(const char*tag,uintptr_t slotVA){
       (unsigned long)((uintptr_t)v-(uintptr_t)info.dli_fbase));
   }
 }
+// Round47: 监视 Promon 自定位锚点 0x838138 + 0x8493b0(guarded body blr 依赖)
+#define ANCHOR_838138 0x838138UL
+#define PTR_8493b0    0x8493b0UL
 static void* slotpoll(void*a){
-  usleep(50000);
+  // 不延迟, 尽早开始抓(pristine 只活 ~374ms)
   int done7=0,done5=0;
-  for(int i=0;i<4000 && !(done7&&done5);i++){ // 最多 poll ~8s
+  uintptr_t last_anchor=0xdeadbeef, last_493=0xdeadbeef;
+  int anchor_logs=0;
+  for(int i=0;i<20000 && !(done7&&done5);i++){ // 高频 poll
     uintptr_t sl=hsbc_slide();
     if(sl){
       uintptr_t*s7=(uintptr_t*)(SLOT_7748d8+sl),*s5=(uintptr_t*)(SLOT_775034+sl);
       Dl_info di;
       if(!done7 && *s7>0x100000000UL && dladdr((void*)*s7,&di)){resolve_slot("7748d8",SLOT_7748d8);done7=1;}
       if(!done5 && *s5>0x100000000UL && dladdr((void*)*s5,&di)){resolve_slot("775034",SLOT_775034);done5=1;}
+      // 锚点监视: 值变化就记(限 30 条)
+      uintptr_t av=*(uintptr_t*)(ANCHOR_838138+sl);
+      uintptr_t pv=*(uintptr_t*)(PTR_8493b0+sl);
+      if((av!=last_anchor || pv!=last_493) && anchor_logs<30){
+        L(@"锚点 [0x838138]=0x%lx  [0x8493b0]=0x%lx  (slide=0x%lx, x8应=0x8493b0值-0x838138值=0x%lx)",
+          av,pv,sl,(unsigned long)(pv-av));
+        last_anchor=av; last_493=pv; anchor_logs++;
+      }
     }
-    usleep(2000);
+    usleep(200); // 0.2ms 高频, 抓 374ms 窗口内的锚点写入
   }
-  if(!done7)L(@"slot 0x84c000 未解密(8s 内)");
-  if(!done5)L(@"slot 0x84c020 未解密(8s 内)");
+  if(!done7)L(@"slot 0x84c000 未解密");
+  if(!done5)L(@"slot 0x84c020 未解密");
   return NULL;
 }
 
@@ -156,6 +171,36 @@ static void install_objc_hook(void){
   if(me){o_fe=(void*)method_getImplementation(me);method_setImplementation(me,(IMP)my_fe);L(@"hooked fileExistsAtPath:");}
   Method me2=class_getInstanceMethod(c,@selector(fileExistsAtPath:isDirectory:));
   if(me2){o_fed=(void*)method_getImplementation(me2);method_setImplementation(me2,(IMP)my_fed);L(@"hooked fileExistsAtPath:isDirectory:");}
+}
+
+// ---- SIGSEGV/SIGBUS handler: 抓崩溃精确 PC/LR (相对 hsbcchinax) ----
+#include <signal.h>
+static void crash_handler(int sig, siginfo_t*info, void*uap){
+  ucontext_t*uc=(ucontext_t*)uap;
+  uintptr_t sl=hsbc_slide();
+  #if defined(__arm64__)||defined(__aarch64__)
+  _STRUCT_MCONTEXT64*mc=(_STRUCT_MCONTEXT64*)uc->uc_mcontext;
+  uintptr_t pc=mc->__ss.__pc, lr=mc->__ss.__lr, fp=mc->__ss.__fp;
+  uintptr_t x8=mc->__ss.__x[8], x9=mc->__ss.__x[9], x19=mc->__ss.__x[19];
+  uintptr_t fault=(uintptr_t)info->si_addr;
+  L(@"💥SIG%d fault=0x%lx PC=0x%lx(off+0x%lx) LR=0x%lx(off+0x%lx) x8=0x%lx x9=0x%lx x19=0x%lx",
+    sig,fault,pc,(sl&&pc>sl)?pc-sl:pc,lr,(sl&&lr>sl)?lr-sl:lr,x8,x9,x19);
+  // 抓调用栈: 沿 fp 链回溯几层
+  uintptr_t*f=(uintptr_t*)fp;
+  for(int i=0;i<8 && f;i++){
+    uintptr_t ret=f[1], nfp=f[0];
+    L(@"  bt[%d] ret=0x%lx (off+0x%lx)",i,ret,(sl&&ret>sl)?ret-sl:ret);
+    if(nfp<=(uintptr_t)f) break; f=(uintptr_t*)nfp;
+  }
+  _exit(42); // 主动退出, 避免 corpse 清零现场后我们啥也看不到
+  #endif
+}
+static void install_crash_handler(void){
+  struct sigaction sa; memset(&sa,0,sizeof(sa));
+  sa.sa_sigaction=crash_handler; sa.sa_flags=SA_SIGINFO;
+  sigaction(SIGSEGV,&sa,NULL); sigaction(SIGBUS,&sa,NULL);
+  sigaction(SIGILL,&sa,NULL); sigaction(SIGTRAP,&sa,NULL);
+  L(@"crash handler 已装(SEGV/BUS/ILL/TRAP)");
 }
 
 %ctor{
@@ -171,6 +216,7 @@ static void install_objc_hook(void){
     rebind_symbols(r,5);
     L(@"fishhook 已装 (stat/lstat/access/open/fopen)");
     install_objc_hook();
+    install_crash_handler();
     pthread_t t; pthread_create(&t,NULL,hb,NULL); pthread_detach(t);
     pthread_t t3; pthread_create(&t3,NULL,slotpoll,NULL); pthread_detach(t3);
   }

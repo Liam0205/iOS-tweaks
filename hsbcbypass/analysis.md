@@ -1546,3 +1546,34 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 更根本方向重新浮现:**abcbypass 成功路径=让检测输入真判定未越狱**(而非事后翻 verdict),
   这样 Promon 走完整正常初始化,锚点/stub 表都正确建立,guarded body 不崩。
   但 Round46 已知检测不走 libc → 需定位 Promon 检测"读环境"的真实手段(可能内联更深层)。
+
+## Round 47-48（2026-08-24,锚点排除 + 崩溃类型漂移(SIGSEGV→SIGILL)指向自毁)
+
+### 锚点假设被推翻:0x838138/0x8493b0 正常/patch 版值一致
+探针监视(pristine + patch 版对比):
+- pristine: [0x838138]=0, [0x8493b0]=0x13ed29ff8(=静态0x3aeb1ff8+slide, 正常 rebase 指针)
+- patch 版: [0x838138]=0, [0x8493b0]=0x13ccb1ff8(=静态+各自slide), 值同样正常。
+⇒ **Round46 的"锚点未初始化"假设错误**。x8=[0x8493b0]-[0x838138] 崩溃前是正确运行时地址。
+  崩溃不是锚点问题。
+
+### ★ 崩溃类型漂移 + handler 抓不到 → 指向"篡改自毁"而非时序 bug
+- 多次 patch 版启动:崩溃在 SIGSEGV(pc=0,寄存器全裸偏移) 与 **SIGILL**(非法指令)间漂移。
+- 探针装了 BSD sigaction(SEGV/BUS/ILL/TRAP) **一次都没接到**(无 💥 日志)——
+  同 Round6:Promon 用 mach 异常端口抢在 BSD signal 前, 或崩在特殊时机。
+- SIGILL = 跳到非法指令/垃圾当代码执行。结合 pc=0 + 寄存器全是裸文件偏移(x21=0x3883f864,
+  x24=0x73018b12, x23=0xcccc..cccd 除法魔数)——**像 Promon 检测到 patch 后故意跳乱地址自毁**,
+  不是单纯初始化时序。
+
+### 重要方向修正:0x712e10 patch 可能被 Promon 局部完整性自检发现
+- 之前多轮判"无 __TEXT 自检"是指"无全局 hash 循环";但 Promon 可能对**关键检测函数/dispatcher
+  做局部校验**(CRC 单个函数/校验特定指令),patch 0x712e10 改了 dispatcher 指令 → 被发现 → 自毁。
+- 佐证:pristine 越狱是"干净 374ms 退出"(检测→退出);patch 版是"~600ms 后 SIGILL/SIGSEGV
+  乱跳"(检测到篡改→自毁式崩溃),两者行为不同 = patch 触发了额外的反篡改响应。
+
+### 下一步(重新聚焦)
+1. 验证是否局部自检:patch 一个"无害"指令(如某 nop slide 或不影响逻辑处)看是否也 SIGILL——
+   若无害改动也崩=有 __TEXT 局部校验;若只有改 dispatcher 崩=逻辑破坏非自检。
+2. 若确有反篡改校验:回到**运行时内存 patch**(在校验之后改)或 **hook 检测函数入口**
+   (但 Round20 知 inline-hook 被反制)——需找校验之后、检测判定之时的窗口。
+3. 重新考虑 abcbypass 路径:hook 检测函数让其返回 clean(而非改 dispatcher 指令),
+   但需绕过反 inline-hook——可能用 fishhook GOT(Round23 知不被反制)hook 解密后的检测函数调用点。
