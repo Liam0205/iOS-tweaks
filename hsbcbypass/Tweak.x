@@ -11,6 +11,8 @@
 #import <unistd.h>
 #import <pthread.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
+#import <UIKit/UIKit.h>
 
 // ElleKit / Substrate C API
 extern void MSHookFunction(void *symbol, void *replace, void **result);
@@ -103,6 +105,16 @@ static int my_kill(int pid,int sig){ emit_hex("[kill] sig=",(unsigned long)sig);
 static void (*orig_pthread_exit)(void*);
 static void my_pthread_exit(void *v){ emit("[pthread_exit]\n"); dump_backtrace(); if(orig_pthread_exit) orig_pthread_exit(v); }
 
+// Mach 终止路径
+static int (*orig_task_terminate)(unsigned int);
+static int my_task_terminate(unsigned int t){ emit("[task_terminate]\n"); dump_backtrace(); return orig_task_terminate?orig_task_terminate(t):0; }
+static int (*orig_thread_terminate)(unsigned int);
+static int my_thread_terminate(unsigned int t){ emit("[thread_terminate]\n"); dump_backtrace(); return orig_thread_terminate?orig_thread_terminate(t):0; }
+static int (*orig___pthread_kill)(void*,int);
+static int my___pthread_kill(void*t,int s){ emit_hex("[__pthread_kill] sig=",(unsigned long)s); dump_backtrace(); return orig___pthread_kill?orig___pthread_kill(t,s):0; }
+static void (*orig_exit_group)(int);
+static void my_exit_group(int c){ emit_hex("[exit_group] code=",(unsigned long)c); dump_backtrace(); if(orig_exit_group)orig_exit_group(c); }
+
 // 通用 hook 助手
 static void hookf(const char *name, void *repl, void **orig){
   void *p = dlsym((void*)-2, name);
@@ -115,6 +127,19 @@ static intptr_t hsbc_slide(void){
     if(nm&&strstr(nm,"hsbcchinax")) return _dyld_get_image_vmaddr_slide(i); }
   return 0;
 }
+
+%hook UIApplication
+- (void)_terminateWithStatus:(int)status {
+  emit_hex("[_terminateWithStatus] status=", (unsigned long)status);
+  dump_backtrace();
+  %orig;
+}
+- (void)terminateWithSuccess {
+  emit("[terminateWithSuccess]\n");
+  dump_backtrace();
+  %orig;
+}
+%end
 
 %ctor {
   g_t0 = CFAbsoluteTimeGetCurrent();
@@ -143,4 +168,15 @@ static intptr_t hsbc_slide(void){
   hookf("pthread_kill", (void*)my_pthread_kill, (void**)&orig_pthread_kill);
   hookf("pthread_exit", (void*)my_pthread_exit, (void**)&orig_pthread_exit);
   hookf("kill", (void*)my_kill, (void**)&orig_kill);
+  hookf("task_terminate", (void*)my_task_terminate, (void**)&orig_task_terminate);
+  hookf("thread_terminate", (void*)my_thread_terminate, (void**)&orig_thread_terminate);
+  hookf("__pthread_kill", (void*)my___pthread_kill, (void**)&orig___pthread_kill);
+  hookf("exit_group", (void*)my_exit_group, (void**)&orig_exit_group);
+  hookf("__exit", (void*)my_libc__exit, (void**)&orig_libc__exit);
+
+  // ObjC 退出路径(abcbypass 里 Promon 用 -[UIApplication _terminateWithStatus:])
+  Class ua = objc_getClass("UIApplication");
+  if (ua){
+    emit("ctor: UIApplication 存在, 将监视 _terminateWithStatus:(见 %hook)\n");
+  }
 }

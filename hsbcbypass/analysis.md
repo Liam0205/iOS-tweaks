@@ -1907,3 +1907,32 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - hook 0x75bf7c 之后 init[42] 的调用: 0x346c7c(收尾状态机) + 0x43e0f8 的 blr x8 目标。
 - hook mach: task_terminate/thread_terminate(dlsym) + exit 的所有别名(__exit/exit_group?)。
 - 或回到网关观测(nop-store)但**只抓 nr=1(exit)的调用者**, 看退出的 caller(即使自旋, exit 前的 caller 也能抓到)。
+
+## Round 60 续（★★★ 抓到真实退出点: init[42] 状态机 0x43ebc4 的 verdict 分支)
+
+### fp-chain 回溯(pid 53235, 退出实例)命中真实退出调用者
+- `[EXIT-0x1f05dc] t=471ms`(0x75bf7c 返回后 16ms), 回溯 frame#1 = **+0x43ebd4**。
+- ⇒ 退出调用点 = **0x43ebd0: bl 0x774770**, 其前 `0x43ebcc: mov w0,#1`(exit(1))。
+- 注意退出确实经 0x1f05dc(网关exit封装), 之前 Round60d 没抓到是因为**进程 fork/重启**(观测到 pid 53235→53251 两个进程,
+  只有先退的 53235 命中)。exit **不总在同一进程**, 有重启对。
+
+### ★ 真实 verdict 分支: init[42](0x43e114)的 OLLVM 状态机内
+```
+43ebb8: mov x8,x9
+43ebbc: mov w10,#0xb99a ; movk w10,#0x144a,lsl#16  => w10=0x144ab99a
+43ebc4: cmp w9, w10
+43ebc8: b.ne 0x43e78c        ; 未越狱→继续状态机
+43ebcc: mov w0, #1           ; 越狱→
+43ebd0: bl 0x774770          ; = exit(1) (0x774770=加密stub表0x84c098槽, 运行时解析的 exit/cxa 系)
+43ebd4: ...                  ; (回溯返回地址落这)
+```
+- **状态变量 w9 == 0x144ab99a ⇒ 判定越狱 ⇒ exit(1)**。
+- 退出点在 **init[42] 0x43e114 的状态机**, 不是 0x75bf7c(0x75bf7c 只 3ms 正常返回)。
+  → 纠正: 0x75bf7c 是检测**之一**(算某些值), 但**最终 verdict+exit 在 init[42] 自己的状态机**里。
+- 0x774770 = __stubs, 走 `adrp x16,0x84c000; ldr x16,[x16,#0x98]` = 加密 stub 表(RC4 解析), 实为 exit。
+
+### 下一步(定位 w9 来源 → 在输入层改)
+- 追 init[42](0x43e114 起)状态机里 **w9 在 0x43ebc4 之前如何被赋值**(哪个检测结果 → w9=0x144ab99a)。
+- 关键: 0x43ebc4 是"中途 verdict"还是"汇总 verdict"? 若 w9 直接来自某检测函数返回, 在那函数返回处改即可。
+- patch 候选(比之前的都精确): `0x43ebc8 b.ne` → 无条件 `b 0x43e78c`(强制走未越狱分支)。
+  但需验证 0x43e78c 分支下游状态是否完整(吸取 Round54 教训: 中途改可能自旋)。这次是"跳过 exit 走正常继续", 风险较低。
