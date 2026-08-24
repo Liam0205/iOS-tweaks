@@ -1651,3 +1651,34 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   (0x8493b0 等)未按正常流程填充。**中途改 verdict 治标不治本。**
 - ⇒ 更确信正解是"让检测源头判定未越狱"(让 Promon 自己走完正常 clean 初始化, 所有槽正确填充),
   而非中途翻 verdict。等子代理定位检测源头 patch 点。
+
+## Round 52（2026-08-24,★★★ 子代理突破: 退出机制 = 数据段 svc 跳板 + 独立巨型状态机 0x75bf7c)
+
+### 退出机制彻底揭开: raw syscall 藏在 __const 数据段
+- 全局槽 **0x8510c8**(__common BSS, 运行时填充, 83 处引用)存一个跳板地址。
+- **0x346c68**(+load 早期调用)执行: `str 0x78befc → [0x8510c8]`。
+- **0x78befc**(在 __const 只读数据段!)字节 = `svc #0x80; ret; brk #1`。
+- ⇒ 83 个 syscall 封装用 `mov x16,#N; ldr x17,[0x8510c8]; blr x17` 直接陷入内核,
+  **完全绕过 libSystem 具名符号**。这解释了为何 hook libc/文件 API 全噪声、hsbcchinax 0 命中。
+- 之前"__text 无 svc"结论对——svc 藏在**数据段**,不在 __text。
+
+### exit(1) = syscall N=1, 4 个调用点全在巨型函数 0x75bf7c 内
+- 0x760570 / 0x760988 / 0x769484 / 0x76b078, 每处 `mov w0,#1; bl 0x1f05dc`(0x1f05dc=N=1 exit 封装)。
+- 各 syscall 封装地址: 0x1f05dc(exit/1), 0x693a74(open/5), 0x3bbef4(close/6),
+  0x4365d4(read/3), 0x34cb18(access/33)。**⚠️ 修正 Round46**: 0x3bbef4/0x4365d4 不是"检测函数",
+  是 close/read 的 syscall 封装! 之前解密 stub 槽指向它们只是因为它们共用 0x8510c8 跳板。
+
+### 0x75bf7c = +load 第一个重逻辑函数, 唯一调用者, 独立巨型状态机
+- +load 链: `43e0bc bl 0x346c68`(装 svc 跳板)→ `43e0c0 bl 0x75bf7c`(唯一调用者!)→
+  `43e0c4 bl 0x346c7c`(收尾)→ 43e0c8 继续到 blr x8→0x5d8758→0x712668 分发器链。
+- 0x75bf7c(~4012字节): 开头 71 组 mov+movk+stur 拼 ~284 字节栈缓冲(密钥/哈希表, 非明文),
+  主体是**另一个 OLLVM 状态机**(同 0x712668 结构但更大~4倍): 状态变量在栈对象 +0x24
+  (初值 0x7251a64c @0x75c888), 50+ case 的 `sub w8,w8,w9;b.eq` switch, 4 个 exit(1) 是其中的 case。
+- **0x75bf7c 在 0x712668 链之前执行!** 若它内部就能 exit(1), 则 3s 退出可能来自这里, 不是 0x712668。
+
+### ★ 关键待验证(决定 patch 哪里): 3s 退出是 0x75bf7c 还是 0x712668 先触发?
+子代理明确: 0x75bf7c 与 0x712668 更可能是**两个独立检测层**(0x75bf7c 更早)。
+必须设备验证: 在 0x75bf7c 入口 + 4 个 exit(1) 调用点打日志, 看 pristine 3s 退出命中哪个。
+- 若命中 0x75bf7c 的 exit → 之前 patch 0x712e10 根本没到点(0x75bf7c 更早就退了),
+  这解释了为何 0x712e10 patch 后行为变(绕过了0x712668但0x75bf7c的exit仍在? 或时序变了)。
+- 素材: /tmp/hsbc_75bf7c_full.txt (72万字节全反汇编)。
