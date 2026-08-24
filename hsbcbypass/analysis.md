@@ -1754,3 +1754,29 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 1. **不 nop store, 改用 poller 线程在 App 安装后持续重写 slot 为跳板**(赛过 App 的 str), 看能否既留住跳板又不破坏安装序列 → 若这样能观测到越狱路径查询, 说明问题是 nop store 破坏了收尾, 而非跳板本身。
 2. 或: nop store 后, 自旋点定位——在 0x75bf7c/0x346c7c 里加日志或看自旋 PC。
 3. 若确认检测 syscall 根本不经 slot(跳板 0 命中越狱路径), 则 svc 跳板方案对"文件检测"无效, 需换"检测走内联 svc 或映射 cache stub"的假设。
+
+## Round 55d-e（2026-08-24,跳板确被调用但结果不确定, svc PC 检查假设未证实)
+
+### 尝试尾调真网关(防 svc-PC 检查): @PAGE/@PAGEOFF reloc 在 tweak 内解析成 0 → br null → 2s SIGSEGV
+- 内联 asm 里 `adrp x17,_hsbc_g_realgate@PAGE; ldr x17,[..@PAGEOFF]; br x17` 读回 0(reloc 未正确绑定)。
+- 回退到自带 `svc #0x80; ret`(55b 已证明转发正确)。
+
+### 加 readback + FIRST-CALL 同步标记后: 跳板确被调用, 但只 1 次(nr=294)然后 3s 退出
+- ctor readback 确认槽=跳板(写入生效)。FIRST-CALL: nr=294 caller=+0x44ef20(在 OLLVM 混淆区, bl 0x240218 附近)。
+- **但 poller 的 t=1s Δ 表和轨迹一行没落**——矛盾: 若跳板被调 g_total>0, poller 应打 Δ 表。
+  ⇒ 要么 poller 线程没跑起来(pthread_create 在检测退出前没调度), 要么第一个 nr=294 后检测很快 exit。
+- **对比 55b(48 call+16s 自旋) vs 55d-e(1 call+3s 退出): 同样 nop-store, 结果不同 = 非确定性**(ASLR/线程调度)。
+
+### 定性: svc 跳板观测法受非确定性 + poller 时序困扰, 且 nop-store 破坏安装序列
+- 反复出现: 有时 48 call 自旋, 有时 1 call 退出。跳板机制本身可用(readback/FIRST-CALL 证明), 但:
+  1. poller 1s 落盘太慢, 检测在 1s 内就 exit → 拿不到轨迹。
+  2. nop-store 破坏 0x346c68→0x75bf7c→0x346c7c 安装序列, 引入自旋/非确定。
+- **反思(第3次中途拦截类失败): 不该继续在跳板+nop-store 上迭代。** 需换思路。
+
+### 新方向候选(下一步选一, 避免再陷跳板泥潭)
+- (A) 不 nop-store、不改控制流: 只在 ctor 后用**独立线程 busy-loop 持续把槽改回跳板**, 且跳板**同步落盘前 200 条**
+  (不靠 poller), 抢在检测跑之前/之中就地记录, 看能否拿到完整越狱路径探测轨迹。纯观测, 不碰控制流。
+- (B) 彻底换层: 用 lldb/debugserver attach(设备有 debugserver?)在 0x75bf7c 下断点单步, 看越狱判定输入。
+- (C) 接受"检测输入=文件系统真实状态"的现实: 既然改控制流一律崩/旋, 改用**文件系统层面伪装**——
+  把设备上越狱特征路径(/var/jb 等)对该 App 的沙箱视图隐藏(bind mount / RootHide 式), 使真实 syscall 返回 clean。
+  这是 RootHide/Dopamine 生态的既有能力, 可能比对抗 Promon 状态机更实际。
