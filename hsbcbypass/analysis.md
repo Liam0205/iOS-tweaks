@@ -2274,3 +2274,34 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 ### 结论
 - 纯用户态拦 mach_vm_read 能**扰动**检测(3s→17s), 但 Promon 的库存在性/一致性校验较严, 净启动未达成。
 - 已把 PoC 推进到: 精确检测点 + 可干预点 + 干预效果曲线。下一步是"构造自洽的合法库伪装"或回内核层(issue #1)。
+
+## Round 77 / Unject 判决实验（2026-08-25,★★★★ 决定性负面结果: 证伪 systemhook-only 假设, 确认必须内核层）
+设备 22415(iPhone 13 Pro/iOS 15.4.1)。用定制 Dopamine 的 Unject 能力做最干净的实验——
+彻底不注入 systemhook 到汇丰 China 进程(连伪装库头都不用)。
+
+### 方法
+- Unject 机制(commit 980bf0f, systemhook `spawn_config_for_executable`): 若 /var/mobile/zp.unject.plist
+  存在且目标进程非 jbroot/procursus 组件, 则可执行名在 plist 里标 true 的进程返回 kSpawnConfigTrust
+  (只授信不注入 systemhook/tweak)。
+- 配置: plist 加 `<key>China</key><true/>`(key=可执行文件名, 汇丰主 binary = China.app/China)。
+- ⚠️ **plist 改后必须 userspace reboot 才生效**(systemhook 是 launchd 早期常驻, 运行时不重读)。
+
+### 验证 Unject 本身生效(关键对照, 不能跳)
+- "1s 退出"单看有歧义(unject 生效暴露第二检测 / unject 没生效照旧带注入)。必须独立证明。
+- 设备无 vmmap/lsof/frida-cli, 本地 python 无 frida。改用**微信 tweak 的可见 UI**作判据:
+  微信(WeChat, com.tencent.xin)登录页原本被 tweak 加了 `默认/iPad登录/iPhone/iPad` 按钮条。
+- 微信加入 unject 名单 + reboot 后, 该按钮条**消失** ⇒ systemhook 确实不再注入。Unject 生效已证实。
+
+### 结果
+- 汇丰 **仍然闪退**, 且比带注入的 3s **更快(<1s)**, 无 crash log(干净 exit)。
+
+### 结论(证伪 + 二律背反)
+1. systemhook.dylib 的 Mach-O 头**不是唯一判定输入**。Round 68-76"让 Promon 读不到 systemhook 就能过"
+   假设被证伪。Promon 有**独立于任何用户态注入库**的检测(很可能环境层: /var/jb、trustcache、
+   amfid/签名行为、内核补丁痕迹)。Round 74"改头撑过3s"=扰动众多检测之一的计时/分支, 非唯一开关。
+2. **用户态二律背反**: 要 Promon 检测不到注入⇒不能注入⇒无法用 tweak 干预; 要 tweak 干预⇒必须注入⇒
+   又被检测。纯用户态无法同时满足"不被检测"+"能干预", 结构性矛盾。
+3. **唯一自洽方向 = 内核层**(issue #1): 隐藏越狱环境, 不注入目标故不触发注入检测, 同时隐藏环境特征。
+   "构造自洽合法库伪装"降级(只覆盖 systemhook 头一个向量, 已知还有环境层检测)。
+- 用户态 PoC 到此收束。详见 llmdoc reference/hsbc-china-detection-vectors.md(Round77段) 与
+  memory/reflections/hsbc-china-unject-round77.md。

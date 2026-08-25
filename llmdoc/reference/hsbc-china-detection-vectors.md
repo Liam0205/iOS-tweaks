@@ -82,23 +82,62 @@ Promon 经 svc 网关发起 `mach_msg`（`msgh_id = 4808`，对应 `mach_vm_read
 
 ## 当前覆盖状态
 
-**未绕过（PoC 阶段）**。
+**未绕过。用户态路线已证伪（Round 77）——确认必须走内核层。**
 
-已验证的用户态干预效果（hook 目标自己的 mach 封装函数 `0x40c698`，篡改其读取到的
-`systemhook.dylib` 头部数据）：
+### 用户态干预效果（Round 74-76，hook mach 封装 `0x40c698` 篡改 systemhook 头）
 
 | 干预方式 | 效果 | 结论 |
 |----------|------|------|
 | 替换路径特征字符串 | 退出从 3s 推迟到 17s | 有效但不彻底，Promon 对该库存在多重/存在性校验 |
 | 清零 Mach-O magic | 绕过 `exit(1)` | 但触发 100% CPU 自旋（CFF 状态变量不一致），净启动未达成 |
 
-净启动尚未达成。候选方向二选一，两者工程量都较大：
+### ★ Round 77：Unject 实验证伪「systemhook-only」假设（决定性负面结果）
 
-1. 构造自洽的合法库镜像伪装，让 `systemhook.dylib` 区域的读取返回一份头部/loadcmds/
-   地址全部自洽的"合法库"镜像
-2. 内核层隐藏越狱环境（兜底方案，记录在 GitHub issue #1）
+用定制 Dopamine 的 **Unject** 能力（systemhook `spawn_config_for_executable` 里按可执行名
+黑名单返回 `kSpawnConfigTrust` = 只授信不注入，见
+`github.com/Liam0205/Dopamine` commit `980bf0f`）对汇丰做**最干净的实验**：彻底不注入
+systemhook 到 `China` 进程，连"伪装库头"都不需要。
 
-详细逐轮实验记录见 `hsbcbypass/analysis.md`（第 55-76 轮）。
+- **配置**：`/var/mobile/zp.unject.plist` 加 `<key>China</key><true/>`（key = 可执行文件名），
+  **改后必须 userspace reboot** 才生效（systemhook 是 launchd 早期常驻，运行时不重读 plist）。
+- **验证 Unject 本身生效**：用微信（`WeChat`，`com.tencent.xin`）对照——加入名单 + reboot 后，
+  微信 tweak（登录页 `默认/iPad登录/iPhone/iPad` 按钮条）消失，证明 systemhook 确实不再注入。
+- **结果**：汇丰 **仍然闪退**，且比带注入时的 3s **更快（<1s）**，同样无 crash log（干净 exit）。
+
+**结论**：
+1. `systemhook.dylib` 的 Mach-O 头**不是**唯一判定输入。Round 68-76 的「让 Promon 读不到
+   systemhook 就能过」假设被证伪。Promon 还有**独立于任何用户态注入库**的检测（很可能是环境层：
+   `/var/jb` 存在、trustcache 异常、amfid/签名验证行为、内核补丁痕迹等），unject 动不了。
+2. **用户态存在二律背反**：要 Promon 检测不到注入 ⇒ 不能注入 ⇒ 我们也无法用 tweak 干预；
+   要用 tweak 干预 ⇒ 必须注入 systemhook ⇒ Promon 又能检测到。纯用户态无法同时满足
+   "不被检测" 与 "能干预"。
+3. Round 74 "改 systemhook 头能撑过 3s" 现在重新理解为：只是扰动了众多检测中某个计时/分支，
+   并非命中唯一开关。
+
+### 唯一自洽的方向：内核 / dyld 加载层（隐藏而非移除）
+
+只有把干预下沉到 systemhook 检测看不到的层，才能同时满足"不被检测"+"能干预"。参考实现是
+**roothide Dopamine**（见反思 `hsbc-china-roothide-eval.md`），它用四支柱做通用越狱隐藏：
+随机 jbroot 路径、内核改写目标 task 的 `all_image_info`（让 App 枚举不到注入库）、dyld 入口/
+函数 hook、per-app 黑名单（命中的 App 不注入 tweak 但内核层隐藏痕迹）。这正是本目标缺的那一层。
+
+### ⛔ 现实约束：不能动越狱本体 ⇒ 可行域为空（2026-08-25 结论）
+
+roothide 的隐藏机制**全部落地在越狱本体**（systemhook / launchdhook / dyldhook / jailbreakd /
+内核改写）。用户明确约束**不能动越狱本体**（不改 basebin、不 rebuild、不刷定制/roothide Dopamine）。
+在此约束下：
+
+- 方案 A（换 roothide 越狱）、B（移植 roothide 到本体）均被排除。
+- 方案 C（自研内核隐藏）与 B **卡在同一禁区**——隐藏必须落在本体层，而本体是禁区。C 不是工作量
+  问题，是**没有可落脚的位置**。
+- 唯一可动的区域只剩"注入进 App 进程的用户态 tweak"，而这正是 Round 77 证伪的二律背反：要放
+  tweak 就得注入 ⇒ 被检测；不被检测就不能注入 ⇒ 没法干预。
+
+**⇒ 在"不能动越狱本体"约束下，汇丰中国 Promon SHIELD 的可行域为空，非难度问题。** 若未来放宽
+该约束（可维护定制/roothide 越狱），A/B 才是唯一有希望的方向；因我们越狱与 roothide 同源
+（都是 opa334 Dopamine 的 fork），B 比从零的 C 现实得多。
+
+详细逐轮实验记录见 `hsbcbypass/analysis.md`（第 55-77 轮）。
 
 ## 版本适配优先检查
 
