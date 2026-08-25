@@ -15,6 +15,7 @@
 - `llmdoc/architecture/tweak-architecture.md`：mybankbypass 的核心执行模型、Hook 分层、业务层 launcher 中和与关键实现约束。
 - `llmdoc/architecture/icbc-architecture.md`：icbcbypass 的架构——fishhook + Logos 组合、三层防御对抗（检测+冻结+弹窗退出）、CALayer 速率限制策略、解冻定时器永久运行与降频机制、已知性能考量、与 mybankbypass 的关键差异。
 - `llmdoc/architecture/abc-architecture.md`：abcbypass 的架构（2026-08-21 重写为最终方案）——**核心=纯 ObjC swizzle `-[DTFrameworkInterface initRiskManage]` 为空实现**，从源头消除检测退出 block；极简 `%ctor`（7 个 ObjC swizzle + 5 个 Logos hook，无 C 函数 hook）；核心约束「禁一切 C 函数 inline-hook/fishhook/__text patch/Frida，只用 ObjC swizzle」（ABC 有内存完整性自检，libc inline-hook 触发 `0xb5a06000` 崩溃）；已验证 11.1.0/iOS15.4.1 + 11.2.0/iOS16.3.1；版本适配检查顺序与历史教训。
+- `llmdoc/architecture/bmwbypass-architecture.md`：bmwbypass 的架构——核心=inline-hook（MSHookFunction）开源 IOSSecuritySuite 全部 8 个 `()->Bool` 顶层检测入口恒返回 false；靠 Swift mangled 符号定位跨版本通用；ISS 无内存完整性自检故 inline-hook 安全（与农行/汇丰根本区别）；纯 `%ctor` + 函数指针表无 Logos/swizzle；构建需 `libtinfo.so.5`；SimTouch 截图验证；Approov 远程 attestation 遗留。
 - `llmdoc/architecture/lianjiabypass-architecture.md`：lianjiabypass 的架构——链家/贝壳找房共用同一检测栈（JGBSDK/du/a/senseid）、四层对抗（文件检测 fishhook + dyld 镜像枚举作用域限定与 vis-map 缓存 + a.framework 注入检测 MSHookFunction + JGBSDK 内联 svc exit 运行时 __text patch）、W^X 权限流程教训、与 abcbypass 的关键差异。
 - `llmdoc/architecture/sshtunnel-architecture.md`：SSHTunnel v1.3.2 架构——4 态状态机（Disconnected/Connecting/Connected/Reconnecting）、进程存活健康检查、指数退避自动重连、LaunchDaemon 开机持久化、sysctl 孤儿进程检测。
 - `llmdoc/architecture/simtouch-architecture.md`：SimTouch 架构——双路径设计（HID 事件注入 for 常规触摸 + SpringBoard 私有 API for 系统手势）、_BKHandleIOHIDEventFromSender hook + 事件克隆注入、单次 IPC swipe 轨迹生成、gesture arbiter 投递路径限制、录制/回放引擎、Phase 3 新增自定义曲线/键盘输入/多指 pinch。
@@ -24,6 +25,7 @@
 - `llmdoc/reference/detection-vectors.md`：网商银行已知越狱检测向量、4.7.36 新增检测点、调试经验与当前覆盖情况。
 - `llmdoc/reference/icbc-detection-vectors.md`：工商银行检测框架（SecureUtilityPlus）、冻结机制（持续 freeze 循环及版本间时序差异）、弹窗退出链路、版本适配记录（3.0.80、3.0.90）与覆盖情况。
 - `llmdoc/reference/abc-detection-vectors.md`：农业银行三层检测架构（SecureUtilityPlus + SecurityGuard + SmAntiFraud）、SDK 识别为 mPaaS、SDK 识别与 exit 源头静态分析。**⚠️ 含 2026-08-21 第 15 轮重大更正**：可信基线（裸跑主 App ~13s 正常退出、全量 hook ~1s 崩溃）、`0xb5a06000` 崩溃根因 = libc 函数 inline-hook 被完整性自检发现、唯一安全手段为 ObjC swizzle；旧 v95"双通道杀死/覆盖成功"多为误判（存活检测匹配到扩展进程），已标注作废。
+- `llmdoc/reference/bmwbypass-detection-vectors.md`：My BMW（`de.bmw.connected.mobile20.cn`）检测向量——Flutter 应用，检测 SDK=标准开源 IOSSecuritySuite（另有 Approov 远程 attestation + Dynatrace）；弹窗由 Dart 层 attestation pre-check 触发（文案 key `attestationPreCheckFailureDescriptionCn`），进程不自杀；运行时探针确认启动只调 `amIJailbroken`+`amIReverseEngineered`，**后者是弹窗根因**；8 个单-Bool 入口符号表与运行时调用情况；checkDYLD/`_dyld_get_image_name` mask 无效的记录；Approov 服务端校验遗留。
 - `llmdoc/reference/lianjiabypass-detection-vectors.md`：链家/贝壳找房检测栈（JGBSDK 核心引擎 + du/senseid 指纹采集器 + a.framework 注入检测）、JGBSDK XxxCheck selector 与越狱特征字符串、DynamicLibraries 目录扫描、a.framework 主线程慢扫描机制、29 处内联 svc #0x80 退出点、anti-frida、当前覆盖状态（四层全覆盖，两 App 均验证）。
 - `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径、单次 IPC swipe 消除合并竞态、gesture arbiter 投递路径限制迫使系统手势走 SpringBoard API、edge mask 诊断用途）+ Phase 3（从零创建多指事件、cubic-bezier、HID keyboard、killall backboardd）。
 - `llmdoc/reference/hsbc-china-detection-vectors.md`：汇丰中国（`cn.com.hsbc.hsbcchina` 3.72.15）检测向量——SDK 识别为 **Promon SHIELD**（更正早期 OneSpan/ThreatMetrix 误判）、私有 svc 网关机制（全局槽跳板绕开 libSystem 具名符号致符号级 hook 全失效）、init[42] CFF 状态机 verdict、`mach_vm_read_overwrite` 读库头识别注入库（`systemhook.dylib`）、已排除向量清单、当前未绕过（PoC 阶段）。
@@ -36,7 +38,8 @@
 
 ## memory/reflections/
 
-- `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 早期分析方法论反思（10+ 轮）。**结论已被 [[hsbc-china-promon-poc]] 更正（SDK 身份 OneSpan→Promon SHIELD）**，仅存档参考。
+- `llmdoc/memory/reflections/bmwbypass-round0-4.md`：BMWBypass 第 0-4 轮反思（2026-08-24，一次会话解决）——先静态识别 SDK 身份（Frameworks 直接看到 IOSSecuritySuite）、运行时探针定位根因（凭「checkDYLD 检测库名」的合理推断 hook `_dyld_get_image_name` 失败，改全 hook 单-Bool 入口 + 记日志一轮定位到 `amIReverseEngineered`）、SimTouch 截图闭环验证、弹窗文案 arb key 反查检测语义；踩坑：日志路径（`/tmp` 被沙箱重定向读不到，一律写 App 数据容器）、只 hook 最明显入口不够、包名前缀 `page.0x01`；与农行/汇丰「只能 swizzle」的区别。
+- `llmdoc/memory/reflections/hsbc-methodology-lesson.md`：HSBC 早期分析方法论反思（10+ 轮），结论已被 `hsbc-china-promon-poc` 更正（SDK 身份 OneSpan→Promon SHIELD），仅存档参考。
 - `llmdoc/memory/reflections/hsbc-china-promon-poc.md`：汇丰中国 Promon SHIELD 检测定位与绕过 PoC 反思（第 55-76 轮）——追错函数 8 轮的教训（`0x75bf7c` 实测与退出无关）、SDK 身份更正为 Promon SHIELD、私有 svc 网关机制与 `mach_vm_read_overwrite` 读库头识别 `systemhook.dylib` 的完整检测链路、多 SDK 并存误判排除过程、用户态干预效果（3s→17s，未达净启动）。
 - `llmdoc/memory/reflections/icbcbypass-v1.0.0-release.md`：icbcbypass v1.0.0 发布反思——嵌套 RunLoop 死锁教训、fishhook 替代 MSHookFunction 约束、semaphore 区分策略。
 - `llmdoc/memory/reflections/icbc-3090-adaptation.md`：ICBC 3.0.90 适配反思——全局阻断框架方法的隐性退化、速率限制优于时间门控、sched_yield 缓解忙循环。
