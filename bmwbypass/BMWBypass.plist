@@ -1,0 +1,5 @@
+{
+  Filter = {
+    Bundles = ( "de.bmw.connected.mobile20.cn" );
+  };
+}
