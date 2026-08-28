@@ -1,8 +1,8 @@
 Package: page.0x01.bmwbypass
 Name: BMWBypass-My BMW反检测-rootless
-Version: 0.0.1
+Version: 0.0.2
 Architecture: iphoneos-arm64
-Description: 绕过 My BMW（de.bmw.connected.mobile20.cn）的越狱检测弹窗，使其在越狱设备上正常运行。检测 SDK 为 IOSSecuritySuite，hook 其越狱/逆向检测入口。适用于 rootless 越狱（Dopamine 等）。
+Description: 绕过 My BMW（de.bmw.connected.mobile20.cn）的越狱检测弹窗，使其在越狱设备上正常运行。检测 SDK 为 IOSSecuritySuite，hook 其越狱/逆向检测入口。在 My BMW 6.8.2 版本验证可用，适用于 rootless 越狱（Dopamine 等）。
 Maintainer: Liam
 Author: Liam
 Section: 反检测

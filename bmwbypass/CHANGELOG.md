@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.2
+
+- 补充验证信息：在 My BMW 6.8.2 版本验证可用
+
 ## 0.0.1
 
 - 绕过 My BMW（`de.bmw.connected.mobile20.cn`）的越狱检测弹窗（「App访问受限 / 检测到可能存在越狱行为」）

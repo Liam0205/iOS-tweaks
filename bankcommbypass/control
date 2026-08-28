@@ -1,8 +1,8 @@
 Package: page.0x01.bankcommbypass
 Name: BankcommBypass-交通银行反检测-rootless
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64
-Description: 绕过交通银行的越狱环境检测，使其在越狱设备上正常运行。支持交通银行 10.3.0 版本，适用于 rootless 越狱（Dopamine 等）。
+Description: 绕过交通银行的越狱环境检测，使其在越狱设备上正常运行。在交通银行 10.3.0 版本验证可用，适用于 rootless 越狱（Dopamine 等）。
 Maintainer: Liam
 Author: Liam
 Section: 反检测
