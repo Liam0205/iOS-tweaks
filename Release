@@ -1,0 +1,16 @@
+Origin: 0x01
+Label: 0x01
+Suite: stable
+Version: 1.0
+Codename: stable
+Architectures: iphoneos-arm64
+Components: main
+Description: 0x01 Jailbreak Tweaks Repository
+MD5Sum:
+ 9811b8e542b2a4a1d15e08aa843a7164 5905 Packages
+ 863447873d137c333abf3a9c3f9b8a70 2039 Packages.gz
+ ab9be3b996274039e5e4af77e39fc4ca 2211 Packages.bz2
+SHA256:
+ 86f53ad4a6c1767669d300967d9fbbc690a7127ba20187ee0ee46e70a9bf7360 5905 Packages
+ 76fb096fb8d04daaf5a045dd45d386526f16f52e31cc4486b046ad57e75ada3d 2039 Packages.gz
+ 7387885aff0a433b8f7d8477f0bf4bbcee39e79aecc7c503f2dbd32d028df6f3 2211 Packages.bz2
