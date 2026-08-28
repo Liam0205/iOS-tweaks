@@ -65,9 +65,29 @@ NSDictionary *orig = %orig;
 NSMutableDictionary *env = [orig mutableCopy];
 ```
 
+## 批量发多个 tweak（一次给多个插件发版）
+
+同时给多个 tweak 打 tag 发版时，有三个反复踩到的坑（2026-08-28 一次发 6 个插件时全部命中）：
+
+1. **一条 `git push` 推多个 tag，GitHub 常常不为每个 tag 触发 workflow**。表现为 push 成功、tag 在远端，但 `gh run list --workflow=release.yml` 里没有对应 run（甚至一个都不触发）。
+   修法：**逐个单独推 tag**，一条 push 一个 ref。若已经批量推过没触发，先删远端 tag 再逐个重推：
+   ```
+   for t in a_1.0.1 b_0.2.1 ...; do git push origin ":refs/tags/$t"; done   # 删远端
+   for t in a_1.0.1 b_0.2.1 ...; do git push origin "refs/tags/$t"; sleep 3; done  # 逐个重推
+   ```
+
+2. **`concurrency: release-deploy`（`cancel-in-progress: false`）在多个 run 几乎同时触发时，排队中的兄弟 run 会显示 `cancelled` 而非串行执行完**。只有最早的一两个真正跑，其余被取消。
+   修法：等当前 run 跑完后，用 `gh run rerun <run-id>` **逐个重跑**被 cancelled/failed 的，每个 watch 到成功再下一个，避免再次互相取消。
+
+3. **`actions/cache@v5` 会偶发 manifest 解析失败**（`While scanning for the next token, find character that cannot start any token` / `Failed to load actions/cache/v5/action.yml`），8 秒内 fail。这是上游 rolling major tag 的偶发问题，**不是我们配置的问题**——`gh run rerun` 重跑即通过，不要去改 workflow 里的 cache 版本（同批次其它 run 用同一 `@v5` 是成功的，即可佐证是偶发）。
+
+判据：判断某个 run 失败是"偶发"还是"真问题"，看**同批次/同配置的其它 run 是否成功**——成功就是偶发，重跑；全失败才查配置。
+
 ## 发版后验证
 
 **必须直接核对服务端，不能只看 tag/CI 状态**：tag 已推送、CI 显示成功，都不等于"已经发布成功"。必须直接 curl gh-pages 上的 Packages 索引和真实 deb 下载 URL 确认存在。若设备上仍看不到新版本，先分开排查"服务端是否正确"（Packages 索引 + deb URL + CDN 缓存头）和"客户端缓存是否过期"（Sileo 的 Sources 标签页下拉刷新通常能解决），不要一开始就假设发版流程本身出了问题。
+
+**CDN 缓存会让刚发布的版本短暂显示为旧版**：release 成功后立刻 curl Packages 索引，可能仍是旧 Version（CDN 边缘缓存未刷新）。这不代表发版失败——等 20~30s 或用 `?t=$(date +%s)` cache-bust 再查，并交叉验证 GitHub Release 的 deb 附件已存在、deb URL 返回 200。2026-08-28 lianjiabypass 就因此一度误显示旧版本。
 
 ## 发版检查清单
 
@@ -81,4 +101,6 @@ NSMutableDictionary *env = [orig mutableCopy];
 6. 对应的 `llmdoc/architecture/` 文档已同步更新（版本号、行为变更）
 7. 若新 tweak/App 引用私有 framework（如继承 `PSListController`），确认 CI 的 `SYSROOT` 环境变量已锁定到带 stub 的 SDK 版本，不要依赖 theos `latest` 自动解析
 8. 确认 `build.yml` 矩阵仍设置 `strategy.fail-fast: false`，避免单个 tweak 失败掩盖其余任务结果
-9. 发版后直接 curl gh-pages 的 Packages 索引和真实 deb URL 验证，不要只看 tag/CI 状态
+9. 发版后直接 curl gh-pages 的 Packages 索引和真实 deb URL 验证，不要只看 tag/CI 状态（注意 CDN 缓存可能短暂显示旧版本，见上文）
+10. 批量发多个 tweak 时，tag **逐个单独推**（一条 push 一个 ref），并逐个 `gh run rerun` 被 concurrency 取消的兄弟 run（见"批量发多个 tweak"一节）
+11. 只给绕过**成功**的 tweak 发版；未成功的（如 hsbcbypass）不加"验证可用"信息、不递增版本、不打 tag

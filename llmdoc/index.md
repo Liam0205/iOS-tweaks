@@ -33,7 +33,7 @@
 ## guides/
 
 - `llmdoc/guides/build-deploy.md`：本地构建、Linux 交叉编译、部署到设备、反向隧道工作流、部署后验证、各 tweak 回归关注点。
-- `llmdoc/guides/ci-cd-release.md`：发版 tag 规则、CI Release/Build workflow、gh-pages 部署流程、macOS CI 缺私有 framework stub 的两种修复路径、CI 矩阵 fail-fast 配置、Logos 跨平台注意事项、发版检查清单。
+- `llmdoc/guides/ci-cd-release.md`：发版 tag 规则、CI Release/Build workflow、gh-pages 部署流程、macOS CI 缺私有 framework stub 的两种修复路径、CI 矩阵 fail-fast 配置、Logos 跨平台注意事项、发版检查清单；**批量发多个 tweak 的三坑**（多 tag 一次 push 不触发 workflow→逐个推、concurrency 取消兄弟 run→逐个 rerun、`actions/cache@v5` 偶发失败→重跑不改配置）、CDN 缓存致刚发版短暂显示旧版本。
 - `llmdoc/guides/reverse-engineering-methodology.md`：逆向分析与反检测对抗的实验方法论、诊断顺序与 analysis.md 记录纪律。含（2026-08-21 补充）进程存活监控必须排除 App Extension（`.appex`）避免误判、「先排除自伤再谈检测」（裸跑对照 + 二分开关 + 固定哨兵地址崩溃识别）、有完整性自检的目标只用 ObjC swizzle。
 
 ## memory/reflections/
