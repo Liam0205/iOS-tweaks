@@ -16,6 +16,7 @@
 - `icbcbypass/` — 工商银行绕过 tweak（fishhook + Logos）
 - `abcbypass/` — 农业银行绕过 tweak（fishhook + MSHookFunction + Logos）
 - `lianjiabypass/` — 链家/贝壳找房绕过 tweak（fishhook + MSHookFunction + 运行时 __text patch）
+- `cctvbypass/` — 央视频绕过 tweak（运行时 __text patch svc→nop + MSHookFunction + Logos ObjC hook）
 - `sshtunnel/` — SSH 反向隧道管理应用（Theos Application，非 tweak）
 - `simtouch/` — 远程触摸模拟与截图捕获工具（Theos Tweak + CLI + PreferenceBundle）
 - `.github/workflows/release.yml` — 自动发版与 Pages 部署
