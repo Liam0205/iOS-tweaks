@@ -1,0 +1,16 @@
+Origin: 0x01-dev
+Label: 0x01-dev
+Suite: unstable
+Version: 1.0
+Codename: unstable
+Architectures: iphoneos-arm64
+Components: main
+Description: 0x01 Dev Builds
+MD5Sum:
+ f0bd69c9b139ca3df9a7795202ebc5c4 1349 Packages
+ 0a59bad5fb52e3a721197ff7cd9721b7 839 Packages.gz
+ 0672bc3d66704abe648e19bfe7c49f91 949 Packages.bz2
+SHA256:
+ 5b98a1d72c6c525895cbf39844a01fd7e33559e82b0e462c7a5b1d0d6651a7c0 1349 Packages
+ 59156606020bd4098506f11645d9e195189996ceaf809cecf4055d4b801ef350 839 Packages.gz
+ 5a21101370e31e305fcd78cf21adced80007d08bcc6ae7ccd707f0834132c835 949 Packages.bz2
