@@ -80,9 +80,48 @@ sudo launchctl bootout system/re.frida.server
 sudo mv /var/lib/LaunchDaemons/re.frida.server.plist <备份目录>   # 实际路径 /var/jb/Library/LaunchDaemons/
 ```
 
+### 8. 唯一有效的干预：接管异常端口但不回复
+
+关键发现来自一次"写坏"的版本：异常服务线程因为消息缓冲区太小一直收不到消息（自旋空转），等价于**接管了异常端口却从不回复**。这个状态下 App 不再闪退，能正常显示界面。
+
+原因：JM 的处决方式是**破坏对象的 isa 再发 Objective-C 消息**，于是线程执行 `blr` 跳到非法地址。异常被内核抛给我们后我们不回复，触发处决的线程就永久停在异常状态，进程不会退出。
+
+实测异常现场（`mach_exception_raise_state_identity`，消息 ID 2407）：
+
+```
+type=1 (EXC_BAD_ACCESS)  code0=1  code1=8
+pc=lr=0x8   x0=0x4   x1=0x1f3821dae (+[NSThread isMainThread])   x8=x9=8
+```
+
+另一类异常跳到 `0xf3`。还有一类是 JM 自己的线程跳到 `0x99e11258` 这类无效地址（`x10` 与 pc 相同，说明是 `blr x10`）。
+
+### 9. 异常消息的解析要点
+
+`task_set_exception_ports` 用 `EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES` 时，内核发来 `msgh_id 2407`，消息里同时带线程端口和完整线程状态。**消息线上的 port descriptor 是 12 字节**，和结构体里的 16 字节不一致，按结构体解析会全部错位（曾经把 `exception` 读成 68、端口读成 1）。可靠的做法是按显式字节偏移读：
+
+```
+0 header(24) | 24 descriptor_count(4) | 28 thread(12) | 40 task(12)
+52 NDR(8) | 60 exception(4) | 64 codeCnt(4) | 68 code(2×8)
+84 flavor(4) | 88 old_stateCnt(4) | 92 old_state
+```
+
+`flavor=6` 就是 `ARM_THREAD_STATE64`，`old_state` 可直接按 `arm_thread_state64_t` 读。
+
+### 10. 已排除但值得记录的尝试
+
+- **终止处决线程**：`thread_terminate` 返回 53，从消息里拿到的端口没有终止权限。
+- **伪造 dyld 镜像路径**：见第 4 条。
+- **只伪装 `dladdr`**：JM 确实用 `dladdr` 逐个检查镜像（`JM+0x15e1c0` 连续查询 systemhook、Choicy、Crane、ellekit、AppSync 等），但只改 `dli_fname` 不足以通过。
+- **枚举伪造 + `dladdr` 伪装同时做**（`AIA_STEALTH`）：仍然崩溃。
+- **UI 层拦截**：卡住时窗口层级完全正常，`hitTest` 能命中 `YBSubHeaderComponentView` 且 `userInteractionEnabled=1`，没有遮罩层。所以不是 UI 拦截。
+
 ## 当前状态
 
-尚未达成启动成功。已排除镜像路径检测和"多一个 tweak"两条假设，确认检测对象是越狱注入基座。下一步需要在 JM 的判定点动手，或找到它判定基座是否存在的具体依据。
+**能启动、能进首页，但运行几分钟后界面仍会变得不可点击。**
+
+进程一直存活、CPU 降到 0、主线程停在正常的 runloop `mach_msg` 等待上，动画也继续渲染，只有触摸事件不再响应。说明主线程没有死锁，问题出在事件处理链或某个被挂起的处决线程持有的状态上。
+
+`Tweak.x` 的默认构建就是这个可用状态，无需额外参数。
 
 ## 可复现的实验开关
 
@@ -97,6 +136,8 @@ sudo mv /var/lib/LaunchDaemons/re.frida.server.plist <备份目录>   # 实际�
 | `AIA_HIDE_IMAGES=1` | 从 `_dyld_*` 枚举里过滤掉越狱相关镜像 |
 | `AIA_BLOCK_ADD_IMAGE=1` | 吞掉对 `_dyld_register_func_for_add_image` 的注册 |
 | `AIA_FAKE_PATH=1` | 改写 dyld 镜像表里的 `imageFilePath` |
+| `AIA_LOG_IMAGES=1` | 启动时打印所有非系统镜像路径 |
+| `AIA_BLOCK_EXIT=1` | 拦下 `exit(1)`/`_exit(1)`（实验用，会导致死锁） |
 
 构建（Linux + Theos）：
 
