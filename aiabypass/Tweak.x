@@ -1855,7 +1855,11 @@ __attribute__((unused)) __attribute__((unused)) static void log_exception_port_o
 // 而 VM 在本进程里解出越界操作码直接跳飞（主线程一挂，界面就再没有触摸响应）。
 // 这里把来源在 Dynatrace 里的 IMP 全部拒掉，让它的埋点装不上。
 #ifndef AIA_BLOCK_DYNATRACE
-#define AIA_BLOCK_DYNATRACE 1
+// 默认关闭。这三个拦截是为了在 ijm 解析器槽被 JM 占用时挡住主线程进 VM；
+// 现在槽已清零、绑定器改走 App 自己的解析器，主线程不再跳飞，它们不再必需。
+// 实测三个同时打开会让进程在 ctor 阶段就卡住（连 2 秒后安装槽清零的任务都跑不到），
+// 单独打开任意一个则正常，属组合效应。保留为实验开关。
+#define AIA_BLOCK_DYNATRACE 0
 #endif
 
 #if AIA_BLOCK_DYNATRACE
@@ -1863,7 +1867,11 @@ __attribute__((unused)) __attribute__((unused)) static void log_exception_port_o
 // 全关会让 Dynatrace 自身状态不自洽，App 完全不响应触摸（视图树只剩三层系统容器）。
 // 精准拦截既能阻止 ijm 方法被包装后调用，又不影响 Dynatrace 的其它埋点。
 #ifndef AIA_BLOCK_IJM_SWIZZLE
-#define AIA_BLOCK_IJM_SWIZZLE 1
+// 默认关闭。这三个拦截是为了在 ijm 解析器槽被 JM 占用时挡住主线程进 VM；
+// 现在槽已清零、绑定器改走 App 自己的解析器，主线程不再跳飞，它们不再必需。
+// 实测三个同时打开会让进程在 ctor 阶段就卡住（连 2 秒后安装槽清零的任务都跑不到），
+// 单独打开任意一个则正常，属组合效应。保留为实验开关。
+#define AIA_BLOCK_IJM_SWIZZLE 0
 #endif
 
 #if AIA_BLOCK_IJM_SWIZZLE
@@ -1896,7 +1904,11 @@ static int imp_is_ijm_stub(IMP imp) { (void)imp; return 0; }
 // Dynatrace 对系统类的埋点——整份关闭配置器（AIA_KILL_DT_SWIZZLE）会让
 // Dynatrace 自身状态不自洽，App 从此完全不响应触摸。
 #ifndef AIA_BLOCK_DT_APP_SWIZZLE
-#define AIA_BLOCK_DT_APP_SWIZZLE 1
+// 默认关闭。这三个拦截是为了在 ijm 解析器槽被 JM 占用时挡住主线程进 VM；
+// 现在槽已清零、绑定器改走 App 自己的解析器，主线程不再跳飞，它们不再必需。
+// 实测三个同时打开会让进程在 ctor 阶段就卡住（连 2 秒后安装槽清零的任务都跑不到），
+// 单独打开任意一个则正常，属组合效应。保留为实验开关。
+#define AIA_BLOCK_DT_APP_SWIZZLE 0
 #endif
 
 #if AIA_BLOCK_DT_APP_SWIZZLE
@@ -2198,6 +2210,16 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
 // 0x30 字节的帧、[sp] 放返回地址，并用 x14 给出实现地址、x15 给出成功标志。
 // 1 = 我们自己的解析器桩；2 = 把槽清零，让绑定器回退到元数据里的 0x7c5600
 // （App 自己的解析器 + 自己的 VM + 自己的描述符，ABI 天然一致）。
+// JM 的 ijm 解释器在 JM+0x11f1dc 读全局 JM+0x1b9678：
+//   cmp x8, #1 ; b.lt 用 0 作密钥 ; 否则 mvn 取反用 0xff
+// 现场观测到 x8=0xff，此时原始字节 0x5d ^ 0xff = 0xa2，而分派表只有 107 项，越界跳飞。
+// 换成密钥 0，同一字节解出 0x5d = 93，是合法表项。也就是说 0xff 是异常态，
+// 由某个检测结果把全局置成了非 0。
+//   0 = 不干预   1 = 只观测   2 = 持续把它压回 0
+#ifndef AIA_IJM_KEY
+#define AIA_IJM_KEY 1
+#endif
+
 #ifndef AIA_IJM_RESOLVER
 #define AIA_IJM_RESOLVER 2
 #endif
@@ -2396,6 +2418,43 @@ __attribute__((unused)) static void install_vm_probe(void) {
 // 直接在 0x7c5590 的 cbz x15 上做不了（静态代码不可改，__TEXT 只读），
 // 所以改为 hook 绑定器回调 0x7c5588 里 blr 出去的那个函数——它是 ijm 运行时的
 // 导入解析器。解析失败的判据是返回 0，我们改成返回元数据表里的 PTR。
+#if AIA_IJM_KEY
+// 这个全局在 __DATA，文件里初值 0；运行期一旦变成非 0，之后每次 VM 分派都会
+// 用取反的密钥，脚本解出来全是乱码。观测它的取值能直接回答"检测是否失败"。
+static volatile uint64_t *g_ijm_key_flag(void) {
+    uintptr_t jm = module_base_for("JMCodeProtectKit", NULL);
+    return jm ? (volatile uint64_t *)(jm + 0x1b9678) : NULL;
+}
+
+static void start_ijm_key_watch(void) {
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_async(q, ^{
+        volatile uint64_t *p = g_ijm_key_flag();
+        if (!p) { log_raw("IJMKEY no JM base\n"); return; }
+        char b[160];
+        uint64_t last = ~0ULL;
+        int changes = 0;
+        for (int i = 0; i < 60000; i++) {
+            uint64_t v = *p;
+            if (v != last) {
+                snprintf(b, sizeof(b), "IJMKEY t=%.2fs = %#llx\n", i * 0.005, (unsigned long long)v);
+                log_raw(b);
+                last = v;
+                if (++changes > 40) break;
+            }
+#if AIA_IJM_KEY >= 2
+            if (v) { *p = 0; }
+#endif
+            usleep(5000);
+        }
+        snprintf(b, sizeof(b), "IJMKEY watch end value=%#llx\n", (unsigned long long)*p);
+        log_raw(b);
+    });
+}
+#else
+__attribute__((unused)) static void start_ijm_key_watch(void) {}
+#endif
+
 #if AIA_IJM_RESOLVER
 // 我们给出的"实现"：被那批 ijm 桩当成真实函数调用。这些桩都是 App 的埋点类方法，
 // 返回空值即可；x0 清零保证返回 nil，而不是把上一个调用的残留值当对象用。
@@ -2816,6 +2875,9 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_PATCH_BINDER_VALUE
     patch_binder_zero_values();
+#endif
+#if AIA_IJM_KEY
+    start_ijm_key_watch();
 #endif
 #if AIA_IJM_RESOLVER
     // 槽要等 App 自己的初始化写完之后再换，否则会被覆盖回原值。
