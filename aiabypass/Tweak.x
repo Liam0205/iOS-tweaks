@@ -1153,10 +1153,13 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
         // 主线程如果一直不回复就永久挂起，界面从此失去响应。
         {
             const uint8_t *bb = (const uint8_t *)req;
+            int etype2 = (int)*(const uint32_t *)(bb + EXC_TYPE_OFF);
             uint32_t flavor2 = *(const uint32_t *)(bb + EXC_FLAVOR_OFF);
             uint32_t sc2 = *(const uint32_t *)(bb + EXC_STATE_OFF);
             uint64_t ftid = thread_id_of(*(const uint32_t *)(bb + EXC_THREAD_OFF));
-            if (g_main_tid && ftid == g_main_tid && flavor2 == 6 && sc2 >= 34) {
+            // 断点类必须交给下面的 AIA_EXC_SKIP_BRK 处理。这里如果也接住，
+            // RECOVER_FAULT=0 时只是不回复，主线程会被挂住直到 SIGTRAP 打死进程。
+            if (g_main_tid && ftid == g_main_tid && etype2 != 6 && flavor2 == 6 && sc2 >= 34) {
                 memcpy(rep->new_state, bb + EXC_STATE_BODY_OFF, sizeof(arm_thread_state64_t));
                 arm_thread_state64_t *nst = (arm_thread_state64_t *)rep->new_state;
                 uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
@@ -1703,9 +1706,23 @@ __attribute__((unused)) static void patch_binder_zero_values(void) {
              (unsigned long long)meta[2], (unsigned long long)meta[3],
              (unsigned long long)meta[4]);
     log_raw(b);
-    // 绑定器代码区在只读段，改不了；只把观察到的槽位值打出来供后续判断。
-    uintptr_t slot = (uintptr_t)meta[3] ? (uintptr_t)meta[3] : (uintptr_t)meta[4];
-    snprintf(b, sizeof(b), "BINDER slotptr=%#lx\n", (unsigned long)slot);
+    // 解析器槽 [meta+0x48] 指向 __LINKEDIT 里的 0x4058008，由 dyld 在运行时填充。
+    // 这里读出三个相关槽的真实值：绑定器就是用它们算重定位基数的。
+    uintptr_t resolver_off = (uintptr_t)meta[9];   // meta[0x48]
+    snprintf(b, sizeof(b), "BINDER resolver_off=%#lx\n", (unsigned long)resolver_off);
+    log_raw(b);
+    for (int i = 0; i < 4; i++) {
+        uintptr_t a = base + resolver_off + (uintptr_t)i * 8;
+        uintptr_t v = 0;
+        if (safe_read(a, &v)) {
+            snprintf(b, sizeof(b), "BINDER slot[%d] @%#lx = %#lx\n",
+                     i, (unsigned long)(resolver_off + i * 8), (unsigned long)v);
+            log_raw(b);
+        }
+    }
+    // x28 = 0x7c55fc - resolver(0x4058008)，即绑定器用的重定位基数。
+    uintptr_t x28 = (uintptr_t)0x7c55fc - resolver_off;
+    snprintf(b, sizeof(b), "BINDER x28=%#lx\n", (unsigned long)x28);
     log_raw(b);
 }
 #endif
@@ -2024,6 +2041,10 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #if AIA_BLOCK_DYNATRACE
     install_dynatrace_block();
 #endif
+    // 只记录，不改变行为：确认进程是被 exit() 正常结束还是被信号打死。
+    MSHookFunction((void *)exit, (void *)my_exit, (void **)&orig_exit);
+    MSHookFunction((void *)_exit, (void *)my_Exit, (void **)&orig_Exit);
+    MSHookFunction((void *)abort, (void *)my_abort, (void **)&orig_abort);
 #if AIA_KILL_DT_SWIZZLE
     kill_dt_swizzle();
 #endif
