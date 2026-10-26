@@ -70,16 +70,35 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_DYLD_ONLY 0
 #endif
 
+// 实验：只 hook dladdr，把落在越狱镜像里的地址伪装成系统库。
 
 // 实验：定期采样所有线程的 PC，用来定位空转位置。
+#ifndef AIA_SAMPLE_THREADS
+#define AIA_SAMPLE_THREADS 0
+#endif
 
 // 实验：安装自己的 Mach 异常处理器，抢在 ellekit 之前拿到故障线程的现场，
 // 这样能看到"谁跳到了非法地址"。AIA_KILL_THREAD=1 时只终止故障线程，不杀整个进程。
+#ifndef AIA_EXC_HANDLER
+#define AIA_EXC_HANDLER 1
+#endif
 // 1 = 收到 SIGUSR1 时把所有线程的 PC/LR 和主线程栈打到日志里，用来诊断卡死。
+#ifndef AIA_DUMP_ON_SIGNAL
+#define AIA_DUMP_ON_SIGNAL 0
+#endif
 // 1 = 后台线程每 50ms 重新设置一次异常端口，抢在 ellekit / Dynatrace KSCrash 之后。
+#ifndef AIA_EXC_WATCHDOG
+#define AIA_EXC_WATCHDOG 1
+#endif
 // 1 = 启动接收线程。0 = 只接管异常端口、不接收，让异常消息永久排队，
 // 触发异常的线程会一直等在异常状态，JM 的处决线程随之阻塞。
+#ifndef AIA_EXC_SERVER
+#define AIA_EXC_SERVER 1
+#endif
 // 1 = 收到异常后不回复，让故障线程永久挂起（不交给 ellekit，也就不会有 exit(1)）
+#ifndef AIA_EXC_NO_REPLY
+#define AIA_EXC_NO_REPLY 1
+#endif
 
 // 实验：拦下 exit(1)/_exit(1)，验证是 JM 自己退出还是 ellekit 异常处理器退出。
 #ifndef AIA_BLOCK_EXIT
@@ -713,6 +732,339 @@ static void my_pthread_exit(void *ret) {
 
 
 // ============================================================
+// MARK: 自建 Mach 异常处理器（抢占 ellekit 的异常端口）
+// ============================================================
+
+#if AIA_EXC_HANDLER
+
+// EXCEPTION_STATE_IDENTITY + MACH_EXCEPTION_CODES 对应 mach_exception_raise_state_identity
+// （msgh_id 2407）。消息里同时带 thread/task 端口和完整线程状态。
+typedef struct {
+    mach_msg_header_t Head;
+    mach_msg_body_t msgh_body;
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+    NDR_record_t NDR;
+    exception_type_t exception;
+    mach_msg_type_number_t codeCnt;
+    int64_t code[2];
+    int flavor;
+    mach_msg_type_number_t old_stateCnt;
+    natural_t old_state[128];
+} exc_req_t;
+
+typedef struct {
+    mach_msg_header_t Head;
+    NDR_record_t NDR;
+    kern_return_t RetCode;
+    mach_msg_type_number_t new_stateCnt;
+    natural_t new_state[128];
+} exc_reply_t;
+
+static mach_port_t g_exc_port = MACH_PORT_NULL;
+
+// 消息线上 port descriptor 是 12 字节，和结构体里的 16 字节不一致，
+// 所以这里全部按显式字节偏移解析，避免被编译器的对齐填充带偏。
+// mach_exception_raise_state_identity 布局：
+//   0 header(24) | 24 descriptor_count(4) | 28 thread(12) | 40 task(12)
+//   52 NDR(8) | 60 exception(4) | 64 codeCnt(4) | 68 code[2](16)
+//   84 flavor(4) | 88 old_stateCnt(4) | 92 old_state
+#define EXC_HDR 0
+#define EXC_THREAD_OFF 28
+#define EXC_TASK_OFF 40
+#define EXC_NDR_OFF 52
+#define EXC_TYPE_OFF 60
+#define EXC_CODECNT_OFF 64
+#define EXC_CODE_OFF 68
+#define EXC_FLAVOR_OFF 84
+#define EXC_STATE_OFF 88
+#define EXC_STATE_BODY_OFF 92
+
+static void dump_fault_state(exc_req_t *req) {
+    char buf[256];
+    const uint8_t *b = (const uint8_t *)req;
+    int64_t code0 = 0, code1 = 0;
+    memcpy(&code0, b + EXC_CODE_OFF, 8);
+    memcpy(&code1, b + EXC_CODE_OFF + 8, 8);
+    uint32_t codeCnt = *(const uint32_t *)(b + EXC_CODECNT_OFF);
+    uint32_t flavor = *(const uint32_t *)(b + EXC_FLAVOR_OFF);
+    uint32_t stateCnt = *(const uint32_t *)(b + EXC_STATE_OFF);
+    int etype = (int)*(const uint32_t *)(b + EXC_TYPE_OFF);
+    mach_port_t thrPort = *(const uint32_t *)(b + EXC_THREAD_OFF);
+    mach_port_t tskPort = *(const uint32_t *)(b + EXC_TASK_OFF);
+    snprintf(buf, sizeof(buf),
+             "EXCFAULT id=%d size=%u thr=%u task=%u type=%d codeCnt=%u code0=%lld code1=%lld flavor=%u stateCnt=%u\n",
+             req->Head.msgh_id, req->Head.msgh_size, thrPort, tskPort, etype, codeCnt,
+             (long long)code0, (long long)code1, flavor, stateCnt);
+    log_raw(buf);
+    if (flavor != 6 || stateCnt < 34) { log_raw("  (state 不可用)\n"); return; }
+    arm_thread_state64_t st;
+    memcpy(&st, b + EXC_STATE_BODY_OFF, sizeof(st));
+    uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+    uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);
+    uintptr_t sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(st);
+    uintptr_t off = 0;
+    const char *m = module_for(pc, &off);
+    snprintf(buf, sizeof(buf), "  pc=%p(%s+0x%lx) lr=%p sp=%p\n", (void *)pc,
+             m ? m : "?", (unsigned long)off, (void *)lr, (void *)sp);
+    log_raw(buf);
+    for (int i = 0; i < 29; i++) {
+        uintptr_t v = (uintptr_t)st.__x[i];
+        uintptr_t voff = 0;
+        const char *vm = module_for(v, &voff);
+        if (vm) {
+            snprintf(buf, sizeof(buf), "  x%-2d=%#018lx %s+0x%lx\n", i,
+                     (unsigned long)v, vm, (unsigned long)voff);
+        } else {
+            snprintf(buf, sizeof(buf), "  x%-2d=%#018lx\n", i, (unsigned long)v);
+        }
+        log_raw(buf);
+    }
+    int found = 0;
+    for (int i = 0; i < 0x2000 / sizeof(uintptr_t) && found < 24; i++) {
+        uintptr_t v = 0;
+        if (!safe_read(sp + i * sizeof(uintptr_t), &v)) break;
+        uintptr_t voff = 0;
+        const char *vm = module_for(v, &voff);
+        if (!vm || voff == 0) continue;
+        if (!strstr(vm, "JMCodeProtectKit") && !strstr(vm, "KYHAppStore")) continue;
+        snprintf(buf, sizeof(buf), "  stack[+0x%x] %p %s+0x%lx\n",
+                 i * 8, (void *)v, vm, (unsigned long)voff);
+        log_raw(buf);
+        found++;
+    }
+}
+
+__attribute__((unused)) static void *aia_exc_server(void *arg) {
+    (void)arg;
+    mach_msg_size_t rcv = 1024;
+    exc_req_t *req = (exc_req_t *)calloc(1, rcv + 2048);
+    exc_reply_t *rep = (exc_reply_t *)calloc(1, sizeof(exc_reply_t) + 256);
+    if (!req || !rep) return NULL;
+    while (1) {
+        kern_return_t kr = mach_msg(&req->Head, MACH_RCV_MSG | MACH_RCV_LARGE, 0,
+                                    rcv, g_exc_port,
+                                    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr == MACH_RCV_TOO_LARGE) {
+            mach_msg_size_t need = 0;
+            mach_msg(&req->Head, MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_LARGE_IDENTITY,
+                     0, 0, g_exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            need = req->Head.msgh_size;
+            if (need < 1024) need = 4096;
+            rcv = need + 1024;
+            req = (exc_req_t *)realloc(req, rcv + 2048);
+            aialog("exc: rcv too large, resized to %u", rcv);
+            continue;
+        }
+        if (kr != KERN_SUCCESS) {
+            static int logged;
+            if (logged < 5) { aialog("exc: recv failed %d", kr); logged++; }
+            usleep(20000);
+            continue;
+        }
+        dump_fault_state(req);
+#if AIA_EXC_NO_REPLY
+        // 不回复：故障线程留在异常状态，内核不会让它继续执行，JM 的处决也不会生效。
+        memset(req, 0, rcv + 2048);
+        continue;
+#endif
+        rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+        rep->Head.msgh_local_port = MACH_PORT_NULL;
+        rep->Head.msgh_id = req->Head.msgh_id + 100;
+        rep->NDR = NDR_record;
+        rep->RetCode = KERN_SUCCESS;
+        rep->new_stateCnt = req->old_stateCnt;
+        memcpy(rep->new_state, req->old_state, req->old_stateCnt * sizeof(natural_t));
+        rep->Head.msgh_size = 8 + 8 + 4 + 4 + req->old_stateCnt * sizeof(natural_t);
+        mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                 MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
+    return NULL;
+}
+
+#if AIA_SAMPLE_THREADS
+__attribute__((unused)) static void *aia_sampler(void *arg) {
+    (void)arg;
+    char buf[256];
+    for (int round = 0; round < 30; round++) {
+        sleep(2);
+        thread_act_array_t list = NULL;
+        mach_msg_type_number_t cnt = 0;
+        if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) continue;
+        snprintf(buf, sizeof(buf), "SAMPLE round=%d threads=%u\n", round, cnt);
+        log_raw(buf);
+        for (mach_msg_type_number_t i = 0; i < cnt && i < 24; i++) {
+            struct thread_basic_info tb = {0};
+            mach_msg_type_number_t tbc = THREAD_BASIC_INFO_COUNT;
+            int cpu = -1;
+            if (thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&tb, &tbc) == KERN_SUCCESS)
+                cpu = tb.cpu_usage;
+            arm_thread_state64_t st;
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t gs = thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc);
+            if (gs != KERN_SUCCESS) {
+                snprintf(buf, sizeof(buf), "  t%u cpu=%d getstate=%d\n", i, cpu, gs);
+                log_raw(buf);
+                continue;
+            }
+            uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+            uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);
+            uintptr_t voff = 0, loff = 0;
+            const char *vm = module_for(pc, &voff);
+            const char *lm = module_for(lr, &loff);
+            snprintf(buf, sizeof(buf), "  t%u cpu=%d pc=%p %s+0x%lx lr=%p %s+0x%lx\n", i, cpu,
+                     (void *)pc, vm ? vm : "?", (unsigned long)voff,
+                     (void *)lr, lm ? lm : "?", (unsigned long)loff);
+            log_raw(buf);
+            if (i == 0) {
+                uintptr_t sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(st);
+                int got = 0;
+                for (int k = 0; k < 0x800 / 8 && got < 14; k++) {
+                    uintptr_t v = 0;
+                    if (!safe_read(sp + k * 8, &v)) break;
+                    uintptr_t o2 = 0;
+                    const char *m2 = module_for(v, &o2);
+                    if (!m2 || o2 == 0) continue;
+                    snprintf(buf, sizeof(buf), "    [%02d] %s+0x%lx\n", k, m2, (unsigned long)o2);
+                    log_raw(buf);
+                    got++;
+                }
+            }
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
+    }
+    return NULL;
+}
+static void start_sampler(void) {
+    pthread_t th;
+    pthread_create(&th, NULL, aia_sampler, NULL);
+}
+#endif
+
+#if AIA_EXC_WATCHDOG
+static void *aia_exc_watchdog(void *arg) {
+    (void)arg;
+    // 必须一直跑：JM 会在运行期间反复检测，端口一旦被别人抢回去就会再次触发处决。
+    for (;;) {
+        task_set_exception_ports(mach_task_self(),
+                                 EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
+                                 g_exc_port, EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
+                                 ARM_THREAD_STATE64);
+        usleep(50000);
+    }
+    return NULL;
+}
+#endif
+
+#if AIA_DUMP_ON_SIGNAL
+static void dump_view(UIView *v, int depth) {
+    if (depth > 3) return;
+    char buf[320];
+    NSString *cls = NSStringFromClass([v class]);
+    snprintf(buf, sizeof(buf), "    %*s%s fr=(%.0f,%.0f %.0fx%.0f) hidden=%d alpha=%.2f "
+             "inter=%d clips=%d layer=%.2f\n", depth * 2, "", cls.UTF8String,
+             v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
+             (int)v.hidden, (double)v.alpha, (int)v.userInteractionEnabled,
+             (int)v.clipsToBounds, (double)v.layer.opacity);
+    log_raw(buf);
+    for (UIView *sub in v.subviews) dump_view(sub, depth + 1);
+}
+
+static void dump_ui_main(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIApplication *app = [UIApplication sharedApplication];
+    char buf[320];
+    snprintf(buf, sizeof(buf), "=== UI: %u windows ===\n",
+             (unsigned)app.windows.count);
+    log_raw(buf);
+    for (UIWindow *w in app.windows) {
+        snprintf(buf, sizeof(buf), "  window %s level=%.0f hidden=%d alpha=%.2f inter=%d\n",
+                 NSStringFromClass([w class]).UTF8String, (double)w.windowLevel,
+                 (int)w.hidden, (double)w.alpha, (int)w.userInteractionEnabled);
+        log_raw(buf);
+        dump_view(w, 1);
+        CGPoint c = CGPointMake(w.bounds.size.width / 2, w.bounds.size.height / 2);
+        UIView *hit = [w hitTest:c withEvent:nil];
+        snprintf(buf, sizeof(buf), "  hitTest(中心) -> %s inter=%d\n",
+                 hit ? NSStringFromClass([hit class]).UTF8String : "(nil)",
+                 hit ? (int)hit.userInteractionEnabled : -1);
+        log_raw(buf);
+    }
+    log_raw("=== UI END ===\n");
+#pragma clang diagnostic pop
+}
+
+static void dump_ui_signal(int sig) {
+    (void)sig;
+    dispatch_async(dispatch_get_main_queue(), ^{ dump_ui_main(); });
+}
+
+static void dump_all_threads(int sig) {
+    (void)sig;
+    char buf[256];
+    log_raw("=== DUMP ALL THREADS ===\n");
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t i = 0; i < cnt && i < 64; i++) {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) != KERN_SUCCESS) continue;
+        uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+        uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);
+        uintptr_t vo = 0, lo = 0;
+        const char *vm = module_for(pc, &vo);
+        const char *lm = module_for(lr, &lo);
+        snprintf(buf, sizeof(buf), "  t%u pc=%p %s+0x%lx lr=%p %s+0x%lx\n", i,
+                 (void *)pc, vm ? vm : "?", (unsigned long)vo,
+                 (void *)lr, lm ? lm : "?", (unsigned long)lo);
+        log_raw(buf);
+        if (i == 0) {
+            uintptr_t sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(st);
+            int got = 0;
+            for (int k = 0; k < 0x1000 / 8 && got < 22; k++) {
+                uintptr_t v = 0;
+                if (!safe_read(sp + k * 8, &v)) break;
+                uintptr_t o2 = 0;
+                const char *m2 = module_for(v, &o2);
+                if (!m2 || o2 == 0) continue;
+                snprintf(buf, sizeof(buf), "    [%02d] %s+0x%lx\n", k, m2, (unsigned long)o2);
+                log_raw(buf);
+                got++;
+            }
+        }
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
+    log_raw("=== DUMP END ===\n");
+}
+#endif
+
+__attribute__((unused)) static void install_exc_handler(void) {
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
+    if (kr != KERN_SUCCESS) { aialog("exc: port_allocate %d", kr); return; }
+    mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
+    kr = task_set_exception_ports(mach_task_self(),
+                                  EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
+                                  g_exc_port, EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
+                                  ARM_THREAD_STATE64);
+    if (kr != KERN_SUCCESS) { aialog("exc: set_exception_ports %d", kr); return; }
+#if AIA_EXC_SERVER
+    pthread_t th;
+    pthread_create(&th, NULL, aia_exc_server, NULL);
+    aialog("exc: handler installed port=%u (server on)", g_exc_port);
+#else
+    aialog("exc: handler installed port=%u (server off, exceptions will queue)", g_exc_port);
+#endif
+#if AIA_EXC_WATCHDOG
+    pthread_t wt;
+    pthread_create(&wt, NULL, aia_exc_watchdog, NULL);
+#endif
+}
+#endif
+
+// ============================================================
 // MARK: 初始化
 // ============================================================
 
@@ -819,6 +1171,17 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     }
     snapshot_modules();
     aialog("module snapshot: %d", g_mod_count);
+#if AIA_EXC_HANDLER
+    install_exc_handler();
+#endif
+#if AIA_SAMPLE_THREADS
+    start_sampler();
+#endif
+#if AIA_DUMP_ON_SIGNAL
+    signal(SIGUSR1, dump_all_threads);
+    signal(SIGUSR2, dump_ui_signal);
+    aialog("dump-on-signal: SIGUSR1 已注册");
+#endif
 #if AIA_LOG_IMAGES
     for (int i = 0; i < g_mod_count; i++) {
         const char *nm = g_mods[i].name;
