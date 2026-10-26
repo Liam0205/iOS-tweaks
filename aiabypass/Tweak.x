@@ -195,6 +195,49 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 // App 能用的前提正是"检测没跑完"。如果让它继续跑，JM 是会判定通过，
 // 还是会在下一步再处决一次，只能实测。
 //   2 = 交给 aia_thread_bail 让 pthread_exit 干净退出
+// 1 = 异常发生时转储其它 JM/App 线程的 PC/LR 与帧链，用来定位判定点。
+// 1 = 在 AIA_EMPTY 模式下连 task_info/exit/_exit/abort 这几个 libc hook 也不装，
+// 只保留异常端口。用来回答一个决定性问题：JM 的处决是我们自己的 hook
+// 触发的（它可能校验被改写过的代码页），还是它本来就判定失败。
+// 1 = 记录 JM 早期检查过的文件路径（access/stat/lstat/open）。
+// 这是定位"它到底在看什么"最直接的办法：越狱检测绝大多数落在路径存在性上。
+#ifndef AIA_FS_PROBE
+#define AIA_FS_PROBE 0
+#endif
+
+// 1 = 过滤 sysctl(KERN_PROC_ALL) 返回的进程列表，抹掉 Sileo/jailbreakd/sshd 等项。
+#ifndef AIA_PROC_FILTER
+#define AIA_PROC_FILTER 0
+#endif
+
+// 1 = 记录 JM/App 查询的环境变量与 sysctl 项。
+#ifndef AIA_ENV_PROBE
+#define AIA_ENV_PROBE 0
+#endif
+
+// 1 = 记录 csops 查询（代码签名状态），RASP 常用信号。
+#ifndef AIA_CSOPS_PROBE
+#define AIA_CSOPS_PROBE 0
+#endif
+
+// 1 = 探测 JM 是否查询任务的异常端口（RASP 常见手法）。
+#ifndef AIA_EXCPORT_PROBE
+#define AIA_EXCPORT_PROBE 0
+#endif
+
+// 1 = 只装文件系统探针（全量记录查询路径），其余 hook 全不装。
+#ifndef AIA_FS_ONLY
+#define AIA_FS_ONLY 0
+#endif
+
+#ifndef AIA_NO_LIBC_HOOKS
+#define AIA_NO_LIBC_HOOKS 0
+#endif
+
+#ifndef AIA_DUMP_PEERS
+#define AIA_DUMP_PEERS 1
+#endif
+
 #ifndef AIA_EXC_NONMAIN
 #define AIA_EXC_NONMAIN 0
 #endif
@@ -243,6 +286,8 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 // 日志写 App 数据容器，不写 /tmp 或 /var/jb/tmp。
 static void log_backtrace(const char *tag);
 static const char *caller_desc(void *ra);
+static const char *aia_real_ptr(uintptr_t v, uintptr_t *real_out, uintptr_t *off_out);
+static const char *module_for(uintptr_t addr, uintptr_t *offset);
 static __thread bool t_in_safe_read;
 static bool caller_is_jb_infra(void *ra);
 static void aialog(const char *fmt, ...) {
@@ -505,6 +550,16 @@ static int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void
 static const char *caller_desc(void *ra) {
     static char buf[320];
     Dl_info info;
+    // 返回地址在 arm64e 上带 PAC 签名，直接用 dladdr 解析会失败。
+    // 先还原成真实地址，解析不出来再退回原值。
+    uintptr_t real = 0, off = 0;
+    if (aia_real_ptr((uintptr_t)ra, &real, &off)) {
+        snprintf(buf, sizeof(buf), "%s+0x%lx",
+                 strrchr(module_for(real, &off), '/') ? strrchr(module_for(real, &off), '/') + 1
+                                                      : module_for(real, &off),
+                 (unsigned long)off);
+        return buf;
+    }
     if (ra && orig_dladdr && orig_dladdr(ra, &info) && info.dli_fname) {
         const char *slash = strrchr(info.dli_fname, '/');
         snprintf(buf, sizeof(buf), "%s+0x%lx", slash ? slash + 1 : info.dli_fname,
@@ -814,8 +869,320 @@ static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
 }
 
 // ============================================================
+#if AIA_FS_PROBE
+// 只记录，不改变任何返回值。
+static int (*orig_access)(const char *, int);
+static int my_access(const char *p, int m) {
+    int r = orig_access(p, m);
+    if (p) aialog("FS access %s %s", r == 0 ? "OK " : "-  ", p);
+    return r;
+}
+
+static int (*orig_lstat_x)(const char *, void *);
+static int my_lstat_x(const char *p, void *b) {
+    int r = orig_lstat_x(p, b);
+    if (p && r == 0) aialog("FS lstat OK  %s", p);
+    return r;
+}
+
+static int (*orig_stat_x)(const char *, void *);
+static int my_stat_x(const char *p, void *b) {
+    int r = orig_stat_x(p, b);
+    if (p && r == 0) aialog("FS stat OK  %s", p);
+    return r;
+}
+
+// open 的调用量很大，只记可疑路径。
+static BOOL fs_suspicious(const char *p) {
+    static const char *keys[] = {
+        "jb", "jail", "cydia", "sileo", "substrate", "Substrate", "ellekit",
+        "systemhook", "injector", "procursus", "preboot", "basebin", "TweakInject",
+        "frida", "Frida", "libhooker", "Dopamine", "unc0ver", "checkra1n",
+        "MobileSubstrate", "Cydia", "dpkg", "bash",
+    };
+    if (!p) return NO;
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        if (strstr(p, keys[k])) return YES;
+    return NO;
+}
+
+static int (*orig_open_x)(const char *, int, ...);
+static int my_open_x(const char *p, int fl, ...) {
+    mode_t mode = 0;
+    va_list ap;
+    va_start(ap, fl);
+    mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+    int r = orig_open_x(p, fl, mode);
+    if (fs_suspicious(p)) aialog("FS open %s -> %d", p, r);
+    return r;
+}
+
+static void install_fs_probe(void) {
+    MSHookFunction((void *)access, (void *)my_access, (void **)&orig_access);
+    MSHookFunction((void *)lstat, (void *)my_lstat_x, (void **)&orig_lstat_x);
+    MSHookFunction((void *)stat, (void *)my_stat_x, (void **)&orig_stat_x);
+    MSHookFunction((void *)open, (void *)my_open_x, (void **)&orig_open_x);
+    log_raw("FS probe installed\n");
+}
+#else
+__attribute__((unused)) static void install_fs_probe(void) {}
+#endif
+
 // MARK: 终止原语（观测是谁在杀进程）
 // ============================================================
+
+#if AIA_FS_ONLY
+// 只装文件系统探针，把**所有**查询路径都记下来（有上限），不装任何伪造逻辑。
+// 目的：看清 JM 在启动阶段到底检查了哪些路径。
+static int g_fs2_used;
+static int (*fs2_orig_access)(const char *, int);
+static int fs2_access(const char *p, int m) {
+    int r = fs2_orig_access(p, m);
+    if (p && g_fs2_used < 400) {
+        aialog("FS access %s %s caller=%s", r == 0 ? "OK " : "-  ", p,
+               caller_desc(__builtin_return_address(0)));
+        g_fs2_used++;
+    }
+    return r;
+}
+static int (*fs2_orig_lstat)(const char *, void *);
+static int fs2_lstat(const char *p, void *b) {
+    int r = fs2_orig_lstat(p, b);
+    if (p && r == 0 && g_fs2_used < 400) {
+        aialog("FS lstat OK  %s caller=%s", p, caller_desc(__builtin_return_address(0)));
+        g_fs2_used++;
+    }
+    return r;
+}
+static int (*fs2_orig_stat)(const char *, void *);
+static int fs2_stat(const char *p, void *b) {
+    int r = fs2_orig_stat(p, b);
+    if (p && r == 0 && g_fs2_used < 400) {
+        aialog("FS stat OK  %s caller=%s", p, caller_desc(__builtin_return_address(0)));
+        g_fs2_used++;
+    }
+    return r;
+}
+static void install_fs_only(void) {
+    MSHookFunction((void *)access, (void *)fs2_access, (void **)&fs2_orig_access);
+    MSHookFunction((void *)lstat, (void *)fs2_lstat, (void **)&fs2_orig_lstat);
+    MSHookFunction((void *)stat, (void *)fs2_stat, (void **)&fs2_orig_stat);
+    log_raw("FS-only probe installed\n");
+}
+#else
+__attribute__((unused)) static void install_fs_only(void) {}
+#endif
+
+#if AIA_EXCPORT_PROBE
+// RASP 常用手法：查询任务的异常端口，看有没有被第三方接管。
+// 这里只记录，不改变返回值。
+static kern_return_t (*ep_orig_get)(task_t, exception_mask_t, exception_mask_array_t,
+                                    mach_msg_type_number_t *, exception_handler_array_t,
+                                    exception_behavior_array_t, exception_flavor_array_t);
+static kern_return_t ep_get(task_t task, exception_mask_t mask, exception_mask_array_t masks,
+                            mach_msg_type_number_t *cnt, exception_handler_array_t handlers,
+                            exception_behavior_array_t behs, exception_flavor_array_t flavs) {
+    kern_return_t kr = ep_orig_get(task, mask, masks, cnt, handlers, behs, flavs);
+    static int n;
+    if (n < 20) {
+        char b[192];
+        snprintf(b, sizeof(b), "EPQUERY mask=%#x -> kr=%d cnt=%u caller=%s\n", mask, kr,
+                 cnt ? *cnt : 0, caller_desc(__builtin_return_address(0)));
+        log_raw(b);
+        n++;
+    }
+    return kr;
+}
+static void install_excport_probe(void) {
+    MSHookFunction((void *)task_get_exception_ports, (void *)ep_get, (void **)&ep_orig_get);
+    log_raw("EPQUERY probe installed\n");
+}
+#else
+__attribute__((unused)) static void install_excport_probe(void) {}
+#endif
+
+#if AIA_CSOPS_PROBE
+// 越狱进程的代码签名状态与正常进程不同（常见：CS_VALID 缺失、CS_DEBUGGED 存在）。
+// 很多 RASP 直接读 csops 判定。这里只记录，暴露 JM 看到的标志位。
+static int (*cs_orig_csops)(pid_t, unsigned int, void *, size_t);
+static int cs_csops(pid_t pid, unsigned int ops, void *addr, size_t size) {
+    int r = cs_orig_csops(pid, ops, addr, size);
+    static int n;
+    if (n < 30) {
+        char b[192];
+        unsigned v = 0;
+        if (addr && size >= 4) memcpy(&v, addr, 4);
+        snprintf(b, sizeof(b), "CSOPS pid=%d ops=%#x -> %d val=%#x caller=%s\n", pid, ops, r, v,
+                 caller_desc(__builtin_return_address(0)));
+        log_raw(b);
+        n++;
+    }
+    return r;
+}
+static void install_csops_probe(void) {
+    void *f = dlsym(RTLD_DEFAULT, "csops");
+    if (f) MSHookFunction(f, (void *)cs_csops, (void **)&cs_orig_csops);
+    log_raw(f ? "CSOPS probe installed\n" : "CSOPS symbol not found\n");
+}
+#else
+__attribute__((unused)) static void install_csops_probe(void) {}
+#endif
+
+#if AIA_ENV_PROBE
+// 注入基座会把 DYLD_INSERT_LIBRARIES 一类的变量留在进程环境里，
+// 这是最经典的"被注入"信号。这里只记录 JM 相关线程查了哪些键。
+static char *(*env_orig_getenv)(const char *);
+static int g_env_used;
+static char *env_getenv(const char *k) {
+    char *v = env_orig_getenv(k);
+    if (k && g_env_used < 60) {
+        const char *c = caller_desc(__builtin_return_address(0));
+        if (strstr(c, "JMCodeProtectKit") || strstr(c, "KYHAppStore")) {
+            aialog("GETENV %s -> %s caller=%s", k, v ? v : "(null)", c);
+            g_env_used++;
+        }
+    }
+    return v;
+}
+static int (*env_orig_sysctl)(int *, unsigned, void *, size_t *, void *, size_t);
+static int g_sys_used;
+static int env_sysctl(int *name, unsigned n, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int r = env_orig_sysctl(name, n, oldp, oldlenp, newp, newlen);
+    if (g_sys_used < 60 && name) {
+        const char *c = caller_desc(__builtin_return_address(0));
+        if (strstr(c, "JMCodeProtectKit") || strstr(c, "KYHAppStore")) {
+            aialog("SYSCTL [%d,%d] -> %d caller=%s", name[0], n > 1 ? name[1] : -1, r, c);
+            g_sys_used++;
+        }
+    }
+    return r;
+}
+static void install_env_probe(void) {
+    MSHookFunction((void *)getenv, (void *)env_getenv, (void **)&env_orig_getenv);
+    MSHookFunction((void *)sysctl, (void *)env_sysctl, (void **)&env_orig_sysctl);
+    log_raw("ENV probe installed\n");
+}
+#else
+__attribute__((unused)) static void install_env_probe(void) {}
+#endif
+
+#if AIA_PROC_FILTER
+// JM 在 JM+0x187d60 调 sysctl([CTL_KERN, KERN_PROC_ALL]) 枚举全进程。
+// 越狱设备上这里有 Sileo、jailbreakd、sshd 这类明确的越狱进程，
+// 是被判定为越狱最直接的证据。
+//
+// 这里在系统调用返回后把这些进程项整体清零。不改数组长度，只把命中的
+// kinfo_proc 抹成 0，调用方遍历到的就是一个 comm 为空的项。
+// 项大小不写死：先用 KERN_PROC_PID 查一次单个进程，返回值长度就是项大小。
+static int proc_entry_size(void) {
+    static int cached;
+    if (cached > 0) return cached;
+    int mib[4] = { CTL_KERN, KERN_PROC, 4 /* KERN_PROC_PID */, (int)getpid() };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0 && len > 0) cached = (int)len;
+    return cached;
+}
+
+static BOOL proc_name_suspicious(const char *nm) {
+    static const char *keys[] = {
+        "Sileo", "Cydia", "Zebra", "jailbreakd", "sshd", "dropbear", "frida",
+        "cycript", "bash", "apt", "dpkg", "injector", "ellekit", "systemhook",
+        "libhooker", "SileoDemo", "NewTerm", "Filza", "Crane", "Choicy",
+    };
+    if (!nm || !*nm) return NO;
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        if (strstr(nm, keys[k])) return YES;
+    return NO;
+}
+
+// 在单个条目里找任意位置的 C 字符串命中，命中即整条清零。
+static int proc_filter_entries(void *buf, size_t len) {
+    int esz = proc_entry_size();
+    if (esz <= 0 || !buf || len < (size_t)esz) return 0;
+    int hit = 0;
+    size_t n = len / (size_t)esz;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char *e = (unsigned char *)buf + i * (size_t)esz;
+        BOOL bad = NO;
+        for (int off = 0; off + 4 < esz && !bad; off++) {
+            if (proc_name_suspicious((const char *)e + off)) bad = YES;
+        }
+        if (bad) { memset(e, 0, (size_t)esz); hit++; }
+    }
+    return hit;
+}
+
+static int (*pf_orig_sysctl)(int *, unsigned, void *, size_t *, void *, size_t);
+static int pf_sysctl(int *name, unsigned n, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int r = pf_orig_sysctl(name, n, oldp, oldlenp, newp, newlen);
+    if (r == 0 && name && n >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROC &&
+        name[2] == 0 /* KERN_PROC_ALL */ && oldp && oldlenp && *oldlenp > 0) {
+        int hit = proc_filter_entries(oldp, *oldlenp);
+        static int diag;
+        if (diag < 2) {
+            char b[256];
+            int esz = proc_entry_size();
+            const char *raw = (const char *)oldp;
+            int hasS = 0, hasJ = 0, hasSh = 0;
+            for (size_t k = 0; k + 8 < *oldlenp; k++) {
+                if (!hasS && memcmp(raw + k, "Sileo", 5) == 0) hasS = 1;
+                if (!hasJ && memcmp(raw + k, "jailbreakd", 10) == 0) hasJ = 1;
+                if (!hasSh && memcmp(raw + k, "sshd", 4) == 0) hasSh = 1;
+            }
+            snprintf(b, sizeof(b),
+                     "PROCDIAG len=%zu esz=%d n=%zu hit=%d Sileo=%d jailbreakd=%d sshd=%d\n",
+                     *oldlenp, esz, esz > 0 ? *oldlenp / (size_t)esz : 0, hit, hasS, hasJ, hasSh);
+            log_raw(b);
+            diag++;
+        }
+        static int logged;
+        if (hit > 0 && logged < 6) {
+            aialog("PROCFILTER 清掉 %d 个进程项 caller=%s", hit,
+                   caller_desc(__builtin_return_address(0)));
+            logged++;
+        }
+    }
+    return r;
+}
+static void install_proc_filter(void) {
+    MSHookFunction((void *)sysctl, (void *)pf_sysctl, (void **)&pf_orig_sysctl);
+    log_raw("PROCFILTER installed\n");
+    // 自检：直接问内核要一次全进程列表，确认这些进程真的能被看到。
+    // 若不出现，说明隐藏它们并不是有效的杠杆，不必再往这个方向投入。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0, 0), ^{
+        int mib[3] = { CTL_KERN, KERN_PROC, 0 };
+        size_t len = 0;
+        int qr = pf_orig_sysctl(mib, 3, NULL, &len, NULL, 0);
+        if (qr != 0 || len == 0) {
+            char e[128];
+            snprintf(e, sizeof(e), "PROCSELF 查询失败 r=%d errno=%d len=%zu\n",
+                     qr, errno, len);
+            log_raw(e);
+            return;
+        }
+        void *buf = malloc(len);
+        if (!buf) return;
+        if (pf_orig_sysctl(mib, 3, buf, &len, NULL, 0) != 0) { free(buf); return; }
+        int esz = proc_entry_size();
+        int nS = 0, nJ = 0, nSh = 0;
+        for (size_t k = 0; k + 12 < len; k++) {
+            const char *c = (const char *)buf + k;
+            if (memcmp(c, "Sileo", 5) == 0) nS++;
+            if (memcmp(c, "jailbreakd", 10) == 0) nJ++;
+            if (memcmp(c, "sshd", 4) == 0) nSh++;
+        }
+        char b[192];
+        snprintf(b, sizeof(b), "PROCSELF len=%zu esz=%d Sileo=%d jailbreakd=%d sshd=%d\n",
+                 len, esz, nS, nJ, nSh);
+        log_raw(b);
+        free(buf);
+    });
+}
+#else
+__attribute__((unused)) static void install_proc_filter(void) {}
+#endif
 
 static void log_backtrace(const char *tag) {
     void *frames[32];
@@ -1186,6 +1553,7 @@ static uint64_t thread_id_of(mach_port_t th) {
     return tii.thread_id;
 }
 
+static void dump_peer_threads(const char *tag, thread_t self_port);
 static void dump_fault_state(exc_req_t *req) {
     char buf[256];
     const uint8_t *b = (const uint8_t *)req;
@@ -1339,6 +1707,15 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
         }
         g_exc_count++;
         dump_fault_state(req);
+#if AIA_DUMP_PEERS
+        {
+            static int peer_dumped;
+            if (peer_dumped < 6) {
+                dump_peer_threads("exc", *(const uint32_t *)((const uint8_t *)req + EXC_THREAD_OFF));
+                peer_dumped++;
+            }
+        }
+#endif
 #if AIA_KILL_THREAD
         {
             mach_port_t tp = *(const uint32_t *)((const uint8_t *)req + EXC_THREAD_OFF);
@@ -1774,6 +2151,76 @@ __attribute__((unused)) static void dump_jm_swizzles(void) {
     }
     snprintf(buf, sizeof(buf), "  SWZ total=%d\n", hits);
     log_raw(buf);
+}
+
+// 异常发生时把其它线程的 PC/LR 也打出来。
+// 故障线程自己在做什么已经知道；要定位 JM 的判定点，必须看"同一时刻其它 JM 线程
+// 停在哪"。只处理落在 JMCodeProtectKit 里的线程，避免日志被无关线程淹没。
+static void dump_peer_threads(const char *tag, thread_t self_port) {
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return;
+    char buf[256];
+    int shown = 0;
+    snprintf(buf, sizeof(buf), "  PEERS (%s) total=%u\n", tag, cnt);
+    log_raw(buf);
+    for (mach_msg_type_number_t i = 0; i < cnt && shown < 24; i++) {
+        if (list[i] == self_port) continue;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) != KERN_SUCCESS)
+            continue;
+        uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+        uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);
+        uintptr_t po = 0, lo = 0, preal = 0, lreal = 0;
+        const char *pm = aia_real_ptr(pc, &preal, &po);
+        const char *lm = aia_real_ptr(lr, &lreal, &lo);
+        BOOL pcInJm = pm && strstr(pm, "JMCodeProtectKit");
+        BOOL lrInJm = lm && strstr(lm, "JMCodeProtectKit");
+        BOOL pcInApp = pm && strstr(pm, "KYHAppStore");
+        BOOL lrInApp = lm && strstr(lm, "KYHAppStore");
+        if (!pcInJm && !lrInJm && !pcInApp && !lrInApp) continue;
+        snprintf(buf, sizeof(buf), "  PEER t%u pc=%s+0x%lx lr=%s+0x%lx\n", i,
+                 pm ? pm : "?", (unsigned long)po, lm ? lm : "?", (unsigned long)lo);
+        log_raw(buf);
+        shown++;
+        // 栈窗口：JM 的检查派发循环把"检查项表"指针放在 [sp+0x30] 与
+        // [sp+0x50]，项数在 [table+0x40]，步长来自 w28。把这段原样打出来，
+        // 就能在离线分析里把整张检查项表还原。
+        {
+            uintptr_t spv = (uintptr_t)__darwin_arm_thread_state64_get_sp(st);
+            char line[192];
+            size_t n = 0;
+            n += (size_t)snprintf(line, sizeof(line), "    sp=%#lx:", (unsigned long)spv);
+            for (int k = 0; k < 14 && n < sizeof(line) - 20; k++) {
+                uintptr_t w = 0;
+                if (!safe_read(spv + (uintptr_t)k * 8, &w)) break;
+                n += (size_t)snprintf(line + n, sizeof(line) - n, " %lx", (unsigned long)w);
+            }
+            snprintf(line + n, sizeof(line) - n, "\n");
+            log_raw(line);
+        }
+        // JM 线程的帧链能说明它停在哪一层、调用者是谁。
+        if (pcInJm || lrInJm || pcInApp || lrInApp) {
+            uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(st));
+            for (int d = 0; d < 12 && fp; d++) {
+                uintptr_t prev = 0, ra = 0;
+                if (!safe_read(fp, &prev) || !safe_read(fp + 8, &ra)) break;
+                uintptr_t ro = 0, rreal = 0;
+                const char *rm = aia_real_ptr(ra, &rreal, &ro);
+                if (rm && (strstr(rm, "JMCodeProtectKit") || strstr(rm, "KYHAppStore") ||
+                           strstr(rm, "UIKit") || strstr(rm, "libobjc"))) {
+                    snprintf(buf, sizeof(buf), "    pt%u#%02d %s+0x%lx\n", i, d, rm,
+                             (unsigned long)ro);
+                    log_raw(buf);
+                }
+                prev = aia_strip_pac(prev);
+                if (!prev || prev <= fp) break;
+                fp = prev;
+            }
+        }
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
 }
 
 #if AIA_DUMP_ON_SIGNAL
@@ -2935,13 +3382,35 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #else
     aialog("empty mode: no hooks (无事件观测)");
 #endif
+#if AIA_FS_ONLY
+    install_fs_only();
+#endif
+#if AIA_ENV_PROBE
+    install_env_probe();
+#endif
+#if AIA_PROC_FILTER
+    install_proc_filter();
+#endif
+#if AIA_EXCPORT_PROBE
+    install_excport_probe();
+#endif
+#if AIA_CSOPS_PROBE
+    install_csops_probe();
+#endif
+#if AIA_FS_PROBE
+    install_fs_probe();
+#endif
 #if AIA_BLOCK_DYNATRACE
     install_dynatrace_block();
 #endif
+#if !AIA_NO_LIBC_HOOKS
     // 只记录，不改变行为：确认进程是被 exit() 正常结束还是被信号打死。
     MSHookFunction((void *)exit, (void *)my_exit, (void **)&orig_exit);
     MSHookFunction((void *)_exit, (void *)my_Exit, (void **)&orig_Exit);
     MSHookFunction((void *)abort, (void *)my_abort, (void **)&orig_abort);
+#else
+    log_raw("NO-LIBC-HOOKS: 只保留异常端口\n");
+#endif
 #if AIA_KILL_DT_SWIZZLE
     kill_dt_swizzle();
 #endif

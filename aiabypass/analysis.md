@@ -361,6 +361,49 @@ ls -t /var/mobile/Library/Logs/CrashReporter/ | head
 
 探针一律低频采样（1 秒一次、有限次数），不要用毫秒级轮询。
 
+### 33. 零 hook 对照：处决不是我们的 hook 引起的
+
+`AIA_NO_LIBC_HOOKS=1` 时只保留异常端口，连 `task_info`/`exit`/`abort` 都不 hook。实测仍然有 2 次处决（`exc=2`），与完整配置一致。**所以触发条件来自真实的运行环境，不是我们改写过代码页。**
+
+### 34. JM 不用路径做检测
+
+`AIA_FS_ONLY=1` 记录全部 `access`/`stat`/`lstat` 查询（带调用者）：
+
+- 查询 `/var/jb/...` 的只有 `libinjector.dylib`（ElleKit 注入器在枚举自己的 TweakInject 目录），**没有一条来自 JM**。
+- JM 只对自身 Framework 目录做过 `stat`，属于正常的 `dlopen` 加载流程。
+
+结论：路径存在性不是 JM 的判定依据，针对 `/var/jb` 做隐藏没有意义。
+
+### 35. 进程枚举这条路被沙盒堵死
+
+`AIA_ENV_PROBE=1` 抓到 JM 在 `JM+0x187d60` 调 `sysctl([CTL_KERN, KERN_PROC_ALL])`，看起来像"枚举进程找 Sileo/sshd"。设备上确实有 `Sileo`、`jailbreakd`、`sshd`。
+
+但自检直接问内核的结果是拒绝：
+
+```
+PROCSELF 查询失败 r=-1 errno=1 (EPERM) len=0
+```
+
+沙盒内进程无权枚举全进程列表。JM 那次 `r=0` 只是长度查询（`oldp == NULL`）成功、真实读取被拒的前半段。**所以 JM 看不到其它进程，`AIA_PROC_FILTER` 也没有用**——实测 `exc` 从 2 变 1 是时序噪声，重复测量回归 2。
+
+### 36. 其它被排除的信号
+
+| 探针 | 结果 |
+|---|---|
+| `task_get_exception_ports` | 有一次 `mask=0x6e`（BAD_ACCESS/BAD_INSTRUCTION/SOFTWARE/BREAKPOINT）查询，但调用者落在主二进制 `+0x3011b3c`，不是 JM |
+| `csops(CS_OPS_STATUS)` | 返回值 `0x22007301`，`CS_VALID` 在位，属正常状态 |
+| `getenv` | JM 相关线程没有查询任何环境变量 |
+| dyld 镜像伪装（`AIA_STEALTH`） | `exc` 未下降（3 次），无效 |
+
+### 37. 主线程不再跳飞之后，剩下的处决点
+
+修好解析器槽之后，主线程的 ijm 交叉跳飞消失。剩下的 2 次处决都在启动期、非主线程：
+
+- `pc=lr=0x8`，`x0=4`，`x1=+[NSThread isMainThread]`
+- `pc=lr=0xeee1`，同样形状
+
+两个线程都是被破坏 `isa` 后收到消息；`fp` 与返回地址一并被破坏，帧链无法回溯，定位不到决定处决的调用者。冻结它们之后 `exc` 不再增长，App 正常工作数分钟以上。
+
 ## 当前状态
 
 **能启动、能进首页、能连续交互，且不再出现主线程卡死。**
