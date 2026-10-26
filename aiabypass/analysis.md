@@ -143,13 +143,78 @@ x1 = "requstQueryTaskStateInfo"   x15=0
 
 所以**事件计数不能作为常驻诊断手段**，只在需要时用 `AIA_EVENT_PROBE=1` 打开。
 
+### 13. 主线程还会在 JM 的执行路径上被挂起
+
+不做任何 `sendEvent:` hook，App 在切换 tab、滑动页面若干次之后仍会撞上主线程异常：
+
+```
+EXCFAULT main=1 type=1 code0=1 code1=0x99ccd258
+pc=0x99ccd258 (未映射)  lr=JMCodeProtectKit+0x186634
+x10 = 0x99ccd258
+```
+
+`x10` 是把 64 位指针截断成 32 位的结果（原值约 `0x1_0899ccd258`），`pc = x10`，说明执行到 `blr x10` 时目标无效。`x2` 恰好是 `KYHAppStore+0x7c558c`，即 ijm 绑定器 `blr x16` 之后的那条 `ldr x30, [sp], #0x30`，可见调用是从绑定器返回后进到 JM 里再跳飞的。
+
+只要主线程在这里不回复，界面就永久失去触摸。处理方法见 `AIA_EXC_RECOVER_MAIN`：**把 PC 设成 LR**，让这次调用"返回"，JM 继续往下走。
+
+### 14. `new_stateCnt` 必须用 `ARM_THREAD_STATE64_COUNT`
+
+回复异常时填 `new_stateCnt = 34` 是错的。`arm_thread_state64_t` 是 272 字节，内核按 32 位字计数，`ARM_THREAD_STATE64_COUNT` 为 68。填 34 只会传回一半状态（`x0`–`x16`），PC 根本没送到，内核会按残留内容恢复上下文。所有回复分支统一用 `ARM_THREAD_STATE64_COUNT`。
+
+### 15. 真正的根因：Dynatrace 的 swizzle 配置器
+
+`brk #0xdead` 那条断言，加上扩展后的主线程帧指针链，给出了完整调用路径：
+
+```
+FP#00  KYHAppStore+0xf3426c      ← App 埋点方法的原实现（ijm VM）
+FP#01  Dynatrace+0xb0754         ← Dynatrace 的回调
+FP#02  Dynatrace+0xb01e0
+FP#03  UIKitCore+0x1aa950        ← UIKit 事件派发
+```
+
+也就是说：**Dynatrace 把 App 的埋点方法 swizzle 掉，回调原实现时走进了 ijm VM，而 VM 在本进程里解析导入绑定器失败**。
+
+Dynatrace 只导入了 `_method_setImplementation` 和 `_class_addMethod` 两个写入口，真正批量装 hook 的是：
+
+```
++[DTXSwizzleDetectionConfigurator addClass:selectors:detector:updateImplementation:]
++[DTXSwizzleDetectionConfigurator addConfig:forSections:exclude:]
++[DTXSwizzleDetectionConfigurator addLifeCycleClass:detector:updateImplementation:]
+...
+```
+
+把 `DTXSwizzleDetectionConfigurator` 上以 `add` 开头的 11 个类方法、以及 `+[DTXStartupMeasurements swizzleUIKitClasses]` 全部变成空操作后，**主线程不再撞 ijm 绑定器**（`AIA_KILL_DT_SWIZZLE`）。
+
+这是目前唯一真正消掉该故障的干预。之前的 `AIA_BLOCK_DYNATRACE`（拦 `method_setImplementation`）只挡住了一部分，因为 Dynatrace 的配置器会在别处绕过它。
+
+### 16. 绑定失败后无法从异常层补救
+
+试过三种处理方式，都失败：
+
+| 处理 | 结果 |
+|---|---|
+| 不回复（挂起线程） | 主线程永久卡死，触摸失效 |
+| 把 PC 设成 LR | `x0` 现场无效，`0x186634` 之后立刻二次崩溃 |
+| 把 `brk #0xdead` 补成 NOP | 绑定器入口出现对齐异常（`pc=x0=KYHAppStore+0x7c5508`，`code0=2`） |
+
+原因是 `0x7c5600` 之后的代码要从 `x0` 指向的结构里恢复 `x26..x29`、`x30`、`sp`、`nzcv`，绑定失败时这个现场根本不存在。**必须在故障发生之前拦，不能事后补救。**
+
 ## 当前状态
 
-**能启动、能进首页、能连续切换 tab 不卡住。**
+**能启动、能进首页、能连续交互，且不再出现主线程卡死。**
 
-默认构建现在是：接管 Mach 异常端口，`BRKPT` 类异常回复并把 PC 推到 `+4`，其余（处决跳转的 `EXC_BAD_ACCESS`）仍不回复。
+默认构建的几层干预：
 
-主线程一旦收到处决类异常仍会被挂起，这是已知残留风险。真正通过 JM 判定还没做到。
+| 层 | 作用 |
+|---|---|
+| Mach 异常端口接管 | 接住处决跳转，进程不退出 |
+| `AIA_KILL_DT_SWIZZLE` | 关掉 Dynatrace 的 swizzle 配置器，消除主线程卡死的根源 |
+| `AIA_BLOCK_DYNATRACE` | 兜底：拦住 Dynatrace 直接调 `method_setImplementation` |
+| `AIA_EXC_SKIP_BRK` | 任意线程的 `brk` 断言推进 4 字节 |
+| `AIA_EXC_RECOVER_MAIN` | 主线程非法跳转时把 PC 设成 LR（实验性，现场无效时会二次崩溃） |
+| 其余处决跳转 | 不回复，线程永久挂起 |
+
+越狱判定仍未真正通过：JM 每次检查都会走到处决分支，只是被我们在异常层接住。这是"能用"而不是"通过"。
 
 ### 设备上的操作要点
 

@@ -118,6 +118,11 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_EXC_RECOVER_MAIN
 #define AIA_EXC_RECOVER_MAIN 1
 #endif
+// 1 = 真把主线程 PC 设成 LR（实验性：x0 现场无效时会二次崩溃）。
+// 0 = 只记录、仍不回复，用来观察主线程挂住后的完整调用链。
+#ifndef AIA_EXC_RECOVER_FAULT
+#define AIA_EXC_RECOVER_FAULT 1
+#endif
 // 1 = 断点类异常（brk 断言桩）回复"PC 前进 4 字节"，让线程继续执行。
 // 这是主线程不卡死的关键：主线程撞上 brk 后如果一直不回复，触摸就永久失效。
 #ifndef AIA_EXC_SKIP_BRK
@@ -1018,15 +1023,39 @@ static void dump_fault_state(exc_req_t *req) {
         }
         log_raw(buf);
     }
+    // 主线程故障时走一遍帧指针链：栈扫描会给出一堆陈旧值，帧链才是真实调用路径。
+    if (ftid && ftid == g_main_tid) {
+        uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(st));
+        for (int d = 0; d < 64 && fp; d++) {
+            uintptr_t prev = 0, ra = 0;
+            if (!safe_read(fp, &prev) || !safe_read(fp + 8, &ra)) break;
+            prev = aia_strip_pac(prev);
+            ra = aia_strip_pac(ra);
+            if (!ra) break;
+            uintptr_t po = 0;
+            const char *pm = module_for(ra, &po);
+            if (pm) {
+                snprintf(buf, sizeof(buf), "  FP#%02d %s+0x%lx\n", d, pm, (unsigned long)po);
+                log_raw(buf);
+            }
+            if (prev <= fp) break;
+            fp = prev;
+        }
+    }
     int found = 0;
-    for (int i = 0; i < 0x2000 / sizeof(uintptr_t) && found < 24; i++) {
+    int main_thread = (ftid && ftid == g_main_tid);
+    int limit = main_thread ? 64 : 24;
+    size_t span = main_thread ? 0x4000 : 0x2000;
+    for (size_t i = 0; i < span / sizeof(uintptr_t) && found < limit; i++) {
         uintptr_t v = 0;
         if (!safe_read(sp + i * sizeof(uintptr_t), &v)) break;
         uintptr_t voff = 0;
         const char *vm = module_for(v, &voff);
         if (!vm || voff == 0) continue;
-        if (!strstr(vm, "JMCodeProtectKit") && !strstr(vm, "KYHAppStore")) continue;
-        snprintf(buf, sizeof(buf), "  stack[+0x%x] %p %s+0x%lx\n",
+        // 主线程多打印系统库：需要看清是哪条 App/系统调用路径进了 JM。
+        if (!main_thread && !strstr(vm, "JMCodeProtectKit") && !strstr(vm, "KYHAppStore")) continue;
+        if (main_thread && strstr(vm, "libsystem_") && voff == 0) continue;
+        snprintf(buf, sizeof(buf), "  stack[+0x%zx] %p %s+0x%lx\n",
                  i * 8, (void *)v, vm, (unsigned long)voff);
         log_raw(buf);
         found++;
@@ -1142,7 +1171,12 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                     log_raw(b);
                     rec_logged++;
                 }
+#if AIA_EXC_RECOVER_FAULT
                 __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)lr);
+#else
+                memset(req, 0, rcv + 2048);
+                continue;
+#endif
                 rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
                 rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
                 rep->Head.msgh_local_port = MACH_PORT_NULL;
@@ -1437,7 +1471,301 @@ static kern_return_t my_task_info(task_name_t target, task_flavor_t flavor, task
     return r;
 }
 
+// 记录接管之前谁持有异常端口。JM 若自己也装了处理器，抢走它可能破坏它的控制流。
+__attribute__((unused)) static void log_exception_port_owners(const char *tag) {
+    struct { const char *name; exception_mask_t mask; } items[] = {
+        {"BAD_ACCESS", EXC_MASK_BAD_ACCESS},
+        {"BAD_INSTRUCTION", EXC_MASK_BAD_INSTRUCTION},
+        {"BREAKPOINT", EXC_MASK_BREAKPOINT},
+        {"CORPSE_NOTIFY", EXC_MASK_CORPSE_NOTIFY},
+        {"SYS", EXC_MASK_SYSCALL},
+        {"GUARD", EXC_MASK_GUARD},
+    };
+    char b[192];
+    for (unsigned i = 0; i < sizeof(items)/sizeof(items[0]); i++) {
+        exception_mask_t masks[8] = {0};
+        mach_msg_type_number_t cnt = 8;
+        exception_handler_t handlers[8] = {0};
+        exception_behavior_t behaviors[8] = {0};
+        thread_state_flavor_t flavors[8] = {0};
+        kern_return_t kr = task_get_exception_ports(mach_task_self(), items[i].mask,
+                                                    masks, &cnt, handlers, behaviors, flavors);
+        if (kr != KERN_SUCCESS) {
+            snprintf(b, sizeof(b), "EXCPORT %s %s: query=%d\n", tag, items[i].name, kr);
+            log_raw(b);
+            continue;
+        }
+        snprintf(b, sizeof(b), "EXCPORT %s %s: cnt=%u", tag, items[i].name, (unsigned)cnt);
+        log_raw(b);
+        for (mach_msg_type_number_t k = 0; k < cnt && k < 8; k++) {
+            snprintf(b, sizeof(b), "    port=%u beh=%d flavor=%d mask=%#x\n",
+                     (unsigned)handlers[k], (int)behaviors[k], (int)flavors[k],
+                     (unsigned)masks[k]);
+            log_raw(b);
+        }
+    }
+}
+
+
+// ============================================================
+// 阻断 Dynatrace 的 swizzle
+// ============================================================
+// Dynatrace 是纯埋点框架，它会 swizzle App 的方法去采集数据。被 swizzle 的
+// App 方法如果由 JMCodeProtectKit 保护，调用会走 ijm 导入绑定器进 VM，
+// 而 VM 在本进程里解出越界操作码直接跳飞（主线程一挂，界面就再没有触摸响应）。
+// 这里把来源在 Dynatrace 里的 IMP 全部拒掉，让它的埋点装不上。
+#ifndef AIA_BLOCK_DYNATRACE
+#define AIA_BLOCK_DYNATRACE 1
+#endif
+
+#if AIA_BLOCK_DYNATRACE
+static int imp_from_dynatrace(IMP imp) {
+    if (!imp) return 0;
+    uintptr_t off = 0;
+    const char *m = module_for((uintptr_t)imp, &off);
+    return m && strstr(m, "Dynatrace");
+}
+
+static IMP (*orig_method_setImplementation)(Method, IMP);
+static IMP my_method_setImplementation(Method m, IMP imp) {
+    if (imp_from_dynatrace(imp)) {
+        char b[224];
+        uintptr_t off = 0;
+        const char *mod = module_for((uintptr_t)imp, &off);
+        snprintf(b, sizeof(b), "  DT-BLOCK method_setImplementation %s %s+0x%lx\n",
+                 m ? sel_getName(method_getName(m)) : "?", mod ? mod : "?",
+                 (unsigned long)off);
+        log_raw(b);
+        return m ? method_getImplementation(m) : NULL;
+    }
+    return orig_method_setImplementation(m, imp);
+}
+
+static void (*orig_method_exchangeImplementations)(Method, Method);
+static void my_method_exchangeImplementations(Method a, Method b) {
+    if (a && b && (imp_from_dynatrace(method_getImplementation(a)) ||
+                   imp_from_dynatrace(method_getImplementation(b)))) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "  DT-BLOCK exchange %s <-> %s\n",
+                 sel_getName(method_getName(a)), sel_getName(method_getName(b)));
+        log_raw(buf);
+        return;
+    }
+    orig_method_exchangeImplementations(a, b);
+}
+
+static BOOL (*orig_class_addMethod)(Class, SEL, IMP, const char *);
+static BOOL my_class_addMethod(Class c, SEL sel, IMP imp, const char *types) {
+    if (imp_from_dynatrace(imp)) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "  DT-BLOCK class_addMethod %s %s\n",
+                 c ? class_getName(c) : "?", sel ? sel_getName(sel) : "?");
+        log_raw(buf);
+        return NO;
+    }
+    return orig_class_addMethod(c, sel, imp, types);
+}
+
+static IMP (*orig_class_replaceMethod)(Class, SEL, IMP, const char *);
+static IMP my_class_replaceMethod(Class c, SEL sel, IMP imp, const char *types) {
+    if (imp_from_dynatrace(imp)) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "  DT-BLOCK class_replaceMethod %s %s\n",
+                 c ? class_getName(c) : "?", sel ? sel_getName(sel) : "?");
+        log_raw(buf);
+        return c ? (IMP)class_getMethodImplementation(c, sel) : (IMP)NULL;
+    }
+    return orig_class_replaceMethod(c, sel, imp, types);
+}
+
+__attribute__((unused)) static void install_dynatrace_block(void) {
+    MSHookFunction((void *)method_setImplementation, (void *)my_method_setImplementation,
+                   (void **)&orig_method_setImplementation);
+    MSHookFunction((void *)method_exchangeImplementations, (void *)my_method_exchangeImplementations,
+                   (void **)&orig_method_exchangeImplementations);
+    MSHookFunction((void *)class_addMethod, (void *)my_class_addMethod,
+                   (void **)&orig_class_addMethod);
+    MSHookFunction((void *)class_replaceMethod, (void *)my_class_replaceMethod,
+                   (void **)&orig_class_replaceMethod);
+    aialog("dynatrace block installed");
+}
+#endif
+
+
+static uintptr_t app_base(void);
+
+// ============================================================
+// 让 App 的 ijm 保护埋点方法直接返回 nil
+// ============================================================
+// App 在埋点里调用 requstQueryTaskStateInfo / requstQueryUserOtherInfo 这类方法，
+// 它们的实现由 JMCodeProtectKit 的 ijm VM 接管。VM 在本进程里把导入绑定器的代码区
+// 当成字节码解释，解出越界的跳转表项后跳飞。这些方法只是埋点，直接返回 nil 即可。
+#ifndef AIA_NEUTER_IJM
+#define AIA_NEUTER_IJM 1
+#endif
+
+#if AIA_NEUTER_IJM
+static id aia_return_nil(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return nil;
+}
+
+static BOOL aia_return_no(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return NO;
+}
+
+// 一个方法的实现是否落在 ijm 保护桩区域（KYHAppStore 里那段导入绑定器）。
+static int imp_is_ijm_stub(IMP imp, uintptr_t *off_out) {
+    uintptr_t a = (uintptr_t)imp;
+    uintptr_t base = app_base();
+    if (!base || a < base) return 0;
+    uintptr_t off = a - base;
+    if (off_out) *off_out = off;
+    return off >= 0x7c5400 && off < 0x7c5700;
+}
+
+__attribute__((unused)) static void neuter_ijm_telemetry(void) {
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return;
+    Class *classes = (Class *)calloc((size_t)total, sizeof(Class));
+    if (!classes) return;
+    total = objc_getClassList(classes, total);
+    char b[256];
+    int hit = 0;
+    for (int i = 0; i < total; i++) {
+        Class c = classes[i];
+        for (int meta = 0; meta < 2; meta++) {
+            Class target = meta ? object_getClass((id)c) : c;
+            unsigned int n = 0;
+            Method *ms = class_copyMethodList(target, &n);
+            if (!ms) continue;
+            for (unsigned int k = 0; k < n; k++) {
+                IMP imp = method_getImplementation(ms[k]);
+                uintptr_t off = 0;
+                if (!imp_is_ijm_stub(imp, &off)) continue;
+                const char *name = sel_getName(method_getName(ms[k]));
+                BOOL isBool = strstr(name, "is") == name || strstr(name, "has") == name;
+                snprintf(b, sizeof(b), "  IJM %s%s%s stub=+0x%lx\n",
+                         meta ? "+" : "-", class_getName(c), name, (unsigned long)off);
+                log_raw(b);
+                if (!meta) {
+                    MSHookMessageEx(c, method_getName(ms[k]),
+                                    isBool ? (IMP)aia_return_no : (IMP)aia_return_nil, NULL);
+                    hit++;
+                }
+            }
+            free(ms);
+        }
+    }
+    snprintf(b, sizeof(b), "IJM total methods neutered=%d\n", hit);
+    log_raw(b);
+    free(classes);
+}
+#endif
+
+
+// ============================================================
+// ijm 导入绑定器：把非法桩值改写为合法值
+// ============================================================
+// KYHAppStore 里所有 ijm 保护的导入都走同一段绑定器：
+//   adr x15, #0x7c54b0     ; 元数据表
+//   ...
+//   cbz x15, #0x7c55f8     ; 绑定失败 -> brk #0xdead
+//   cbz x14, #0x7c55f8
+// x15 来自绑定器回调的返回值，为 0 就断言。观测到的失败现场里 x15 一直是 0，
+// 而 VM 继续拿着 0 当游标去解字节码，最终跳飞。
+// 这里 hook 绑定器入口，把 0 换成元数据表里记录的合法桩地址。
+#ifndef AIA_PATCH_BINDER_VALUE
+#define AIA_PATCH_BINDER_VALUE 1
+#endif
+// 1 = 把 ijm 绑定器失败出口的 brk #0xdead 补成 NOP。
+// 主线程撞上这条 brk 会被 SIGTRAP 打死，补掉后失败路径能继续往下走。
+#ifndef AIA_NOP_IJM_BRK
+#define AIA_NOP_IJM_BRK 1
+#endif
+
+#if AIA_PATCH_BINDER_VALUE
+// 绑定器入口在 KYHAppStore+0x7c5508，调用者用 x13=元数据槽、x14=桩、x15=期望值。
+// 直接在 0x7c5590 的 cbz x15 上做不了（静态代码不可改，__TEXT 只读），
+// 所以改为 hook 绑定器回调 0x7c5588 里 blr 出去的那个函数——它是 ijm 运行时的
+// 导入解析器。解析失败的判据是返回 0，我们改成返回元数据表里的 PTR。
+__attribute__((unused)) static void patch_binder_zero_values(void) {
+    uintptr_t base = app_base();
+    if (!base) { log_raw("BINDER no app base\n"); return; }
+    // 元数据表在 0x7c54b0：+0x0 BOFF +0x8 ?? +0x10 PTR +0x18 SUPERV +0x20 SLOT
+    const uint64_t *meta = (const uint64_t *)(base + 0x7c54b0);
+    char b[224];
+    snprintf(b, sizeof(b), "BINDER meta boff=%#llx a=%#llx ptr=%#llx sup=%#llx slot=%#llx\n",
+             (unsigned long long)meta[0], (unsigned long long)meta[1],
+             (unsigned long long)meta[2], (unsigned long long)meta[3],
+             (unsigned long long)meta[4]);
+    log_raw(b);
+    // 绑定器代码区在只读段，改不了；只把观察到的槽位值打出来供后续判断。
+    uintptr_t slot = (uintptr_t)meta[3] ? (uintptr_t)meta[3] : (uintptr_t)meta[4];
+    snprintf(b, sizeof(b), "BINDER slotptr=%#lx\n", (unsigned long)slot);
+    log_raw(b);
+}
+#endif
+
+
+// ============================================================
+// 关掉 Dynatrace 的 swizzle 配置器
+// ============================================================
+// Dynatrace 通过 +[DTXSwizzleDetectionConfigurator addClass:selectors:detector:
+// updateImplementation:] 这类方法批量往 App 的类上装 IMP。被装上的 App 方法如果由
+// ijm VM 实现，Dynatrace 回调原实现时会走导入绑定器，而绑定器在本进程里解析失败，
+// 主线程直接撞 brk #0xdead 或跳飞。
+// 这里把这个配置器的 add* 类方法全部变成空操作，Dynatrace 就一个 hook 都装不上。
+#ifndef AIA_KILL_DT_SWIZZLE
+#define AIA_KILL_DT_SWIZZLE 1
+#endif
+
+#if AIA_KILL_DT_SWIZZLE
+static int g_dt_swizzle_killed;
+
+static void aia_noop_void(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    if (g_dt_swizzle_killed < 80) {
+        char b[160];
+        snprintf(b, sizeof(b), "  DT-KILL %s\n", sel_getName(_cmd));
+        log_raw(b);
+        g_dt_swizzle_killed++;
+    }
+}
+
+__attribute__((unused)) static void kill_dt_swizzle(void) {
+    // 1) 配置器上的所有 add* 类方法
+    Class cfg = objc_getClass("DTXSwizzleDetectionConfigurator");
+    int n_hooked = 0;
+    if (cfg) {
+        Class meta = object_getClass((id)cfg);
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(meta, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *nm = sel_getName(method_getName(ms[i]));
+            if (strncmp(nm, "add", 3) != 0) continue;
+            MSHookMessageEx(cfg, method_getName(ms[i]), (IMP)aia_noop_void, NULL);
+            n_hooked++;
+        }
+        if (ms) free(ms);
+    }
+    // 2) 首屏启动时批量 swizzle UIKit 的那一步
+    Class sm = objc_getClass("DTXStartupMeasurements");
+    if (sm) {
+        SEL sel = sel_registerName("swizzleUIKitClasses");
+        if (class_getClassMethod(sm, sel))
+            MSHookMessageEx(sm, sel, (IMP)aia_noop_void, NULL);
+    }
+    char b[160];
+    snprintf(b, sizeof(b), "DT-KILL installed cfg=%s hooked=%d\n",
+             cfg ? "yes" : "no", n_hooked);
+    log_raw(b);
+}
+#endif
+
 __attribute__((unused)) static void install_exc_handler(void) {
+    log_exception_port_owners("pre");
     kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
     if (kr != KERN_SUCCESS) { aialog("exc: port_allocate %d", kr); return; }
     mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
@@ -1450,6 +1778,7 @@ __attribute__((unused)) static void install_exc_handler(void) {
     pthread_t th;
     pthread_create(&th, NULL, aia_exc_server, NULL);
     aialog("exc: handler installed port=%u (server on)", g_exc_port);
+    log_exception_port_owners("post");
 #else
     aialog("exc: handler installed port=%u (server off, exceptions will queue)", g_exc_port);
 #endif
@@ -1687,6 +2016,25 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("empty mode: no hooks (含事件观测)");
 #else
     aialog("empty mode: no hooks (无事件观测)");
+#endif
+#if AIA_BLOCK_DYNATRACE
+    install_dynatrace_block();
+#endif
+#if AIA_KILL_DT_SWIZZLE
+    kill_dt_swizzle();
+#endif
+#if AIA_PATCH_BINDER_VALUE
+    patch_binder_zero_values();
+#endif
+#if AIA_NOP_IJM_BRK
+    // 绑定器失败出口 KYHAppStore+0x7c55f8 是 brk #0xdead，主线程撞上就会被 SIGTRAP 打死。
+    // 补成 NOP 后继续走 0x7c55fc 的 nop 和 0x7c5600 的上下文恢复代码。
+    patch_app_code(0x7c55f8, 0xd43bd5a0, 0xd503201f, "ijm-brk");
+#endif
+#if AIA_NEUTER_IJM
+    // 稍等片刻：App 的类和分类要等首屏建起来才齐。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ neuter_ijm_telemetry(); });
 #endif
     start_stats_thread();
     return;
