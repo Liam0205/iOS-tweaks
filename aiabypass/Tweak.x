@@ -70,6 +70,17 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_DYLD_ONLY 0
 #endif
 
+// 隐身组合：dyld 枚举过滤 + dladdr 伪装，两者保持一致的镜像视图。
+// 需要同时用 AIA_HIDE_IMAGES=1 编译。
+#ifndef AIA_STEALTH
+#define AIA_STEALTH 0
+#endif
+
+// 实验：只 hook dladdr，把落在越狱镜像里的地址伪装成系统库。
+#ifndef AIA_DLADDR_MASK
+#define AIA_DLADDR_MASK 0
+#endif
+
 // 实验：定期采样所有线程的 PC，用来定位空转位置。
 #ifndef AIA_SAMPLE_THREADS
 #define AIA_SAMPLE_THREADS 0
@@ -1159,6 +1170,47 @@ static void fake_own_image_path(void) {
 }
 #endif
 
+#if AIA_DLADDR_MASK || AIA_STEALTH
+static void *g_orig_dladdr_fn;
+static const char *g_mask_names[] = {
+    "/usr/lib/libz.1.dylib", "/usr/lib/libsqlite3.dylib", "/usr/lib/libxml2.2.dylib",
+    "/usr/lib/libbz2.1.0.dylib", "/usr/lib/liblzma.5.dylib", "/usr/lib/libcrypto.44.dylib",
+    "/usr/lib/libcompression.dylib", "/usr/lib/libicucore.A.dylib",
+};
+static char g_mask_store[8][64];
+static int g_mask_used;
+
+static int my_dladdr_mask(const void *addr, Dl_info *info) {
+    int (*orig)(const void *, Dl_info *) = (int (*)(const void *, Dl_info *))g_orig_dladdr_fn;
+    int r = orig(addr, info);
+    if (!r || !info || !info->dli_fname) return r;
+    const char *p = info->dli_fname;
+    if (!strstr(p, "/var/jb") && !strstr(p, "preboot") && !strstr(p, "basebin") &&
+        !strstr(p, "procursus") && !strstr(p, "TweakInject") && !strstr(p, "ellekit") &&
+        !strstr(p, "systemhook") && !strstr(p, "libinjector") && !strstr(p, "AIABypass")) {
+        return r;
+    }
+    if (g_mask_used >= 8) { g_mask_used = 0; }
+    strlcpy(g_mask_store[g_mask_used], g_mask_names[g_mask_used], sizeof(g_mask_store[0]));
+    aialog("[mask] dladdr(%p) %s -> %s (caller %s)", addr, p,
+           g_mask_store[g_mask_used], caller_desc(__builtin_return_address(0)));
+    info->dli_fname = g_mask_store[g_mask_used];
+    g_mask_used++;
+    return r;
+}
+
+// 通过 __DATA_CONST 的懒绑定指针找到 dladdr 的真实实现
+static void install_dladdr_mask(void) {
+    void *fn = dlsym(RTLD_DEFAULT, "dladdr");
+    if (!fn) { aialog("mask: dlsym dladdr failed"); return; }
+    g_orig_dladdr_fn = fn;
+    Dl_info di = {0};
+    if (dladdr(fn, &di) && di.dli_fname) aialog("mask: dladdr impl in %s", di.dli_fname);
+    MSHookFunction(fn, (void *)my_dladdr_mask, (void **)&g_orig_dladdr_fn);
+    aialog("mask: dladdr hooked, orig=%p", g_orig_dladdr_fn);
+}
+#endif
+
 __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("===== ctor in %s =====", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
 #if AIA_TRULY_EMPTY
@@ -1202,6 +1254,22 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_FAKE_PATH
     fake_own_image_path();
+#endif
+#if AIA_STEALTH
+    MSHookFunction((void *)_dyld_image_count, (void *)my_dyld_image_count, (void **)&orig_dyld_image_count);
+    MSHookFunction((void *)_dyld_get_image_name, (void *)my_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    MSHookFunction((void *)_dyld_get_image_header, (void *)my_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    MSHookFunction((void *)_dyld_get_image_vmaddr_slide, (void *)my_dyld_get_image_slide, (void **)&orig_dyld_get_image_slide);
+    MSHookFunction((void *)_dyld_register_func_for_add_image, (void *)my_register_add_image, (void **)&orig_register_add_image);
+    MSHookFunction((void *)objc_copyImageNames, (void *)my_objc_copyImageNames, (void **)&orig_objc_copyImageNames);
+    install_dladdr_mask();
+    aialog("stealth mode: dyld filter + dladdr mask");
+    return;
+#endif
+#if AIA_DLADDR_MASK
+    install_dladdr_mask();
+    aialog("dladdr-mask mode");
+    return;
 #endif
 #if AIA_EMPTY
     aialog("empty mode: no hooks");
