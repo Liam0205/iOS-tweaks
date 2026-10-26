@@ -113,6 +113,11 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_EXC_SERVER
 #define AIA_EXC_SERVER 1
 #endif
+// 1 = 主线程遇到非法跳转时不挂起，而是把 PC 设成 LR，让这次调用"返回"后继续执行。
+// 主线程一挂起，整个界面就再也收不到触摸事件（动画仍由 render server 合成）。
+#ifndef AIA_EXC_RECOVER_MAIN
+#define AIA_EXC_RECOVER_MAIN 1
+#endif
 // 1 = 断点类异常（brk 断言桩）回复"PC 前进 4 字节"，让线程继续执行。
 // 这是主线程不卡死的关键：主线程撞上 brk 后如果一直不回复，触摸就永久失效。
 #ifndef AIA_EXC_SKIP_BRK
@@ -1099,9 +1104,9 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             rep->Head.msgh_id = req->Head.msgh_id + 100;
             rep->NDR = NDR_record;
             rep->RetCode = KERN_SUCCESS;
-            rep->new_stateCnt = 34;
+            rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
             memcpy(rep->new_state, buf2, sizeof(arm_thread_state64_t));
-            rep->Head.msgh_size = 8 + 8 + 4 + 4 + 34 * sizeof(natural_t);
+            rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
             kern_return_t sk = mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
                                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
             if (bail_logged < 20) {
@@ -1111,6 +1116,46 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             }
             memset(req, 0, rcv + 2048);
             continue;
+        }
+#endif
+#if AIA_EXC_RECOVER_MAIN
+        // 主线程的非法跳转：把 PC 改成 LR，模拟这次调用正常返回。
+        // JM 破坏对象 isa 后发消息，最终 blr 到一个被截断的指针（例如 0x99ccd258），
+        // 主线程如果一直不回复就永久挂起，界面从此失去响应。
+        {
+            const uint8_t *bb = (const uint8_t *)req;
+            uint32_t flavor2 = *(const uint32_t *)(bb + EXC_FLAVOR_OFF);
+            uint32_t sc2 = *(const uint32_t *)(bb + EXC_STATE_OFF);
+            uint64_t ftid = thread_id_of(*(const uint32_t *)(bb + EXC_THREAD_OFF));
+            if (g_main_tid && ftid == g_main_tid && flavor2 == 6 && sc2 >= 34) {
+                memcpy(rep->new_state, bb + EXC_STATE_BODY_OFF, sizeof(arm_thread_state64_t));
+                arm_thread_state64_t *nst = (arm_thread_state64_t *)rep->new_state;
+                uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
+                uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(*nst);
+                static int rec_logged;
+                if (rec_logged < 40) {
+                    char b[192];
+                    uintptr_t lo = 0;
+                    const char *lm = module_for(lr, &lo);
+                    snprintf(b, sizeof(b), "  RECOVERMAIN pc=%#lx -> lr=%s+0x%lx\n",
+                             (unsigned long)oldpc, lm ? lm : "?", (unsigned long)lo);
+                    log_raw(b);
+                    rec_logged++;
+                }
+                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)lr);
+                rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+                rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+                rep->Head.msgh_local_port = MACH_PORT_NULL;
+                rep->Head.msgh_id = req->Head.msgh_id + 100;
+                rep->NDR = NDR_record;
+                rep->RetCode = KERN_SUCCESS;
+                rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
+                rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+                mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                memset(req, 0, rcv + 2048);
+                continue;
+            }
         }
 #endif
 #if AIA_EXC_SKIP_BRK
@@ -1142,8 +1187,8 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                 rep->Head.msgh_id = req->Head.msgh_id + 100;
                 rep->NDR = NDR_record;
                 rep->RetCode = KERN_SUCCESS;
-                rep->new_stateCnt = 34;
-                rep->Head.msgh_size = 8 + 8 + 4 + 4 + 34 * sizeof(natural_t);
+                rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
+                rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
                 mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
                          MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
                 memset(req, 0, rcv + 2048);
