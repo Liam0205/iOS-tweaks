@@ -188,6 +188,17 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_EXC_BAIL 0
 #endif
 
+// 非主线程处决跳飞的处理方式：
+//   0 = 不回复，线程永久停在异常状态（默认，实测最稳）
+//   1 = 把 PC 设成 LR、x0 清零，当作这次调用返回 0
+// 1 是为了回答一个具体问题：JM 的检查线程被冻结，检测就永远不完成，
+// App 能用的前提正是"检测没跑完"。如果让它继续跑，JM 是会判定通过，
+// 还是会在下一步再处决一次，只能实测。
+//   2 = 交给 aia_thread_bail 让 pthread_exit 干净退出
+#ifndef AIA_EXC_NONMAIN
+#define AIA_EXC_NONMAIN 0
+#endif
+
 // 实验：拦下 exit(1)/_exit(1)，验证是 JM 自己退出还是 ellekit 异常处理器退出。
 #ifndef AIA_BLOCK_EXIT
 #define AIA_BLOCK_EXIT 0
@@ -1217,8 +1228,13 @@ static void dump_fault_state(exc_req_t *req) {
         }
         log_raw(buf);
     }
-    // 主线程故障时走一遍帧指针链：栈扫描会给出一堆陈旧值，帧链才是真实调用路径。
-    if (ftid && ftid == g_main_tid) {
+    // 帧指针链：栈扫描会给出一堆陈旧值，帧链才是真实调用路径。
+    // 主线程之外，凡 PC 落在任何模块之外（跳飞现场）也做一遍，
+    // 用来回答"是谁把那根坏指针 blr 出去的"。
+    uintptr_t pcv = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+    uintptr_t pcOff = 0;
+    BOOL pcDangling = (module_for(pcv, &pcOff) == NULL);
+    if (ftid && (ftid == g_main_tid || pcDangling)) {
         uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(st));
         for (int d = 0; d < 64 && fp; d++) {
             uintptr_t prev = 0, ra = 0;
@@ -1228,6 +1244,9 @@ static void dump_fault_state(exc_req_t *req) {
             if (pm) {
                 snprintf(buf, sizeof(buf), "  FP#%02d %s+0x%lx ra=%#lx\n", d, pm,
                          (unsigned long)po, (unsigned long)ra);
+                log_raw(buf);
+            } else if (pcDangling) {
+                snprintf(buf, sizeof(buf), "  FP#%02d ?+0x0 ra=%#lx\n", d, (unsigned long)ra);
                 log_raw(buf);
             }
             // 帧指针指向栈，不带代码签名，48 位掩码就够；只有返回地址需要重建。
@@ -1283,7 +1302,7 @@ static void dump_fault_state(exc_req_t *req) {
     }
 }
 
-#if AIA_EXC_BAIL
+#if AIA_EXC_BAIL || (defined(AIA_EXC_NONMAIN) && AIA_EXC_NONMAIN == 2)
 // 故障线程被重定向到这里：直接结束该线程，让 pthread 清理路径归还它持有的锁。
 __attribute__((noinline, used)) static void aia_thread_bail(void) {
     pthread_exit(NULL);
@@ -1327,6 +1346,56 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             char b[96];
             snprintf(b, sizeof(b), "  terminate thread(%u) -> %d\n", tp, tk);
             log_raw(b);
+        }
+#endif
+#if AIA_EXC_NONMAIN
+        // 实验：让非主线程的处决跳飞"当作返回 0"，看 JM 的检查流程能否跑完。
+        if (!(g_main_tid && thread_id_of(*(const uint32_t *)((const uint8_t *)req + EXC_THREAD_OFF)) == g_main_tid)) {
+            static char nmst[sizeof(arm_thread_state64_t) + 64];
+            memcpy(nmst, (const char *)req + EXC_STATE_BODY_OFF, sizeof(arm_thread_state64_t));
+            arm_thread_state64_t *nst = (arm_thread_state64_t *)nmst;
+            uintptr_t opc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
+            uintptr_t olr = (uintptr_t)__darwin_arm_thread_state64_get_lr(*nst);
+            static int nm_logged;
+#if AIA_EXC_NONMAIN == 2
+            __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)aia_thread_bail);
+#else
+            uintptr_t ro = 0, rreal = 0;
+            const char *rm = aia_real_ptr(olr, &rreal, &ro);
+            if (rm && ro) __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)rreal);
+            else {
+                // 返回地址不可用，退回挂起，避免把线程送到垃圾地址。
+                if (nm_logged < 20) {
+                    char b[144];
+                    snprintf(b, sizeof(b), "  NONMAIN pc=%#lx lr=%#lx 无可返回地址 -> 挂起\n",
+                             (unsigned long)opc, (unsigned long)olr);
+                    log_raw(b); nm_logged++;
+                }
+                memset(req, 0, rcv + 2048);
+                continue;
+            }
+#endif
+            nst->__x[0] = 0;
+            nst->__x[1] = 0;
+            if (nm_logged < 30) {
+                char b[176];
+                snprintf(b, sizeof(b), "  NONMAIN pc=%#lx -> lr=%s+0x%lx x0:=0\n",
+                         (unsigned long)opc, rm ? rm : "?", (unsigned long)ro);
+                log_raw(b); nm_logged++;
+            }
+            rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+            rep->Head.msgh_local_port = MACH_PORT_NULL;
+            rep->Head.msgh_id = req->Head.msgh_id + 100;
+            rep->NDR = NDR_record;
+            rep->RetCode = KERN_SUCCESS;
+            rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
+            memcpy(rep->new_state, nmst, sizeof(arm_thread_state64_t));
+            rep->Head.msgh_size = EXC_REPLY_HDR_SIZE + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+            mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                     MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            memset(req, 0, rcv + 2048);
+            continue;
         }
 #endif
 #if AIA_EXC_BAIL
