@@ -1680,9 +1680,11 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
 #define AIA_PATCH_BINDER_VALUE 1
 #endif
 // 1 = 把 ijm 绑定器失败出口的 brk #0xdead 补成 NOP。
-// 主线程撞上这条 brk 会被 SIGTRAP 打死，补掉后失败路径能继续往下走。
+// 实测有害：brk 之后 0x7c55fc 的上下文恢复依赖一个并不存在的现场，
+// 补掉后失败路径会继续跑到无效代码，App 启动即闪退。
+// 正确做法是让异常端口接住这条 brk（AIA_EXC_SKIP_BRK）。
 #ifndef AIA_NOP_IJM_BRK
-#define AIA_NOP_IJM_BRK 1
+#define AIA_NOP_IJM_BRK 0
 #endif
 
 #if AIA_PATCH_BINDER_VALUE
@@ -1717,8 +1719,10 @@ __attribute__((unused)) static void patch_binder_zero_values(void) {
 // ijm VM 实现，Dynatrace 回调原实现时会走导入绑定器，而绑定器在本进程里解析失败，
 // 主线程直接撞 brk #0xdead 或跳飞。
 // 这里把这个配置器的 add* 类方法全部变成空操作，Dynatrace 就一个 hook 都装不上。
+// 实测有害：把 add* 变空操作会破坏 Dynatrace 的自洽状态，App 能起但界面不再
+// 响应触摸（视图树只剩三层系统容器）。默认关闭。
 #ifndef AIA_KILL_DT_SWIZZLE
-#define AIA_KILL_DT_SWIZZLE 1
+#define AIA_KILL_DT_SWIZZLE 0
 #endif
 
 #if AIA_KILL_DT_SWIZZLE
