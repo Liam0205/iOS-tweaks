@@ -12,6 +12,9 @@
 - **查出 7 个槽对应的函数**。systemhook 对自己挂过的符号经 `dlsym` 会返回同一地址，逐个比对候选符号后确认：5 个 `__got` 槽分别是 `dlopen`、`dlopen_preflight`、`fork`、`posix_spawn`、`vfork`，两个 `__la_symbol_ptr` 槽都是 `dlopen`。主二进制导入的相关符号正好就是这 6 个，systemhook 把它们全部换成了自己的实现。
 - **把 7 个槽全部还原后，处决次数不变**。用自解析 `__LINKEDIT` 符号表的方式取得未被劫持的地址（不能用 `dlsym`，它返回的就是 systemhook 的地址）写回后，App 连续三次启动都稳定，`exc` 仍然是 2。说明这些 GOT 条目不是处决的触发点。
 - **两次处决发生在进程启动后 7ms 和 12ms**。加上相对时间戳后，三次运行都是同一时刻，远早于 JM 的 50 项 GOT 检查。判定不是这批检查做出的。
+- **加载期 interpose 在 tweak 里不生效**。用 `__DATA,__interpose` 挂 `_dyld_image_count`、`_dyld_get_image_name`、`_dyld_get_image_header`、`getenv`、`sysctl`、`dlsym` 六个，构造函数里读到的记录数是 0。interpose 只对在它之后绑定的镜像生效，而 tweak 是追加到主程序加载命令末尾的，App 及其框架早已绑定完毕。
+- **构造函数里停不住处决线程**。扫描全部线程、把 PC 落在 JM 范围内的线程挂起，实测构造函数执行时一个都找不到；两次处决是 7ms 和 12ms 之后才发生的。
+- 综合第 48–50 节：JM 作为主程序依赖，初始化早于被 ellekit 追加的 tweak，判定在看到 systemhook 改过的 GOT 时就已做出，7ms/12ms 的两次处决是后果。按目前 tweak 注入的范围，改内存改变不了这个顺序。
 - 实测默认构建连续三次启动均为 `exc=2 alive=1`，App 可用。**检测本身仍未真正通过**：两条处决（`pc=lr=0x8`、`pc=lr=0xeee1`）仍由异常端口接住，而不是被消除。要让判定本身不成立，需要在比 tweak 构造函数更早的阶段介入加载顺序，或者定位到发起处决的那段 JM 代码。
 
 ## 0.0.6

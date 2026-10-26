@@ -1,6 +1,6 @@
 Package: page.0x01.aiabypass
 Name: AIABypass-友邦友享反检测-rootless
-Version: 0.0.87
+Version: 0.0.90
 Architecture: iphoneos-arm64
 Description: 绕过友邦友享（com.aia.china.YoubangHealthRelease）的越狱环境检测。目标 App 内置 JMCodeProtectKit 代码保护 SDK，检测命中后跳转到非法地址使进程 SIGSEGV 退出。适用于 rootless 越狱（Dopamine 等）。在友邦友享 6.9.33 版本验证。
 Maintainer: Liam

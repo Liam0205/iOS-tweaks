@@ -231,6 +231,12 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_KILL_PROBE
 #define AIA_KILL_PROBE 0
 #endif
+#ifndef AIA_EARLY_TRACE
+#define AIA_EARLY_TRACE 0
+#endif
+#ifndef AIA_FREEZE_JM
+#define AIA_FREEZE_JM 0
+#endif
 // 1 = 连 __got 里的 5 个槽也一起还原（实测会让 App 立刻退出）
 #ifndef AIA_GOT_RESTORE_GOT
 #define AIA_GOT_RESTORE_GOT 0
@@ -3797,6 +3803,104 @@ static void install_kill_probe(void) {
 __attribute__((unused)) static void install_kill_probe(void) {}
 #endif
 
+#if AIA_EARLY_TRACE
+// dyld 在绑定阶段就会把别处对这些符号的引用重定向到 __interpose 里的替代函数，
+// 比任何构造函数都早。用它来观察"构造函数之前"到底发生过什么。
+struct aia_early_rec { uint64_t t; const char *name; uintptr_t ra; };
+static struct aia_early_rec g_early[96];
+static int g_early_n;
+static void aia_early_note(const char *name, uintptr_t ra) {
+    int i = __atomic_fetch_add(&g_early_n, 1, __ATOMIC_RELAXED);
+    if (i < 96) { g_early[i].t = mach_absolute_time(); g_early[i].name = name; g_early[i].ra = ra; }
+}
+
+static uint32_t ip_image_count(void) {
+    aia_early_note("dyld_image_count", (uintptr_t)__builtin_return_address(0));
+    return _dyld_image_count();
+}
+static const char *ip_image_name(uint32_t i) {
+    aia_early_note("dyld_get_image_name", (uintptr_t)__builtin_return_address(0));
+    return _dyld_get_image_name(i);
+}
+static const struct mach_header *ip_image_header(uint32_t i) {
+    aia_early_note("dyld_get_image_header", (uintptr_t)__builtin_return_address(0));
+    return _dyld_get_image_header(i);
+}
+static char *ip_getenv(const char *n) {
+    aia_early_note("getenv", (uintptr_t)__builtin_return_address(0));
+    return getenv(n);
+}
+static int ip_sysctl(int *a, u_int b, void *c, size_t *d, void *e, size_t f) {
+    aia_early_note("sysctl", (uintptr_t)__builtin_return_address(0));
+    return sysctl(a, b, c, d, e, f);
+}
+static void *ip_dlsym(void *h, const char *n) {
+    aia_early_note("dlsym", (uintptr_t)__builtin_return_address(0));
+    return dlsym(h, n);
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *repl; const void *orig; } g_early_interpose[] = {
+    { (const void *)ip_image_count,  (const void *)_dyld_image_count },
+    { (const void *)ip_image_name,   (const void *)_dyld_get_image_name },
+    { (const void *)ip_image_header, (const void *)_dyld_get_image_header },
+    { (const void *)ip_getenv,       (const void *)getenv },
+    { (const void *)ip_sysctl,       (const void *)sysctl },
+    { (const void *)ip_dlsym,        (const void *)dlsym },
+};
+
+static void dump_early(void) {
+    char b[256];
+    snprintf(b, sizeof(b), "EARLY now=%llu n=%d\n", (unsigned long long)mach_absolute_time(), g_early_n);
+    log_raw(b);
+    for (int i = 0; i < g_early_n && i < 96; i++) {
+        uintptr_t o = 0;
+        const char *m = module_for(g_early[i].ra, &o);
+        snprintf(b, sizeof(b), "  EARLY#%d t=%llu %s caller=%s+0x%lx\n", i,
+                 (unsigned long long)g_early[i].t, g_early[i].name, m ? m : "?", (unsigned long)o);
+        log_raw(b);
+    }
+}
+#else
+__attribute__((unused)) static void dump_early(void) {}
+#endif
+
+#if AIA_FREEZE_JM
+// 判定发生在我们的构造函数之前，改内存已经来不及；但执行处决的是 JM 自己的线程。
+// 这里在构造函数里把这些线程停住，让处决根本不会发生。
+static int freeze_jm_threads(void) {
+    uintptr_t jm = module_base_for("JMCodeProtectKit", NULL);
+    if (!jm) { log_raw("FREEZEJM 找不到 JM 基址\n"); return 0; }
+    uintptr_t jmend = jm + 0x1a8000;
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return 0;
+    int frozen = 0;
+    for (mach_msg_type_number_t i = 0; i < cnt; i++) {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) != KERN_SUCCESS) continue;
+        uintptr_t pc = aia_strip_pac((uintptr_t)st.__pc);
+        if (pc < jm || pc >= jmend) continue;
+        if (thread_suspend(list[i]) == KERN_SUCCESS) {
+            frozen++;
+            char b[128];
+            snprintf(b, sizeof(b), "FREEZEJM 停住线程 %u pc=+0x%lx\n",
+                     (unsigned)list[i], (unsigned long)(pc - jm));
+            log_raw(b);
+        }
+    }
+    for (mach_msg_type_number_t i = 0; i < cnt; i++) mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_act_t));
+    char b[96];
+    snprintf(b, sizeof(b), "FREEZEJM 共停住 %d 个线程\n", frozen);
+    log_raw(b);
+    return frozen;
+}
+#else
+__attribute__((unused)) static int freeze_jm_threads(void) { return 0; }
+#endif
+
 __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("===== ctor in %s =====", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
 #if AIA_TRULY_EMPTY
@@ -3840,6 +3944,9 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     got_audit();
 #endif
     if (!g_t0) g_t0 = mach_absolute_time();
+#if AIA_EARLY_TRACE
+    dump_early();
+#endif
     snapshot_modules();
 #if AIA_GOT_RESTORE
     install_got_restore_dlsym();
@@ -4008,6 +4115,9 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_IJM_KEY
     start_ijm_key_watch();
+#endif
+#if AIA_FREEZE_JM
+    freeze_jm_threads();
 #endif
 #if AIA_IJM_RESOLVER
     // 槽要等 App 自己的初始化写完之后再换，否则会被覆盖回原值。
