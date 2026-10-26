@@ -145,6 +145,20 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_HOOK_IJM_BINDER 0
 #endif
 
+// 1 = 在 JM 的 ijm VM 入口校验脚本描述符。实测每次调用拿到的都是主二进制的
+// 0x7c5500，而 JM 的分派表只接受自己脚本的编码，硬解释会越界跳飞。
+// 校验失败时按 VM 的正常返回约定把 ctx 交回去。
+#ifndef AIA_VM_GUARD
+#define AIA_VM_GUARD 0
+#endif
+
+// 1 = 在 JM 的 ijm VM 入口挂观察钩子，统计脚本描述符归属。
+// 实测 164008 次调用里只有 1 次拿到非 JM 描述符（主二进制的 0x7c5500）。
+// 这个探针本身会给热路径加一层跳板，只在排查时打开。
+#ifndef AIA_VM_PROBE
+#define AIA_VM_PROBE 0
+#endif
+
 #ifndef AIA_EXC_SKIP_BRK
 #define AIA_EXC_SKIP_BRK 1
 #endif
@@ -586,6 +600,8 @@ static void log_raw(const char *s) {
 }
 
 #define AIA_MAX_MODULES 1024
+static int g_vm_calls, g_vm_bad, g_vm_guarded;
+
 static struct { uintptr_t base; uintptr_t size; const char *name; } g_mods[AIA_MAX_MODULES];
 static int g_mod_count;
 
@@ -645,6 +661,10 @@ static bool safe_read(uintptr_t addr, uintptr_t *out) {
     return kr == KERN_SUCCESS && got == sizeof(uintptr_t);
 }
 
+static volatile int g_exc_count;      // 收到的异常消息总数
+static volatile int g_exc_noreply;    // 其中按"不回复"处理的数量
+static void log_exception_port_owners(const char *tag);
+
 static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     char buf[512];
@@ -655,10 +675,11 @@ static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
     uintptr_t fp = uc->uc_mcontext->__ss.__fp;
     uintptr_t off = 0;
     const char *m = module_for(pc, &off);
-    snprintf(buf, sizeof(buf), "SIGNAL %d code=%d addr=%p pc=%p(%s+0x%lx) lr=%p sp=%p fp=%p\n",
+    snprintf(buf, sizeof(buf), "SIGNAL %d code=%d addr=%p pc=%p(%s+0x%lx) lr=%p sp=%p fp=%p exc=%d noreply=%d\n",
              sig, si ? si->si_code : -1, si ? si->si_addr : NULL,
              (void *)pc, m ? m : "?", (unsigned long)off,
-             (void *)lr, (void *)uc->uc_mcontext->__ss.__sp, (void *)fp);
+             (void *)lr, (void *)uc->uc_mcontext->__ss.__sp, (void *)fp,
+             g_exc_count, g_exc_noreply);
     log_raw(buf);
     for (int i = 0; i < 29; i++) {
         uintptr_t voff = 0;
@@ -913,9 +934,6 @@ __attribute__((unused)) static inline uintptr_t aia_strip_pac(uintptr_t v) {
 static uint64_t g_main_tid;
 static volatile int g_evt_count;      // UIWindow sendEvent: 累计调用次数
 static volatile int g_evt_touch;      // 其中触摸事件
-static volatile int g_exc_count;      // 收到的异常消息总数
-static volatile int g_exc_noreply;    // 其中按"不回复"处理的数量
-
 // 每 5 秒记录一次：异常数量、线程数、Mach 端口名称数。
 // 目的：区分"触摸失效"是资源累积耗尽，还是 JM 状态机被卡住。
 static uint64_t thread_id_of(mach_port_t th);
@@ -964,6 +982,30 @@ __attribute__((unused)) static void *aia_stats(void *arg) {
         snprintf(b, sizeof(b), "STATS t=%ds exc=%d noreply=%d evt=%d touch=%d threads=%d ports=%d\n",
                  i * 5, g_exc_count, g_exc_noreply, g_evt_count, g_evt_touch, nthreads, nports);
         log_raw(b);
+        {
+            // ijm 绑定器的共享解析器槽。它在 __DATA 的零填充尾部，ctor 时读到 0；
+            // 如果 JM 会在环境检查通过后填它，这里就能看到值随时间变化。
+            uintptr_t ab = app_base();
+            if (ab) {
+                uint64_t s8 = 0, s0 = 0, s10 = 0, s18 = 0;
+                safe_read(ab + 0x4058008, (uintptr_t *)&s8);
+                safe_read(ab + 0x4058000, (uintptr_t *)&s0);
+                safe_read(ab + 0x4058010, (uintptr_t *)&s10);
+                safe_read(ab + 0x4058018, (uintptr_t *)&s18);
+                snprintf(b, sizeof(b), "  RESV slot=%#llx b0=%#llx b10=%#llx b18=%#llx\n",
+                         (unsigned long long)s8, (unsigned long long)s0,
+                         (unsigned long long)s10, (unsigned long long)s18);
+                log_raw(b);
+            }
+            {
+                snprintf(b, sizeof(b), "  VM calls=%d bad=%d guarded=%d\n", g_vm_calls, g_vm_bad, g_vm_guarded);
+                log_raw(b);
+            }
+            if ((i % 4) == 0) {
+                // 端口被别的组件抢回去，故障就会绕过我们直接变成信号。
+                log_exception_port_owners("tick");
+            }
+        }
         {
             // 直接读主线程 PC：判断"点不动"是不是主线程被阻塞。
             mach_port_t mt = main_thread_port();
@@ -1279,6 +1321,51 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                     log_raw(b);
                     rec_logged++;
                 }
+#if AIA_EXC_UNWIND_JM
+                // ijm VM 交叉现场：不回复就会把主线程永久挂住（evt 计数停止增长），
+                // 界面从此失去响应。这里沿帧链退回到调用方（现场是 Dynatrace），
+                // 让整次 ijm 埋点调用作废，主线程继续跑 runloop。
+                {
+                    uintptr_t lrOff = 0;
+                    const char *lm = module_for(lr, &lrOff);
+                    BOOL vmSite = lm && strstr(lm, "JMCodeProtectKit") &&
+                                  lrOff >= 0x186600 && lrOff < 0x186700;
+                    if (vmSite) {
+                        uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(*nst));
+                        uintptr_t prevfp = 0, ra = 0;
+                        if (fp && safe_read(fp, &prevfp) && safe_read(fp + 8, &ra)) {
+                            uintptr_t rao = 0;
+                            uintptr_t raUn = aia_strip_pac(ra);
+                            const char *ram = module_for(raUn, &rao);
+                            char b[192];
+                            snprintf(b, sizeof(b), "  UNWINDJM -> %s+0x%lx fp=%#lx\n",
+                                     ram ? ram : "?", (unsigned long)rao, (unsigned long)fp);
+                            log_raw(b);
+                            if (ram && raUn) {
+                                nst->__x[0] = 0;
+                                nst->__x[1] = 0;
+                                __darwin_arm_thread_state64_set_fp(*nst, (void *)aia_strip_pac(prevfp));
+                                __darwin_arm_thread_state64_set_lr_fptr(*nst, (void *)raUn);
+                                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)raUn);
+                                __darwin_arm_thread_state64_set_sp(*nst, (void *)(fp + 0x10));
+                                rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+                                rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+                                rep->Head.msgh_local_port = MACH_PORT_NULL;
+                                rep->Head.msgh_id = req->Head.msgh_id + 100;
+                                rep->NDR = NDR_record;
+                                rep->RetCode = KERN_SUCCESS;
+                                rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
+                                rep->Head.msgh_size = EXC_REPLY_HDR_SIZE +
+                                                      ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+                                mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                                memset(req, 0, rcv + 2048);
+                                continue;
+                            }
+                        }
+                    }
+                }
+#endif
 #if AIA_EXC_RECOVER_FAULT
                 // ijm VM 交叉现场里 x0 指向"字节码游标槽"（结构 + 0x708），
                 // 而 JM+0x186634 这条返回路径期望 x0 就是上下文结构。
@@ -1300,40 +1387,11 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                         log_raw(b);
                         nst->__x[0] = (uint64_t)ctx;
                     }
-#if AIA_EXC_UNWIND_JM
-                    // 上面那种"fault 返回到 JM+0x186634"的做法实测必然二次崩溃：
-                    // 那条路径会从上下文结构里取出保存的 PC/SP 再 ret，而那些槽本身
-                    // 就是这次出错的计算结果。这里改成沿帧链退回到调用方
-                    // （帧链现场是 Dynatrace），让这次 ijm 埋点调用整体作废。
-                    if (vmSite) {
-                        uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(*nst));
-                        uintptr_t prevfp = 0, ra = 0;
-                        if (fp && safe_read(fp, &prevfp) && safe_read(fp + 8, &ra) && ra) {
-                            uintptr_t rao = 0;
-                            const char *ram = module_for(aia_strip_pac(ra), &rao);
-                            char b[192];
-                            snprintf(b, sizeof(b), "  UNWINDJM -> %s+0x%lx fp=%#lx\n",
-                                     ram ? ram : "?", (unsigned long)rao, (unsigned long)fp);
-                            log_raw(b);
-                            if (ram) {
-                                nst->__x[0] = 0;
-                                __darwin_arm_thread_state64_set_fp(*nst, (void *)aia_strip_pac(prevfp));
-                                __darwin_arm_thread_state64_set_lr_fptr(*nst, (void *)aia_strip_pac(ra));
-                                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)aia_strip_pac(ra));
-                                __darwin_arm_thread_state64_set_sp(*nst, (void *)(fp + 0x10));
-                                goto recover_reply;
-                            }
-                        }
-                    }
-#endif
                 }
                 __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)lr);
 #else
                 memset(req, 0, rcv + 2048);
                 continue;
-#endif
-#if AIA_EXC_UNWIND_JM
-            recover_reply:
 #endif
                 rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
                 rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
@@ -1653,7 +1711,7 @@ static kern_return_t my_task_info(task_name_t target, task_flavor_t flavor, task
 }
 
 // 记录接管之前谁持有异常端口。JM 若自己也装了处理器，抢走它可能破坏它的控制流。
-__attribute__((unused)) static void log_exception_port_owners(const char *tag) {
+__attribute__((unused)) __attribute__((unused)) static void log_exception_port_owners(const char *tag) {
     struct { const char *name; exception_mask_t mask; } items[] = {
         {"BAD_ACCESS", EXC_MASK_BAD_ACCESS},
         {"BAD_INSTRUCTION", EXC_MASK_BAD_INSTRUCTION},
@@ -1895,6 +1953,8 @@ __attribute__((noinline, used)) static id aia_binder_entry(void) {
 
 __attribute__((unused)) static id aia_import_nil(void) { return nil; }
 
+static void install_vm_probe(void);
+
 __attribute__((unused)) static void patch_binder_slow_path(void) {
     uintptr_t base = app_base();
     if (!base) return;
@@ -1911,6 +1971,71 @@ __attribute__((unused)) static void patch_binder_slow_path(void) {
 #else
     (void)aia_binder_entry;
 #endif
+#if AIA_VM_PROBE
+    install_vm_probe();
+#endif
+}
+
+// ============================================================
+// JM 的 ijm VM 入口观察
+// ============================================================
+// VM 入口 JM+0x11ee28 的第一个参数 x0 是"脚本描述符"，游标 = x0 + 4。
+// 正常情况下这个描述符应该落在 JMCodeProtectKit 自己的代码区里。
+// 故障现场拿到的是主二进制的 0x7c5500，说明调用方给的是别的东西。
+// 这里只观察不改写：统计每次调用的描述符归属，看看非 JM 描述符是偶发还是常态。
+static void *g_orig_vm_entry;
+
+static uintptr_t module_base_for(const char *needle, uintptr_t *size_out) {
+    for (int i = 0; i < g_mod_count; i++) {
+        if (g_mods[i].name && strstr(g_mods[i].name, needle)) {
+            if (size_out) *size_out = g_mods[i].size;
+            return g_mods[i].base;
+        }
+    }
+    return 0;
+}
+
+// 与 VM 入口同样的 C 调用约定：x0/x1/x2 是前三个参数，返回值就是 x0。
+__attribute__((unused)) static uint64_t aia_vm_probe_entry(uint64_t x0, uint64_t x1, uint64_t x2) {
+    uintptr_t jm = 0, jmsz = 0;
+    jm = module_base_for("JMCodeProtectKit", &jmsz);
+    g_vm_calls++;
+    if (jm && !(x0 >= jm && x0 < jm + jmsz)) {
+        if (g_vm_bad < 40) {
+            uintptr_t off = 0;
+            const char *m = module_for((uintptr_t)x0, &off);
+            char b[192];
+            snprintf(b, sizeof(b), "  VMBAD #%d desc=%#llx %s+0x%lx ctx=%#llx\n",
+                     g_vm_bad, (unsigned long long)x0, m ? m : "?",
+                     (unsigned long)off, (unsigned long long)x1);
+            log_raw(b);
+            g_vm_bad++;
+        }
+    }
+#if AIA_VM_GUARD
+    // 描述符不属于 JM 自己的代码区，说明这个 VM 调用不是 JM 的脚本。
+    // 硬解释会把游标走到越界的分派表项上，算出未映射地址直接跳飞。
+    // 这里按 VM 自己的正常返回约定收尾：x0 = ctx。
+    // VM 的返回路径（JM+0x11f264）就是把 ctx 原样交回去，由外层壳从 ctx 里
+    // 恢复寄存器并返回，因此这样收尾对调用方是合法的。
+    if (jm && !(x0 >= jm && x0 < jm + jmsz) && x1) {
+        g_vm_guarded++;
+        return x1;
+    }
+#endif
+    uint64_t (*orig)(uint64_t, uint64_t, uint64_t) =
+        (uint64_t (*)(uint64_t, uint64_t, uint64_t))g_orig_vm_entry;
+    return orig(x0, x1, x2);
+}
+
+__attribute__((unused)) static void install_vm_probe(void) {
+    uintptr_t jm = module_base_for("JMCodeProtectKit", NULL);
+    if (!jm) { log_raw("VMPROBE no JM base\n"); return; }
+    MSHookFunction((void *)(jm + 0x11ee28), (void *)aia_vm_probe_entry, (void **)&g_orig_vm_entry);
+    char b[128];
+    snprintf(b, sizeof(b), "VMPROBE hook at %#lx orig=%p\n",
+             (unsigned long)(jm + 0x11ee28), (void *)g_orig_vm_entry);
+    log_raw(b);
 }
 
 // 绑定器入口在 KYHAppStore+0x7c5508，调用者用 x13=元数据槽、x14=桩、x15=期望值。
