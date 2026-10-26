@@ -70,17 +70,18 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_DYLD_ONLY 0
 #endif
 
-// 实验：只 hook dladdr，把落在越狱镜像里的地址伪装成系统库。
-
 // 实验：定期采样所有线程的 PC，用来定位空转位置。
 #ifndef AIA_SAMPLE_THREADS
 #define AIA_SAMPLE_THREADS 0
 #endif
 
 // 实验：安装自己的 Mach 异常处理器，抢在 ellekit 之前拿到故障线程的现场，
-// 这样能看到"谁跳到了非法地址"。
+// 这样能看到"谁跳到了非法地址"。AIA_KILL_THREAD=1 时只终止故障线程，不杀整个进程。
 #ifndef AIA_EXC_HANDLER
 #define AIA_EXC_HANDLER 1
+#endif
+#ifndef AIA_KILL_THREAD
+#define AIA_KILL_THREAD 0
 #endif
 // 1 = 收到 SIGUSR1 时把所有线程的 PC/LR 和主线程栈打到日志里，用来诊断卡死。
 #ifndef AIA_DUMP_ON_SIGNAL
@@ -863,6 +864,15 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             continue;
         }
         dump_fault_state(req);
+#if AIA_KILL_THREAD
+        {
+            mach_port_t tp = *(const uint32_t *)((const uint8_t *)req + EXC_THREAD_OFF);
+            kern_return_t tk = thread_terminate(tp);
+            char b[96];
+            snprintf(b, sizeof(b), "  terminate thread(%u) -> %d\n", tp, tk);
+            log_raw(b);
+        }
+#endif
 #if AIA_EXC_NO_REPLY
         // 不回复：故障线程留在异常状态，内核不会让它继续执行，JM 的处决也不会生效。
         memset(req, 0, rcv + 2048);
