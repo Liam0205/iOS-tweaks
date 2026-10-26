@@ -94,6 +94,12 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_KILL_THREAD
 #define AIA_KILL_THREAD 0
 #endif
+// 1 = hook UIApplication/UIWindow 的 sendEvent: 统计事件数量。
+// 注意：App 自己在 sendEvent: 里做埋点，加这层 hook 会改变 swizzle 链，
+// 实测会让主线程更早撞上 brk #0xdead，所以默认关闭，只在排查时打开。
+#ifndef AIA_EVENT_PROBE
+#define AIA_EVENT_PROBE 0
+#endif
 // 1 = 收到 SIGUSR1 时把所有线程的 PC/LR 和主线程栈打到日志里，用来诊断卡死。
 #ifndef AIA_DUMP_ON_SIGNAL
 #define AIA_DUMP_ON_SIGNAL 0
@@ -107,9 +113,20 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_EXC_SERVER
 #define AIA_EXC_SERVER 1
 #endif
-// 1 = 收到异常后不回复，让故障线程永久挂起（不交给 ellekit，也就不会有 exit(1)）
+// 1 = 断点类异常（brk 断言桩）回复"PC 前进 4 字节"，让线程继续执行。
+// 这是主线程不卡死的关键：主线程撞上 brk 后如果一直不回复，触摸就永久失效。
+#ifndef AIA_EXC_SKIP_BRK
+#define AIA_EXC_SKIP_BRK 1
+#endif
+// 1 = 收到非断点异常后不回复，让故障线程永久挂起（不交给 ellekit，也就不会有 exit(1)）。
+// 处决跳转的 pc=0x8 如果被回复，线程会重跑同一条非法指令形成死循环，进程随即被杀。
 #ifndef AIA_EXC_NO_REPLY
 #define AIA_EXC_NO_REPLY 1
+#endif
+// 1 = 不挂起故障线程，而是把它送到 aia_thread_bail 让 pthread_exit 干净退出，
+// 这样线程持有的锁和资源会被释放（挂起会导致后续触摸失效）。
+#ifndef AIA_EXC_BAIL
+#define AIA_EXC_BAIL 0
 #endif
 
 // 实验：拦下 exit(1)/_exit(1)，验证是 JM 自己退出还是 ellekit 异常处理器退出。
@@ -130,6 +147,12 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 // 空 tweak：只记录构造，不安装任何 hook，用来判断 RASP 是否只检测镜像存在。
 #ifndef AIA_EMPTY
 #define AIA_EMPTY 1
+#endif
+
+// 只装"安全子集"的观测 hook（不含 vm_region / vm_read 等高危项），
+// 与异常接管同时开启，用来观察 JM 在判定前后调用了什么。
+#ifndef AIA_OBSERVE_ONLY
+#define AIA_OBSERVE_ONLY 0
 #endif
 
 // 运行时把 0x7c54b0..0x7c5620 的字节和映射来源打出来，用来对比文件里的原始机器码。
@@ -792,6 +815,162 @@ static mach_port_t g_exc_port = MACH_PORT_NULL;
 #define EXC_STATE_OFF 88
 #define EXC_STATE_BODY_OFF 92
 
+// arm64e 的返回地址和帧指针带 PAC 签名，比较前要先剥掉高位。
+__attribute__((unused)) static inline uintptr_t aia_strip_pac(uintptr_t v) {
+    uintptr_t t = v & 0x0000FFFFFFFFFFFFULL;
+    if (t & 0x0000800000000000ULL) t |= 0xFFFF000000000000ULL;
+    return t;
+}
+
+static uint64_t g_main_tid;
+static volatile int g_evt_count;      // UIWindow sendEvent: 累计调用次数
+static volatile int g_evt_touch;      // 其中触摸事件
+static volatile int g_exc_count;      // 收到的异常消息总数
+static volatile int g_exc_noreply;    // 其中按"不回复"处理的数量
+
+// 每 5 秒记录一次：异常数量、线程数、Mach 端口名称数。
+// 目的：区分"触摸失效"是资源累积耗尽，还是 JM 状态机被卡住。
+static uint64_t thread_id_of(mach_port_t th);
+
+// 主线程的 Mach 端口：从 task_threads 里找 tid 等于 mainTid 的那个。
+static mach_port_t main_thread_port(void) {
+    thread_act_array_t l = NULL;
+    mach_msg_type_number_t n = 0;
+    mach_port_t r = 0;
+    if (task_threads(mach_task_self(), &l, &n) != KERN_SUCCESS) return 0;
+    for (mach_msg_type_number_t k = 0; k < n; k++) {
+        if (thread_id_of(l[k]) == g_main_tid) { r = l[k]; }
+        else mach_port_deallocate(mach_task_self(), l[k]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)l, n * sizeof(thread_t));
+    return r;
+}
+
+static void dump_jm_swizzles(void);
+#if AIA_EVENT_PROBE
+static void my_app_sendEvent(id self, SEL _cmd, UIEvent *ev);
+#endif
+
+__attribute__((unused)) static void *aia_stats(void *arg) {
+    (void)arg;
+    char b[192];
+    for (int i = 0; i < 240; i++) {
+        sleep(5);
+        thread_act_array_t list = NULL;
+        mach_msg_type_number_t cnt = 0;
+        int nthreads = -1;
+        if (task_threads(mach_task_self(), &list, &cnt) == KERN_SUCCESS) {
+            nthreads = (int)cnt;
+            for (mach_msg_type_number_t k = 0; k < cnt; k++) mach_port_deallocate(mach_task_self(), list[k]);
+            vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(mach_port_t));
+        }
+        mach_port_name_array_t names = NULL;
+        mach_msg_type_number_t ncnt = 0, ntypes = 0;
+        mach_port_type_array_t types = NULL;
+        int nports = -1;
+        if (mach_port_names(mach_task_self(), &names, &ncnt, &types, &ntypes) == KERN_SUCCESS) {
+            nports = (int)ncnt;
+            vm_deallocate(mach_task_self(), (vm_address_t)names, ncnt * sizeof(mach_port_name_t));
+            vm_deallocate(mach_task_self(), (vm_address_t)types, ntypes * sizeof(mach_port_type_t));
+        }
+        snprintf(b, sizeof(b), "STATS t=%ds exc=%d noreply=%d evt=%d touch=%d threads=%d ports=%d\n",
+                 i * 5, g_exc_count, g_exc_noreply, g_evt_count, g_evt_touch, nthreads, nports);
+        log_raw(b);
+        {
+            // 直接读主线程 PC：判断"点不动"是不是主线程被阻塞。
+            mach_port_t mt = main_thread_port();
+            arm_thread_state64_t mst;
+            mach_msg_type_number_t msc = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(mt, ARM_THREAD_STATE64, (thread_state_t)&mst, &msc) == KERN_SUCCESS) {
+                uintptr_t mpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(mst);
+                uintptr_t mlr = (uintptr_t)__darwin_arm_thread_state64_get_lr(mst);
+                uintptr_t mo1 = 0, mo2 = 0;
+                const char *m1 = module_for(mpc, &mo1);
+                const char *m2 = module_for(mlr, &mo2);
+                snprintf(b, sizeof(b), "  MAIN pc=%s+0x%lx lr=%s+0x%lx\n",
+                         m1 ? m1 : "?", (unsigned long)mo1,
+                         m2 ? m2 : "?", (unsigned long)mo2);
+                log_raw(b);
+            } else {
+                log_raw("  MAIN getstate failed\n");
+            }
+        }
+        if (i < 3 || i % 12 == 0) {
+            // 事件入口是否还指着我们的实现；App 实际的 UIApplication 子类是什么。
+            Class ac = objc_getClass("UIApplication");
+            id app = ((id (*)(id, SEL))objc_msgSend)((id)ac, sel_registerName("sharedApplication"));
+            Class realCls = app ? object_getClass(app) : Nil;
+            Method m = ac ? class_getInstanceMethod(ac, sel_registerName("sendEvent:")) : NULL;
+            IMP cur = m ? method_getImplementation(m) : NULL;
+            uintptr_t mo = 0;
+            const char *mn = cur ? module_for((uintptr_t)cur, &mo) : NULL;
+            snprintf(b, sizeof(b), "  EVTCHK appCls=%s sendEventIMP=%s+0x%lx\n",
+                     realCls ? class_getName(realCls) : "nil", mn ? mn : "?",
+                     (unsigned long)mo);
+            log_raw(b);
+#if AIA_EVENT_PROBE
+            if (i == 0) dump_jm_swizzles();
+#endif
+        }
+    }
+    return NULL;
+}
+
+
+// 观测事件入口：判断"点击无反应"时事件根本没送到 App，还是送到了但被丢弃。
+static void (*orig_app_sendEvent)(id, SEL, UIEvent *);
+__attribute__((unused)) static void my_app_sendEvent(id self, SEL _cmd, UIEvent *ev) {
+    static int n;
+    if (n < 200) {
+        char b[160];
+        snprintf(b, sizeof(b), "EVT UIApplication sendEvent type=%ld n=%d\n",
+                 (long)ev.type, n + 1);
+        log_raw(b);
+        n++;
+    }
+    orig_app_sendEvent(self, _cmd, ev);
+}
+
+static void (*orig_win_sendEvent)(id, SEL, UIEvent *);
+__attribute__((unused)) static void my_win_sendEvent(id self, SEL _cmd, UIEvent *ev) {
+    static int n;
+    g_evt_count++;
+    if (ev && ev.type == UIEventTypeTouches) g_evt_touch++;
+    if (n < 200) {
+        char b[200];
+        snprintf(b, sizeof(b), "EVT UIWindow sendEvent type=%ld win=%s n=%d\n",
+                 (long)ev.type, object_getClassName(self), n + 1);
+        log_raw(b);
+        n++;
+    }
+    orig_win_sendEvent(self, _cmd, ev);
+}
+
+__attribute__((unused)) static void install_event_probe(void) {
+    MSHookMessageEx(objc_getClass("UIApplication"),
+                    @selector(sendEvent:), (IMP)my_app_sendEvent, (IMP *)&orig_app_sendEvent);
+    MSHookMessageEx(objc_getClass("UIWindow"),
+                    @selector(sendEvent:), (IMP)my_win_sendEvent, (IMP *)&orig_win_sendEvent);
+    log_raw("event probe installed\n");
+}
+
+static void start_stats_thread(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, aia_stats, NULL) == 0) pthread_detach(t);
+}
+#if AIA_EXC_BAIL
+static void aia_thread_bail(void);
+#endif
+static uint64_t thread_id_of(mach_port_t th) {
+    struct thread_identifier_info tii;
+    mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT;
+    if (thread_info(th, THREAD_IDENTIFIER_INFO, (thread_info_t)&tii, &cnt) != KERN_SUCCESS) return 0;
+    return tii.thread_id;
+}
+
 static void dump_fault_state(exc_req_t *req) {
     char buf[256];
     const uint8_t *b = (const uint8_t *)req;
@@ -804,8 +983,10 @@ static void dump_fault_state(exc_req_t *req) {
     int etype = (int)*(const uint32_t *)(b + EXC_TYPE_OFF);
     mach_port_t thrPort = *(const uint32_t *)(b + EXC_THREAD_OFF);
     mach_port_t tskPort = *(const uint32_t *)(b + EXC_TASK_OFF);
+    uint64_t ftid = thread_id_of(thrPort);
     snprintf(buf, sizeof(buf),
-             "EXCFAULT id=%d size=%u thr=%u task=%u type=%d codeCnt=%u code0=%lld code1=%lld flavor=%u stateCnt=%u\n",
+             "EXCFAULT main=%d thrId=%llu mainTid=%llu id=%d size=%u thr=%u task=%u type=%d codeCnt=%u code0=%lld code1=%lld flavor=%u stateCnt=%u\n",
+             (int)(ftid && ftid == g_main_tid), (unsigned long long)ftid, (unsigned long long)g_main_tid,
              req->Head.msgh_id, req->Head.msgh_size, thrPort, tskPort, etype, codeCnt,
              (long long)code0, (long long)code1, flavor, stateCnt);
     log_raw(buf);
@@ -847,6 +1028,14 @@ static void dump_fault_state(exc_req_t *req) {
     }
 }
 
+#if AIA_EXC_BAIL
+// 故障线程被重定向到这里：直接结束该线程，让 pthread 清理路径归还它持有的锁。
+__attribute__((noinline, used)) static void aia_thread_bail(void) {
+    pthread_exit(NULL);
+    for (;;) { }
+}
+#endif
+
 __attribute__((unused)) static void *aia_exc_server(void *arg) {
     (void)arg;
     mach_msg_size_t rcv = 1024;
@@ -874,6 +1063,7 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             usleep(20000);
             continue;
         }
+        g_exc_count++;
         dump_fault_state(req);
 #if AIA_KILL_THREAD
         {
@@ -884,8 +1074,86 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             log_raw(b);
         }
 #endif
+#if AIA_EXC_BAIL
+        if (!(g_main_tid && thread_id_of(*(const uint32_t *)((const uint8_t *)req + EXC_THREAD_OFF)) == g_main_tid)) {
+            // 非主线程：送到一个只做 pthread_exit 的桩函数，让它正常结束。
+            static char buf2[sizeof(arm_thread_state64_t) + 64];
+            memcpy(buf2, (const char *)req + EXC_STATE_BODY_OFF,
+                   sizeof(arm_thread_state64_t));
+            arm_thread_state64_t *st = (arm_thread_state64_t *)buf2;
+            uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*st);
+            __darwin_arm_thread_state64_set_pc_fptr(*st, (void *)aia_thread_bail);
+            __darwin_arm_thread_state64_set_lr_fptr(*st, (void *)0);
+            st->__x[0] = 0;
+            static int bail_logged;
+            if (bail_logged < 20) {
+                char b[128];
+                snprintf(b, sizeof(b), "  bail: pc %#lx -> aia_thread_bail\n",
+                         (unsigned long)oldpc);
+                log_raw(b);
+                bail_logged++;
+            }
+            rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+            rep->Head.msgh_local_port = MACH_PORT_NULL;
+            rep->Head.msgh_id = req->Head.msgh_id + 100;
+            rep->NDR = NDR_record;
+            rep->RetCode = KERN_SUCCESS;
+            rep->new_stateCnt = 34;
+            memcpy(rep->new_state, buf2, sizeof(arm_thread_state64_t));
+            rep->Head.msgh_size = 8 + 8 + 4 + 4 + 34 * sizeof(natural_t);
+            kern_return_t sk = mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                                        MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            if (bail_logged < 20) {
+                char b[96];
+                snprintf(b, sizeof(b), "  bail: reply=%d size=%u\n", sk, rep->Head.msgh_size);
+                log_raw(b);
+            }
+            memset(req, 0, rcv + 2048);
+            continue;
+        }
+#endif
+#if AIA_EXC_SKIP_BRK
+        // 断点异常（brk / brk #0xdead 断言桩）：把 PC 推到下一条指令再回复，
+        // 线程继续执行而不是被永久挂起。这是"能启动 + 主线程不卡死"的关键。
+        {
+            const uint8_t *bb = (const uint8_t *)req;
+            int etype2 = (int)*(const uint32_t *)(bb + EXC_TYPE_OFF);
+            uint32_t flavor2 = *(const uint32_t *)(bb + EXC_FLAVOR_OFF);
+            uint32_t sc2 = *(const uint32_t *)(bb + EXC_STATE_OFF);
+            if (etype2 == 6 && flavor2 == 6 && sc2 >= 34) {
+                memcpy(rep->new_state, bb + EXC_STATE_BODY_OFF, sizeof(arm_thread_state64_t));
+                arm_thread_state64_t *nst = (arm_thread_state64_t *)rep->new_state;
+                uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
+                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)(oldpc + 4));
+                static int skip_logged;
+                if (skip_logged < 40) {
+                    char b[160];
+                    uintptr_t so = 0;
+                    const char *sm = module_for(oldpc, &so);
+                    snprintf(b, sizeof(b), "  SKIPBRK pc=%s+0x%lx -> +4\n",
+                             sm ? sm : "?", (unsigned long)so);
+                    log_raw(b);
+                    skip_logged++;
+                }
+                rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+                rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
+                rep->Head.msgh_local_port = MACH_PORT_NULL;
+                rep->Head.msgh_id = req->Head.msgh_id + 100;
+                rep->NDR = NDR_record;
+                rep->RetCode = KERN_SUCCESS;
+                rep->new_stateCnt = 34;
+                rep->Head.msgh_size = 8 + 8 + 4 + 4 + 34 * sizeof(natural_t);
+                mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                memset(req, 0, rcv + 2048);
+                continue;
+            }
+        }
+#endif
 #if AIA_EXC_NO_REPLY
         // 不回复：故障线程留在异常状态，内核不会让它继续执行，JM 的处决也不会生效。
+        g_exc_noreply++;
         memset(req, 0, rcv + 2048);
         continue;
 #endif
@@ -978,7 +1246,50 @@ static void *aia_exc_watchdog(void *arg) {
 }
 #endif
 
+// 判断某个地址是否落在 JMCodeProtectKit 里：JM 若 swizzle 了事件入口，
+// 对应方法的 IMP 就会指向这个镜像。
+static int jm_contains(uintptr_t a, uintptr_t *off) {
+    uintptr_t lo = 0;
+    const char *m = module_for(a, &lo);
+    if (m && strstr(m, "JMCodeProtectKit")) { if (off) *off = lo; return 1; }
+    return 0;
+}
+
+// 扫描一组与触摸/事件相关的类，列出 IMP 落在 JM 里的方法。
+__attribute__((unused)) static void dump_jm_swizzles(void) {
+    char buf[256];
+    const char *names[] = {
+        "UIApplication", "UIWindow", "UIView", "UIResponder", "UIControl",
+        "UIEvent", "UITouch", "UIGestureRecognizer", "UIGestureEnvironment",
+        "UIScreen", "UIWindowScene", "UIApplicationSceneSettings", NULL
+    };
+    int hits = 0;
+    for (int i = 0; names[i]; i++) {
+        Class c = objc_getClass(names[i]);
+        if (!c) continue;
+        for (int meta = 0; meta < 2; meta++) {
+            Class target = meta ? object_getClass((id)c) : c;
+            unsigned int n = 0;
+            Method *ms = class_copyMethodList(target, &n);
+            for (unsigned int k = 0; k < n; k++) {
+                IMP imp = method_getImplementation(ms[k]);
+                uintptr_t off = 0;
+                if (!jm_contains((uintptr_t)imp, &off)) continue;
+                snprintf(buf, sizeof(buf), "  SWZ %s%s%s -> JM+0x%lx\n",
+                         meta ? "+" : "-", names[i],
+                         sel_getName(method_getName(ms[k])), (unsigned long)off);
+                log_raw(buf);
+                hits++;
+            }
+            if (ms) free(ms);
+        }
+    }
+    snprintf(buf, sizeof(buf), "  SWZ total=%d\n", hits);
+    log_raw(buf);
+}
+
 #if AIA_DUMP_ON_SIGNAL
+
 static void dump_view(UIView *v, int depth) {
     if (depth > 3) return;
     char buf[320];
@@ -1013,6 +1324,7 @@ static void dump_ui_main(void) {
                  hit ? (int)hit.userInteractionEnabled : -1);
         log_raw(buf);
     }
+    dump_jm_swizzles();
     log_raw("=== UI END ===\n");
 #pragma clang diagnostic pop
 }
@@ -1043,24 +1355,42 @@ static void dump_all_threads(int sig) {
                  (void *)lr, lm ? lm : "?", (unsigned long)lo);
         log_raw(buf);
         if (i == 0) {
-            uintptr_t sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(st);
-            int got = 0;
-            for (int k = 0; k < 0x1000 / 8 && got < 22; k++) {
-                uintptr_t v = 0;
-                if (!safe_read(sp + k * 8, &v)) break;
+            // x29 帧链比栈扫描可靠：fp[0] 是上一帧 fp，fp[1] 是返回地址
+            uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(st));
+            for (int d = 0; d < 40 && fp; d++) {
+                uintptr_t prev = 0, ra = 0;
+                if (!safe_read(fp, &prev) || !safe_read(fp + 8, &ra)) break;
+                prev = aia_strip_pac(prev);
+                ra = aia_strip_pac(ra);
                 uintptr_t o2 = 0;
-                const char *m2 = module_for(v, &o2);
-                if (!m2 || o2 == 0) continue;
-                snprintf(buf, sizeof(buf), "    [%02d] %s+0x%lx\n", k, m2, (unsigned long)o2);
+                const char *m2 = module_for(ra, &o2);
+                snprintf(buf, sizeof(buf), "    fp#%02d %s+0x%lx (%p)\n", d,
+                         m2 ? m2 : "?", (unsigned long)o2, (void *)ra);
                 log_raw(buf);
-                got++;
+                if (prev <= fp) break;
+                fp = prev;
             }
+            snprintf(buf, sizeof(buf), "    x0=%#lx x1=%#lx x16=%#lx\n",
+                     (unsigned long)st.__x[0], (unsigned long)st.__x[1],
+                     (unsigned long)st.__x[16]);
+            log_raw(buf);
         }
     }
     vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
     log_raw("=== DUMP END ===\n");
 }
 #endif
+
+__attribute__((unused)) // 观测 task_info：JM 可能用 TASK_DYLD_INFO 直接读原始镜像表，绕过全部 _dyld_* hook。
+static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+static kern_return_t my_task_info(task_name_t target, task_flavor_t flavor, task_info_t info, mach_msg_type_number_t *cnt) {
+    kern_return_t r = orig_task_info(target, flavor, info, cnt);
+    const char *who = caller_desc(__builtin_return_address(0));
+    if (flavor == TASK_DYLD_INFO) {
+        aialog("task_info(TASK_DYLD_INFO) -> %d caller=%s", r, who);
+    }
+    return r;
+}
 
 __attribute__((unused)) static void install_exc_handler(void) {
     kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
@@ -1232,7 +1562,13 @@ __attribute__((constructor)) static void aiabypass_init(void) {
         sigaction(SIGTRAP, &sa, NULL);
     }
     snapshot_modules();
-    aialog("module snapshot: %d", g_mod_count);
+    {
+        struct thread_identifier_info tii;
+        mach_msg_type_number_t c = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(mach_thread_self(), THREAD_IDENTIFIER_INFO, (thread_info_t)&tii, &c) == KERN_SUCCESS)
+            g_main_tid = tii.thread_id;
+    }
+    aialog("module snapshot: %d mainTid=%llu", g_mod_count, (unsigned long long)g_main_tid);
 #if AIA_EXC_HANDLER
     install_exc_handler();
 #endif
@@ -1271,8 +1607,43 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("dladdr-mask mode");
     return;
 #endif
+#if AIA_OBSERVE_ONLY
+    MSHookFunction((void *)_dyld_image_count, (void *)my_dyld_image_count, (void **)&orig_dyld_image_count);
+    MSHookFunction((void *)_dyld_get_image_name, (void *)my_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    MSHookFunction((void *)_dyld_get_image_header, (void *)my_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    MSHookFunction((void *)_dyld_get_image_vmaddr_slide, (void *)my_dyld_get_image_slide, (void **)&orig_dyld_get_image_slide);
+    MSHookFunction((void *)_dyld_register_func_for_add_image, (void *)my_register_add_image, (void **)&orig_register_add_image);
+    MSHookFunction((void *)objc_copyImageNames, (void *)my_objc_copyImageNames, (void **)&orig_objc_copyImageNames);
+    MSHookFunction((void *)dladdr, (void *)my_dladdr, (void **)&orig_dladdr);
+    MSHookFunction((void *)stat, (void *)my_stat, (void **)&orig_stat);
+    MSHookFunction((void *)lstat, (void *)my_lstat, (void **)&orig_lstat);
+    MSHookFunction((void *)access, (void *)my_access, (void **)&orig_access);
+    MSHookFunction((void *)open, (void *)my_open, (void **)&orig_open);
+    MSHookFunction((void *)readlink, (void *)my_readlink, (void **)&orig_readlink);
+    MSHookFunction((void *)sysctl, (void *)my_sysctl, (void **)&orig_sysctl);
+    MSHookFunction((void *)getsectiondata, (void *)my_getsectiondata, (void **)&orig_getsectiondata);
+    MSHookFunction((void *)NSClassFromString, (void *)my_NSClassFromString, (void **)&orig_NSClassFromString);
+    MSHookFunction((void *)objc_getClass, (void *)my_objc_getClass, (void **)&orig_objc_getClass);
+    MSHookFunction((void *)dlsym, (void *)my_dlsym, (void **)&orig_dlsym);
+    MSHookFunction((void *)getenv, (void *)my_getenv, (void **)&orig_getenv);
+    MSHookFunction((void *)exit, (void *)my_exit, (void **)&orig_exit);
+    MSHookFunction((void *)_exit, (void *)my_Exit, (void **)&orig_Exit);
+    MSHookFunction((void *)abort, (void *)my_abort, (void **)&orig_abort);
+    MSHookFunction((void *)kill, (void *)my_kill, (void **)&orig_kill);
+    MSHookFunction((void *)task_info, (void *)my_task_info, (void **)&orig_task_info);
+    aialog("observe-only mode: safe hook subset installed");
+    return;
+#endif
 #if AIA_EMPTY
-    aialog("empty mode: no hooks");
+    // 观测模式：不装任何会改变行为的 hook，只额外记录 task_info 与资源统计。
+    MSHookFunction((void *)task_info, (void *)my_task_info, (void **)&orig_task_info);
+#if AIA_EVENT_PROBE
+    install_event_probe();
+    aialog("empty mode: no hooks (含事件观测)");
+#else
+    aialog("empty mode: no hooks (无事件观测)");
+#endif
+    start_stats_thread();
     return;
 #endif
 
@@ -1367,5 +1738,7 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     MSHookFunction((void *)dlsym, (void *)my_dlsym, (void **)&orig_dlsym);
     MSHookFunction((void *)getenv, (void *)my_getenv, (void **)&orig_getenv);
 
+    MSHookFunction((void *)task_info, (void *)my_task_info, (void **)&orig_task_info);
     aialog("hooks installed; image_count=%u", orig_dyld_image_count ? orig_dyld_image_count() : 0);
+    start_stats_thread();
 }
