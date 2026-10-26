@@ -205,6 +205,11 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_FS_PROBE 0
 #endif
 
+// 1 = 拦截发给非法接收者的 objc 消息，记录调用者并返回 nil。
+#ifndef AIA_MSGSEND_PROBE
+#define AIA_MSGSEND_PROBE 0
+#endif
+
 // 1 = 过滤 sysctl(KERN_PROC_ALL) 返回的进程列表，抹掉 Sileo/jailbreakd/sshd 等项。
 #ifndef AIA_PROC_FILTER
 #define AIA_PROC_FILTER 0
@@ -1182,6 +1187,37 @@ static void install_proc_filter(void) {
 }
 #else
 __attribute__((unused)) static void install_proc_filter(void) {}
+#endif
+
+#if AIA_MSGSEND_PROBE
+// 处决现场的共同形状：x0=4、x1=+[NSThread isMainThread]、pc=lr=0x8，
+// 也就是"向一个非法接收者发消息"。这里在 objc_msgSend 入口检查接收者，
+// 只要它不是一个合法的指针（低于 0x10000），就把发送者记下来。
+// 记录是次要目的；主要目的是让这次消息直接返回 nil，使线程不跳飞。
+static int g_msg_hits;
+static int (*orig_msg_send)(id, SEL, ...);
+
+__attribute__((noinline, used)) static id aia_msg_send_probe(id self, SEL _cmd, ...) {
+    if ((uintptr_t)self < 0x10000) {
+        if (g_msg_hits < 30) {
+            char b[224];
+            snprintf(b, sizeof(b), "MSGSEND self=%#lx sel=%s caller=%s\n",
+                     (unsigned long)self, _cmd ? sel_getName(_cmd) : "?",
+                     caller_desc(__builtin_return_address(0)));
+            log_raw(b);
+            g_msg_hits++;
+        }
+        return nil;
+    }
+    return ((id (*)(id, SEL))orig_msg_send)(self, _cmd);
+}
+
+static void install_msgsend_probe(void) {
+    MSHookFunction((void *)objc_msgSend, (void *)aia_msg_send_probe, (void **)&orig_msg_send);
+    log_raw("MSGSEND probe installed\n");
+}
+#else
+__attribute__((unused)) static void install_msgsend_probe(void) {}
 #endif
 
 static void log_backtrace(const char *tag) {
@@ -3390,6 +3426,9 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_PROC_FILTER
     install_proc_filter();
+#endif
+#if AIA_MSGSEND_PROBE
+    install_msgsend_probe();
 #endif
 #if AIA_EXCPORT_PROBE
     install_excport_probe();
