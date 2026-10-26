@@ -1,5 +1,19 @@
 # AIABypass 更新日志
 
+## 1.0.0
+
+首个发布版。目标 App 友邦友享（`com.aia.china.YoubangHealthRelease`）6.9.33，在 rootless 越狱（Dopamine + ElleKit）环境下不再一打开就闪退，首页加载、5 个 tab 切换、滚动、前后台往返均正常，连续三次冷启动验证通过。
+
+- **闪退根因**：App 内置的 `JMCodeProtectKit.framework` 是 RASP 组件，它在启动早期判定环境并主动处决进程。处决方式是两段固定故障——7ms 时破坏对象 `isa` 后发 Objective-C 消息（`pc=lr=0x8`），12ms 时给出 `pc=lr=0xeee1` 的 SIGUSR1。
+- **主要手段是接管 Mach 异常端口**：把 `EXC_BAD_ACCESS`/`EXC_BAD_INSTRUCTION`/`EXC_BREAKPOINT` 收到自己的端口上，处决跳转不回复，触发线程停在异常状态，进程不再被自杀。`brk` 断言类异常改为推进 4 字节继续执行，并在信号层补一次 `SIGTRAP` 跳过。
+- **修掉主线程跳飞**：主二进制的 ijm 导入绑定器会用 `[meta+0x48]` 指向的缓存槽挑解析器，而这个槽运行时被 JM 自己占着，于是 JM 拿主二进制的字节码套自己的分派表解释，越界后跳飞。默认配置把该槽清零（`AIA_IJM_RESOLVER=2`），绑定器回退到 App 自己的解析器，主线程异常归零。
+- **发布版不再留自身痕迹**：`AIA_DEBUG_LOG` 默认关闭，不创建 `aiabypass.log`，也不再启动每 5 秒枚举线程与端口的统计线程。需要排查时用 `ADDITIONAL_OBJCFLAGS="-DAIA_DEBUG_LOG=1"` 重新构建。
+- **已知边界**：越狱判定本身没有被绕过，是「接住」而不是「通过」。判定发生在 JM 初始化时，早于任何 tweak 代码（JM 是主程序依赖，而 tweak 由 ellekit 追加在加载命令末尾），所以启动期仍有 2 次处决，由异常端口接住。把 systemhook 改写过、指向越狱库的 7 个 GOT 槽全部还原后处决次数不变，已确认这些条目不是触发点。详见 `analysis.md` 第 41–54 节。
+
+## 0.0.7
+
+> 0.0.8–0.0.90 是诊断迭代，未发布，结论汇总在 1.0.0 与本文件下方条目中。
+
 ## 0.0.7
 
 - **查清 JM 的检查项是什么**。钩住 `JM+0x14fc40` 后可以看到，每次调用传入的是 0x48 字节的节描述结构：`sectname[16]`、`segname[16]`、`addr`、`size`。启动期一共调用 50 次，正好是 25 个 App 内嵌镜像各查 `__got` 与 `__la_symbol_ptr` 两个节，也就是逐镜像的导入表完整性校验。

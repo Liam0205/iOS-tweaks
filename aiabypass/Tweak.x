@@ -39,8 +39,11 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #import <mach/thread_act.h>
 #import <mach/ndr.h>
 
+// 发布默认 0：日志文件写在 App 自己的 Documents 里，"aiabypass.log" 这个名字
+// 本身就是一处显眼的痕迹，不值得为了排查能力在正式版里留着。
+// 定位问题时用 ADDITIONAL_OBJCFLAGS="-DAIA_DEBUG_LOG=1" 重新构建。
 #ifndef AIA_DEBUG_LOG
-#define AIA_DEBUG_LOG 1
+#define AIA_DEBUG_LOG 0
 #endif
 
 // 实验开关：1 = 从 dyld 枚举里隐藏注入库；0 = 只观测不隐藏
@@ -1970,6 +1973,10 @@ __attribute__((unused)) static void install_event_probe(void) {
 }
 
 static void start_stats_thread(void) {
+#if !AIA_DEBUG_LOG
+    // 正式版不跑统计线程：它每 5 秒枚举线程与端口，纯为排查服务。
+    return;
+#endif
     static int started;
     if (started) return;
     started = 1;
@@ -3925,9 +3932,11 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 
     {
+#if AIA_DEBUG_LOG
         NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSString *lp = [dir stringByAppendingPathComponent:@"aiabypass.log"];
         g_logfd = open([lp fileSystemRepresentation], O_WRONLY | O_APPEND);
+#endif
         struct sigaction sa = {0};
         sa.sa_sigaction = crash_signal_handler;
         sa.sa_flags = SA_SIGINFO;
