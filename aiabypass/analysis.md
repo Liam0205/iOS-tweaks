@@ -349,6 +349,18 @@ arm64e 上栈里保存的返回地址带 PAC 签名，直接喂给 `module_for` 
 
 之前"密钥 0 才解得出合法 opcode"的推断要推翻——JM 的脚本本来就是用 `0xff` 加密的。跳飞的原因是游标错位，不是密钥错。
 
+### 32. 高频轮询探针会触发系统的唤醒限制，把 App 杀掉
+
+`IJMKEY` 探针最初按 5 ms 轮询、跑 5 分钟，累计唤醒次数超过系统给 App 的预算，进程被直接杀掉。`CrashReporter` 里留下的是 `KYHAppStore.wakeups_resource-*.ips`，不是崩溃报告。
+
+这个现象很容易被误读成"JM 检测到东西并退出了"，因为日志同样是在某一行之后戛然而止。排查时先看 `CrashReporter` 里有没有 `wakeups_resource` / `cpu_resource` 这类报告：
+
+```
+ls -t /var/mobile/Library/Logs/CrashReporter/ | head
+```
+
+探针一律低频采样（1 秒一次、有限次数），不要用毫秒级轮询。
+
 ## 当前状态
 
 **能启动、能进首页、能连续交互，且不再出现主线程卡死。**

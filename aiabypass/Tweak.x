@@ -2286,7 +2286,7 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
 // 由某个检测结果把全局置成了非 0。
 //   0 = 不干预   1 = 只观测   2 = 持续把它压回 0
 #ifndef AIA_IJM_KEY
-#define AIA_IJM_KEY 1
+#define AIA_IJM_KEY 0
 #endif
 
 #ifndef AIA_IJM_RESOLVER
@@ -2503,10 +2503,13 @@ static void start_ijm_key_watch(void) {
         char b[160];
         uint64_t last = ~0ULL;
         int changes = 0;
-        for (int i = 0; i < 60000; i++) {
+        // 采样必须很低频。先前按 5 ms 轮询 5 分钟，累计唤醒次数触发了系统的
+        // wakeups_resource 限制，App 直接被杀掉（CrashReporter 里有
+        // KYHAppStore.wakeups_resource-*.ips）。改成 1 秒一次、只跑 60 次。
+        for (int i = 0; i < 60; i++) {
             uint64_t v = *p;
             if (v != last) {
-                snprintf(b, sizeof(b), "IJMKEY t=%.2fs = %#llx\n", i * 0.005, (unsigned long long)v);
+                snprintf(b, sizeof(b), "IJMKEY t=%ds = %#llx\n", i, (unsigned long long)v);
                 log_raw(b);
                 last = v;
                 if (++changes > 40) break;
@@ -2514,7 +2517,7 @@ static void start_ijm_key_watch(void) {
 #if AIA_IJM_KEY >= 2
             if (v) { *p = 0; }
 #endif
-            usleep(5000);
+            sleep(1);
         }
         snprintf(b, sizeof(b), "IJMKEY watch end value=%#llx\n", (unsigned long long)*p);
         log_raw(b);
