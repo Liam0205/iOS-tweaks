@@ -466,6 +466,125 @@ PROCSELF 查询失败 r=-1 errno=1 (EPERM) len=0
 
 另外，点「友保障」「我的」等需要身份的页面会拉起**微信**登录；如果那台设备的微信自己未登录，就会停在微信的扫码页。这时左上角状态栏会显示「◀ 友邦友享」。这属于正常跳转，不是卡死。
 
+## 41. GOT 命中的来源查清：systemhook 自己在镜像装载时改写，不是我们的 hook
+
+开启 `AIA_GOT_AUDIT` 后，主二进制的 `__got` 有 5 个槽、`__la_symbol_ptr` 有 1 个槽，`MPIDRSSDK` 的 `__la_symbol_ptr` 有 1 个槽，都指向 `systemhook.dylib` 内部地址。原始值与映像基址实测如下：
+
+```
+GOTHIT KYHAppStore __got+0x1dc8 raw=0x108726ad8 -> systemhook+0x6ad8
+GOTHIT KYHAppStore __got+0x1dd0 raw=0x108726bd0 -> systemhook+0x6bd0
+GOTHIT KYHAppStore __got+0x1e08 raw=0x108726eb0 -> systemhook+0x6eb0
+GOTHIT KYHAppStore __got+0x25e0 raw=0x1087265a8 -> systemhook+0x65a8
+GOTHIT KYHAppStore __got+0x2738 raw=0x108726f0c -> systemhook+0x6f0c
+GOTHIT KYHAppStore __la_symbol_ptr+0x1ea8 -> systemhook（对应 _dlopen）
+GOTHIT MPIDRSSDK   __la_symbol_ptr+0xdb0  -> systemhook（对应 _dlopen）
+appBase=0x10410c000 shBase=0x108720000
+```
+
+三点结论：
+
+- 这 7 个槽在构造函数运行时就已经是 systemhook 的地址，早于我们装任何 hook。
+- 故意多挂 `getenv`/`sysctl`/`stat`/`access` 四个透传 hook，命中数仍是 7，说明我们的 `MSHookFunction` 不会给 App 的 GOT 添条目；这些条目是 systemhook 装载镜像时自己写进去的。
+- 5 个 `__got` 槽在主二进制里没有对应的 dyld 绑定记录（`LC_DYLD_INFO_ONLY` 的 bind 流里查不到这几个偏移），磁盘上也是 0。App 自己的 ijm 处理器代码（`KYHAppStore+0x2ada300` 一带）会 `ldr` 这些槽，把它们当函数指针用。
+
+**早期一个错误结论要更正**：先前"零 hook 对照命中 0 条"并不是真的干净，而是诊断工具的假象——`module_for` 依赖 `snapshot_modules()` 填的模块表，在快照之前调用一律返回 NULL，于是所有条目都被判为"不是越狱库"。补上分时点审计后可以看得很清楚：命中数在 `post-logfile` 时是 0、`post-snapshot` 时变成 7，变的只是解析能力，内存内容没变。
+
+## 42. 直接还原这 7 个槽会让 App 立刻退出
+
+`AIA_GOT_RESTORE=1` 把 5 个 `__got` 槽写回磁盘值 0，把两个 `_dlopen` 槽写回 `dlsym(RTLD_DEFAULT, "dlopen")` 的返回值。实测：
+
+```
+GOTRESTORE KYHAppStore __got+0x1dc8 0x108ad6ad8 -> 0
+... 5 条同类 ...
+GOTRESTORE 完成，还原 7 个槽
+GOTHIT 汇总：命中 2 条        ← 两个 dlopen 槽仍是 systemhook 地址
+```
+
+进程随后退出（`alive=0`）。所以这 5 个槽在启动早期确实会被调用，清零等于把 App 自己的导入函数指针打断。同时说明 `dlsym(RTLD_DEFAULT, "dlopen")` 也返回 systemhook 的地址，没法用它还原。
+
+还原这条路要成立，前提是先知道这 5 个槽对应的原始函数。目前还没拿到。
+
+## 43. 几条被排除的猜测
+
+- **App 不用 `dlsym`**：`AIA_DLSYM_PROBE=1` 挂住 `dlsym` 并记录所有调用方，实测启动到首屏稳定后调用次数为 0。
+- **JM 处决不走 `kill`/`raise`/`pthread_kill`**：`AIA_KILL_PROBE=1` 三个都挂住，一次调用都没记录到，但 `SIGUSR1` 仍然送达（现场 `pc=lr=0xeee1`）。说明这条信号走的是更底层的手段，或者由别的进程/线程投递。
+
+## 44. 检查项的结构和数量
+
+钩住 `JM+0x14fc40` 后可以确认，每次调用传入的 `x1` 指向一个 0x48 字节的结构：
+
+```
+char sectname[16];   // "__got" / "__la_symbol_ptr"
+char segname[16];    // "__DATA_CONST" / "__DATA"
+uint64_t addr;       // 节的运行时地址（主二进制）或节内偏移（内嵌框架）
+uint64_t size;
+```
+
+50 次调用 = 25 个 App 内嵌镜像 × 2 个节。也就是说 JM 逐镜像核对 `__got` 与 `__la_symbol_ptr`，正是完整性校验。
+
+## 45. 处决线程的栈上有可用的 JM 返回地址
+
+`pc=lr=0x8` 那次现场，栈扫描打出 6 个落在 JM 内部的地址：`JM+0x11c4ac`、`JM+0x11c720`、`JM+0x15063c`、`JM+0x15298c`、`JM+0x16773c`、`JM+0x180100`、`JM+0x1818b8`、`JM+0x1829ac`（`__text` 范围 0x117d44–0x19f918）。帧指针确实被破坏，但栈上的返回地址还在，后续可以据此往上找发起处决的那一段。
+
+## 46. 构建陷阱：改编译开关必须先 `make clean`
+
+用不同的 `ADDITIONAL_OBJCFLAGS` 直接增量构建，产物会缺 `__DATA` 段（实测 88640 字节降到 33888 字节），装到设备上 App 会在 dyld 阶段直接退出，连构造函数里的日志都写不出来，表现为"日志文件 0 字节、进程不在"。改开关时一律 `make clean` 后再构建。
+
+## 47. 阶段结论
+
+- 默认构建连续三次启动都是 `exc=2 alive=1`，App 可用，主线程异常 0 次。
+- 越狱检测仍未真正通过。已经确认 JM 在逐镜像核对 `__got`/`__la_symbol_ptr`，而 systemhook 在主二进制和 `MPIDRSSDK` 里留下了 7 个指向自己的条目；但直接还原这些条目会让 App 崩溃，且 5 个 `__got` 槽对应的原始符号还没确定。
+- 两条处决（`pc=lr=0x8`、`pc=lr=0xeee1`）仍由异常端口接住，而非被消除。
+
+## 48. 7 个槽对应的符号查出来了
+
+槽里存的是 systemhook 的地址，而 systemhook 对自己挂过的符号经 `dlsym` 会返回同一个地址。逐个比对候选符号后可以精确对上：
+
+| 槽 | systemhook 地址 | 符号 |
+|---|---|---|
+| `KYHAppStore __got+0x1dc8` | `+0x6ad8` | `dlopen` |
+| `KYHAppStore __got+0x1dd0` | `+0x6bd0` | `dlopen_preflight` |
+| `KYHAppStore __got+0x1e08` | `+0x6eb0` | `fork` |
+| `KYHAppStore __got+0x25e0` | `+0x65a8` | `posix_spawn` |
+| `KYHAppStore __got+0x2738` | `+0x6f0c` | `vfork` |
+| `KYHAppStore __la_symbol_ptr+0x1ea8` | `+0x6ad8` | `dlopen` |
+| `MPIDRSSDK __la_symbol_ptr+0xdb0` | `+0x6ad8` | `dlopen` |
+
+参照对照：`execve`→`+0x665c`、`execv`→`+0x6974`、`execvp`→`+0x6a88`、`execl`→`+0x68d4`、`execle`→`+0x6704`、`ptrace`→`+0x6ca0`、`posix_spawnp`→`+0x65bc`。
+
+主二进制导入的相关符号正好是这 6 个：`dlopen`、`dlopen_preflight`、`fork`、`pthread_atfork`、`posix_spawn`、`vfork`（`llvm-nm -u` 可查）。也就是说，systemhook 把 App 的 fork/vfork/posix_spawn/dlopen 全部换成了自己的实现。
+
+## 49. 把 7 个槽全部还原，App 稳定，但处决次数不变
+
+按上面的符号表，用自己解析 `__LINKEDIT` 符号表的方式拿到未被劫持的地址（不能用 `dlsym`，它返回的就是 systemhook 的地址），写回 7 个槽：
+
+```
+GOTRESTORE KYHAppStore __got+0x1dc8 0x10868ead8 -> 0x1a8f8d118   (dlopen)
+GOTRESTORE KYHAppStore __got+0x1dd0 0x10868ebd0 -> 0x1a8f8d2a0   (dlopen_preflight)
+GOTRESTORE KYHAppStore __got+0x1e08 0x10868eeb0 -> 0x1b43bf5e4   (fork)
+GOTRESTORE KYHAppStore __got+0x25e0 0x10868e5a8 -> 0x1e0da8740   (posix_spawn)
+GOTRESTORE KYHAppStore __got+0x2738 0x10868ef0c -> 0x1b43c5640   (vfork)
+GOTRESTORE KYHAppStore __la_symbol_ptr+0x1ea8 -> 0x1a8f8d118
+GOTRESTORE MPIDRSSDK   __la_symbol_ptr+0xdb0  -> 0x1a8f8d118
+```
+
+连续三次启动都是 `exc=2 alive=1`，与不还原时完全一样。**结论：这 7 个 GOT 条目不是处决的触发点。** 之后 JM 的 50 项检查照样跑完，两次处决照样发生。
+
+解析符号表时踩到一个坑：共享缓存里的镜像，`symoff`/`stroff` 是缓存文件内的偏移，直接按镜像头加会读到未映射区域并段错误。要按 `__LINKEDIT` 段的 `vmaddr + (off - fileoff) + slide` 换算，并先用 `fileoff..fileoff+filesize` 做范围校验。
+
+## 50. 两次处决发生在进程启动后 7ms 和 12ms
+
+给异常和信号日志加上相对构造函数的时间戳后，连续三次运行都是同一个时刻：
+
+```
+EXCFAULT t=7ms  ... code0=1 code1=8        (pc=lr=0x8，isa 破坏)
+EXCFAULT t=12ms ... code0=257 code1=61153  (SIGUSR1，pc=lr=0xeee1)
+```
+
+两次都落在进程刚起来的十几毫秒内，远早于 JM 的 50 项 GOT 检查（那批检查在我们的构造函数装好钩子之后才跑）。这与第 49 节的实测互相印证：判定不是 GOT 检查做出的，而是在更早的阶段。
+
+要真正"通过"，只有两条路：一是让 JM 在它做判定的那一刻看不到越狱痕迹（比我们的 dylib 构造函数更早，需要调整注入时的加载顺序），二是找到发起处决的那段 JM 代码并在那里改结果。两者都还没做。
+
 ## 可复现的实验开关
 
 `Tweak.x` 里的编译期开关，用 `ADDITIONAL_OBJCFLAGS` 传入：

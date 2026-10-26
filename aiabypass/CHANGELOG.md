@@ -1,5 +1,19 @@
 # AIABypass 更新日志
 
+## 0.0.7
+
+- **查清 JM 的检查项是什么**。钩住 `JM+0x14fc40` 后可以看到，每次调用传入的是 0x48 字节的节描述结构：`sectname[16]`、`segname[16]`、`addr`、`size`。启动期一共调用 50 次，正好是 25 个 App 内嵌镜像各查 `__got` 与 `__la_symbol_ptr` 两个节，也就是逐镜像的导入表完整性校验。
+- **查清 GOT 命中的来源**。开启 `AIA_GOT_AUDIT` 时命中的 7 条（主二进制 `__got` 5 条、`__la_symbol_ptr` 1 条，`MPIDRSSDK` 的 `__la_symbol_ptr` 1 条）全部指向 `systemhook.dylib`，而且在我们的构造函数跑起来之前就已经写好。故意多挂四个透传 hook 后命中数仍是 7，说明不是我们的 `MSHookFunction` 造成的，而是 systemhook 装载镜像时自己改写的。
+- **更正一个诊断假象**。此前"零 hook 对照命中 0 条"的说法不成立：`module_for` 依赖 `snapshot_modules()` 填的模块表，在快照之前调用一律返回 NULL，所有条目都被判成"不是越狱库"。补上分时点审计后，命中数在快照前后从 0 变成 7，变的只是解析能力，内存内容没变。
+- **排除两条还原路径**。把 5 个 `__got` 槽写回磁盘值 0 会让 App 立刻退出，说明这些槽启动早期就会被调用；`dlsym(RTLD_DEFAULT, "dlopen")` 返回的仍是 systemhook 的地址，也没法用来还原 `__la_symbol_ptr`。
+- **排除两条猜测**。App 完全不调用 `dlsym`（挂住 `dlsym` 后启动到首屏调用次数为 0）；JM 处决也不走 `kill`/`raise`/`pthread_kill`（三个都挂住，一次调用都没有），但 `SIGUSR1` 照样送达。
+- **新增四个诊断开关**（全部默认关闭）：`AIA_GOT_RESTORE`（还原被 systemhook 改写的槽）、`AIA_DLSYM_PROBE`、`AIA_KILL_PROBE`、`AIA_EXTRA_HOOKS`。
+- 记录构建陷阱：改动 `ADDITIONAL_OBJCFLAGS` 必须先 `make clean`，否则产物缺 `__DATA` 段，App 在 dyld 阶段直接退出，连日志都写不出来。
+- **查出 7 个槽对应的函数**。systemhook 对自己挂过的符号经 `dlsym` 会返回同一地址，逐个比对候选符号后确认：5 个 `__got` 槽分别是 `dlopen`、`dlopen_preflight`、`fork`、`posix_spawn`、`vfork`，两个 `__la_symbol_ptr` 槽都是 `dlopen`。主二进制导入的相关符号正好就是这 6 个，systemhook 把它们全部换成了自己的实现。
+- **把 7 个槽全部还原后，处决次数不变**。用自解析 `__LINKEDIT` 符号表的方式取得未被劫持的地址（不能用 `dlsym`，它返回的就是 systemhook 的地址）写回后，App 连续三次启动都稳定，`exc` 仍然是 2。说明这些 GOT 条目不是处决的触发点。
+- **两次处决发生在进程启动后 7ms 和 12ms**。加上相对时间戳后，三次运行都是同一时刻，远早于 JM 的 50 项 GOT 检查。判定不是这批检查做出的。
+- 实测默认构建连续三次启动均为 `exc=2 alive=1`，App 可用。**检测本身仍未真正通过**：两条处决（`pc=lr=0x8`、`pc=lr=0xeee1`）仍由异常端口接住，而不是被消除。要让判定本身不成立，需要在比 tweak 构造函数更早的阶段介入加载顺序，或者定位到发起处决的那段 JM 代码。
+
 ## 0.0.6
 
 - **查清主线程跳飞的真正成因：解析器槽被 JM 占了**。主二进制的 ijm 导入绑定器 `KYHAppStore+0x7c5508` 在缓存槽为空时，会读元数据 `[meta+0x48]` 指向的 `__DATA` 槽（偏移 `0x4058008`）。运行时读出来是 `JMCodeProtectKit+0x1865dc`，也就是 JM 自己的解析器。它拿主二进制的字节码，用 JM 的分派表和索引去解释，越界后把代码字节当表项偏移，跳到未映射地址。故障现场 `x2` 恒为 `KYHAppStore+0x7c558c`（绑定器 `blr` 的返回点），两条证据互相印证。此前记的"绑定器慢路径本来就坏"要修正：慢路径之所以从没走通，是因为槽一直被 JM 占着。

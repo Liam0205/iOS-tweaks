@@ -205,6 +205,37 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_FS_PROBE 0
 #endif
 
+// 1 = 拦掉 systemhook 的 GOT 重绑定（_litehook_apply_global_rebinds）。
+#ifndef AIA_BLOCK_LITEHOOK
+#define AIA_BLOCK_LITEHOOK 0
+#endif
+
+// 1 = 审计 App 内嵌框架的 __got/__la_symbol_ptr，找指向越狱注入库的条目。
+#ifndef AIA_GOT_AUDIT
+#define AIA_GOT_AUDIT 0
+#endif
+
+// 1 = 跟踪 JM 的检查项求值函数 JM+0x14fc40，转储每一项的内容。
+#ifndef AIA_CHECK_TRACE
+#define AIA_CHECK_TRACE 0
+#endif
+#ifndef AIA_DLSYM_PROBE
+#define AIA_DLSYM_PROBE 0
+#endif
+#ifndef AIA_EXTRA_HOOKS
+#define AIA_EXTRA_HOOKS 0
+#endif
+#ifndef AIA_GOT_RESTORE
+#define AIA_GOT_RESTORE 0
+#endif
+#ifndef AIA_KILL_PROBE
+#define AIA_KILL_PROBE 0
+#endif
+// 1 = 连 __got 里的 5 个槽也一起还原（实测会让 App 立刻退出）
+#ifndef AIA_GOT_RESTORE_GOT
+#define AIA_GOT_RESTORE_GOT 0
+#endif
+
 // 1 = 拦截发给非法接收者的 objc 消息，记录调用者并返回 nil。
 #ifndef AIA_MSGSEND_PROBE
 #define AIA_MSGSEND_PROBE 0
@@ -261,6 +292,9 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #ifndef AIA_TRULY_EMPTY
 #define AIA_TRULY_EMPTY 0
 #endif
+#ifndef AIA_TE_HOOK
+#define AIA_TE_HOOK 0
+#endif
 
 // 空 tweak：只记录构造，不安装任何 hook，用来判断 RASP 是否只检测镜像存在。
 #ifndef AIA_EMPTY
@@ -293,6 +327,7 @@ static void log_backtrace(const char *tag);
 static const char *caller_desc(void *ra);
 static const char *aia_real_ptr(uintptr_t v, uintptr_t *real_out, uintptr_t *off_out);
 static const char *module_for(uintptr_t addr, uintptr_t *offset);
+static uintptr_t module_base_for(const char *needle, uintptr_t *size_out);
 static __thread bool t_in_safe_read;
 static bool caller_is_jb_infra(void *ra);
 static void aialog(const char *fmt, ...) {
@@ -681,8 +716,20 @@ static char *my_getenv(const char *name) {
 // ============================================================
 
 static int g_logfd = -1;
+static uint64_t g_t0 = 0;
+static uint64_t up_ms(void) {
+    if (!g_t0) return 0;
+    return (mach_absolute_time() - g_t0) / 1000000ULL;
+}
+// 多条日志线程并发写同一个 fd 时会互相穿插，把整行切碎，
+// 之前好几处诊断就是因为这个读不出来。加一把锁保证整行原子落盘。
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static void log_raw(const char *s) {
-    if (g_logfd >= 0) { ssize_t n = strlen(s); (void)!write(g_logfd, s, n); }
+    if (g_logfd < 0) return;
+    pthread_mutex_lock(&g_log_lock);
+    ssize_t n = strlen(s);
+    (void)!write(g_logfd, s, n);
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 #define AIA_MAX_MODULES 1024
@@ -761,8 +808,8 @@ static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
     uintptr_t fp = uc->uc_mcontext->__ss.__fp;
     uintptr_t off = 0;
     const char *m = module_for(pc, &off);
-    snprintf(buf, sizeof(buf), "SIGNAL %d code=%d addr=%p pc=%p(%s+0x%lx) lr=%p sp=%p fp=%p exc=%d noreply=%d\n",
-             sig, si ? si->si_code : -1, si ? si->si_addr : NULL,
+    snprintf(buf, sizeof(buf), "SIGNAL t=%llums %d code=%d addr=%p pc=%p(%s+0x%lx) lr=%p sp=%p fp=%p exc=%d noreply=%d\n",
+             (unsigned long long)up_ms(), sig, si ? si->si_code : -1, si ? si->si_addr : NULL,
              (void *)pc, m ? m : "?", (unsigned long)off,
              (void *)lr, (void *)uc->uc_mcontext->__ss.__sp, (void *)fp,
              g_exc_count, g_exc_noreply);
@@ -1220,6 +1267,350 @@ static void install_msgsend_probe(void) {
 __attribute__((unused)) static void install_msgsend_probe(void) {}
 #endif
 
+#if AIA_CHECK_TRACE
+// JM 的检查调度循环（JM+0x11a708 一带）对每个检查项调用 0x14fc40 求值：
+//   x0 = 上下文, x1 = 检查项 + 0x48, x2 = 另一上下文,
+//   x3/x4 = 成对参数, x5 = 参数
+// 在这里把每一项的原始字节打出来，就能拿到"它到底在查什么"的清单。
+static uint64_t (*ct_orig)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static int g_ct_n;
+
+__attribute__((noinline, used)) static uint64_t ct_entry(uint64_t x0, uint64_t x1, uint64_t x2,
+                                                          uint64_t x3, uint64_t x4, uint64_t x5) {
+    if (g_ct_n < 120) {
+        char b[512];
+        size_t n = 0;
+        n += (size_t)snprintf(b, sizeof(b), "CHECK #%d x1=%#llx x0=%#llx x2=%#llx x3=%#llx x5=%#llx |",
+                              g_ct_n, (unsigned long long)x1, (unsigned long long)x0,
+                              (unsigned long long)x2, (unsigned long long)x3,
+                              (unsigned long long)x5);
+        for (int k = 0; k < 6 && n < sizeof(b) - 24; k++) {
+            uintptr_t w = 0;
+            if (!safe_read((uintptr_t)x1 + (uintptr_t)k * 8, &w)) break;
+            n += (size_t)snprintf(b + n, sizeof(b) - n, " %lx", (unsigned long)w);
+        }
+        snprintf(b + n, sizeof(b) - n, "\n");
+        log_raw(b);
+        // 前几个项的邻近字节里若出现可打印串，也记下来。
+        for (int k = 0; k < 4; k++) {
+            uintptr_t p = 0;
+            if (!safe_read((uintptr_t)x1 + (uintptr_t)k * 8, &p)) break;
+            char s2[256];
+            size_t m = 0;
+            int printable = 1;
+            for (int j = 0; j < 48; j++) {
+                uintptr_t cb = 0;
+                if (!safe_read(p + (uintptr_t)j, &cb)) { printable = 0; break; }
+                char c = (char)(cb & 0xff);
+                if (c == 0) break;
+                if (c < 0x20 || c > 0x7e) { printable = 0; break; }
+                s2[m++] = c;
+            }
+            if (printable && m >= 4) {
+                s2[m] = 0;
+                char b2[320];
+                snprintf(b2, sizeof(b2), "  CHECKSTR #%d [%d] \"%s\"\n", g_ct_n, k, s2);
+                log_raw(b2);
+            }
+        }
+        g_ct_n++;
+    }
+    uint64_t rv = ct_orig(x0, x1, x2, x3, x4, x5);
+    if (g_ct_n <= 130) {
+        char rb[512];
+        uintptr_t bo = 0;
+        const char *bm = module_for(x2, &bo);
+        uintptr_t o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+        safe_read((uintptr_t)rv, &o0);
+        safe_read((uintptr_t)rv + 8, &o1);
+        safe_read((uintptr_t)rv + 0x10, &o2);
+        safe_read((uintptr_t)rv + 0x18, &o3);
+        snprintf(rb, sizeof(rb), "  CHKRET %s+0x%lx -> %#llx [%lx %lx %lx %lx]\n",
+                 bm ? bm : "?", (unsigned long)bo, (unsigned long long)rv,
+                 (unsigned long)o0, (unsigned long)o1, (unsigned long)o2, (unsigned long)o3);
+        log_raw(rb);
+    }
+    return rv;
+}
+
+static void install_check_trace(void) {
+    uintptr_t jm = module_base_for("JMCodeProtectKit", NULL);
+    if (!jm) { log_raw("CHECKTRACE no JM base\n"); return; }
+    MSHookFunction((void *)(jm + 0x14fc40), (void *)ct_entry, (void **)&ct_orig);
+    log_raw("CHECKTRACE installed\n");
+}
+#else
+__attribute__((unused)) static void install_check_trace(void) {}
+#endif
+
+#if AIA_GOT_AUDIT
+// JM 的检查项是各框架 __got / __la_symbol_ptr 的完整性。
+// 这里自己走一遍：把每个 App 内嵌框架的这两个节逐项检查，
+// 看有没有条目指向越狱注入库（systemhook / libinjector / libellekit / 我们自己的 dylib）。
+// 若有，那就是 JM 判定的直接依据，修法也明确：把条目还原。
+static BOOL addr_in_jb(const char *mod) {
+    if (!mod) return NO;
+    return strstr(mod, "systemhook") || strstr(mod, "libinjector") ||
+           strstr(mod, "libellekit") || strstr(mod, "ellekit") ||
+           strstr(mod, "AIABypass") || strstr(mod, "TweakInject") ||
+           strstr(mod, "procursus") || strstr(mod, "preboot");
+}
+
+static void got_audit(void) {
+    uint32_t nimg = _dyld_image_count();
+    int hits = 0, imgs = 0;
+    char b[288];
+    for (uint32_t i = 0; i < nimg; i++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!mh || mh->magic != 0xfeedfacf) continue;
+        // 只审 App 内嵌框架与主二进制。
+        if (!nm || !strstr(nm, "KYHAppStore.app")) continue;
+        imgs++;
+        const uint8_t *p = (const uint8_t *)(mh + 1);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmdsize == 0) break;
+            if (lc->cmd == 0x19 /* LC_SEGMENT_64 */) {
+                const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+                uint32_t ns = sg->nsects;
+                for (uint32_t k = 0; k < ns; k++, sc++) {
+                    const char *sect = sc->sectname;
+                    if (strncmp(sect, "__got", 6) != 0 &&
+                        strncmp(sect, "__la_symbol_ptr", 16) != 0 &&
+                        strncmp(sect, "__auth_got", 11) != 0) continue;
+                    if (sc->size < 8) continue;
+                    uintptr_t base = (uintptr_t)(sc->addr + (uint64_t)slide);
+                    // rebase 表的项里存的是没签名的指针，直接读会有 PAC 高位，用 aia_real_ptr 还原。
+                    for (uint64_t off = 0; off + 8 <= sc->size; off += 8) {
+                        uintptr_t v = 0;
+                        if (!safe_read(base + off, &v)) break;
+                        uintptr_t real = 0, vo = 0;
+                        const char *vm = aia_real_ptr(v, &real, &vo);
+                        if (!vm) continue;
+                        if (!addr_in_jb(vm)) continue;
+                        if (hits < 40) {
+                            const char *fn = strrchr(nm, '/');
+                            snprintf(b, sizeof(b),
+                                     "GOTHIT %s %s+0x%llx raw=%#llx -> %s+0x%lx\n",
+                                     fn ? fn + 1 : nm, sect, (unsigned long long)off,
+                                     (unsigned long long)v, vm, (unsigned long)vo);
+                            log_raw(b);
+                            // 跳板的真实机器码在运行时才生成。顺它找到原始函数：
+                            // 常见形状是 ldr x16,[pc,#..] / br x16，数据页里存的是原函数地址。
+                            uint32_t w[10] = {0};
+                            size_t n = 0;
+                            char lb[256];
+                            n += (size_t)snprintf(lb, sizeof(lb), "  TRAMP:");
+                            for (int q = 0; q < 10; q++) {
+                                if (!safe_read(real + (uintptr_t)q * 4, (uintptr_t *)&w[q])) break;
+                                n += (size_t)snprintf(lb + n, sizeof(lb) - n, " %08x", w[q]);
+                            }
+                            snprintf(lb + n, sizeof(lb) - n, "\n");
+                            log_raw(lb);
+                        }
+                        hits++;
+                    }
+                }
+            }
+            p += lc->cmdsize;
+        }
+    }
+    uintptr_t ab = 0, sb = 0;
+    for (int i = 0; i < g_mod_count; i++) {
+        if (g_mods[i].name && strstr(g_mods[i].name, "KYHAppStore.app/KYHAppStore")) ab = g_mods[i].base;
+        if (g_mods[i].name && strstr(g_mods[i].name, "systemhook")) sb = g_mods[i].base;
+    }
+    snprintf(b, sizeof(b), "GOTHIT 汇总：审了 %d 个 App 镜像，命中 %d 条 appBase=%#lx shBase=%#lx\n",
+             imgs, hits, (unsigned long)ab, (unsigned long)sb);
+    log_raw(b);
+}
+#else
+__attribute__((unused)) static void got_audit(void) {}
+#endif
+
+#if AIA_GOT_RESTORE
+// 还原实验：把被 systemhook 改写过、指向越狱库的 GOT 槽改回去。
+// __got 里那 5 个槽在磁盘上就是 0，直接清零；__la_symbol_ptr 里的 _dlopen
+// 换回 dyld 解析出的真实地址。改完看 JM 是否还处决。
+static void install_got_restore_dlsym(void) { }
+
+#if AIA_GOT_RESTORE
+// 自己走 nlist 找符号的真实地址。不能用 dlsym：它已经被 systemhook 挂过，
+// 返回的是 systemhook 的跳板，拿它去还原等于没还原。
+static uintptr_t aia_lookup_clean_symbol(const char *want) {
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t i = 0; i < nimg; i++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!mh || mh->magic != 0xfeedfacf || !nm) continue;
+        if (strstr(nm, "systemhook") || strstr(nm, "ellekit") || strstr(nm, "injector")) continue;
+        const uint8_t *p = (const uint8_t *)(mh + 1);
+        const struct symtab_command *st = NULL;
+        const struct segment_command_64 *le = NULL;
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmdsize == 0) break;
+            if (lc->cmd == 0x2) st = (const struct symtab_command *)lc;
+            if (lc->cmd == 0x19) {
+                const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                if (strncmp(sg->segname, "__LINKEDIT", 11) == 0) le = sg;
+            }
+            p += lc->cmdsize;
+        }
+        if (!st || !le || le->filesize == 0) continue;
+        // 表偏移是相对于所在文件的；共享缓存里的镜像要把偏移换算成缓存内的地址，
+        // 不能直接按镜像头加，否则会读到未映射区域。
+        if (st->symoff < le->fileoff || st->symoff >= le->fileoff + le->filesize) continue;
+        if (st->stroff < le->fileoff || st->stroff >= le->fileoff + le->filesize) continue;
+        if ((uint64_t)st->nsyms * 16 > le->filesize) continue;
+        const struct nlist_64 *nl = (const struct nlist_64 *)((uintptr_t)le->vmaddr + (uint64_t)slide
+                                                              + (st->symoff - le->fileoff));
+        const char *strs = (const char *)((uintptr_t)le->vmaddr + (uint64_t)slide
+                                          + (st->stroff - le->fileoff));
+        for (uint32_t k = 0; k < st->nsyms; k++) {
+            if ((nl[k].n_type & 0x0e) != 0x0e) continue;
+            if (nl[k].n_un.n_strx == 0 || nl[k].n_un.n_strx >= st->strsize) continue;
+            if (strcmp(strs + nl[k].n_un.n_strx, want) != 0) continue;
+            return (uintptr_t)(nl[k].n_value + (uint64_t)slide);
+        }
+    }
+    return 0;
+}
+#endif
+
+static void got_restore(void) {
+    uint32_t nimg = _dyld_image_count();
+    int fixed = 0;
+    for (uint32_t i = 0; i < nimg; i++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!mh || mh->magic != 0xfeedfacf) continue;
+        if (!nm || !strstr(nm, "KYHAppStore.app")) continue;
+        const uint8_t *p = (const uint8_t *)(mh + 1);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmdsize == 0) break;
+            if (lc->cmd != 0x19) { p += lc->cmdsize; continue; }
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+            for (uint32_t k = 0; k < sg->nsects; k++, sc++) {
+                BOOL is_got = strncmp(sc->sectname, "__got", 6) == 0;
+                BOOL is_la = strncmp(sc->sectname, "__la_symbol_ptr", 16) == 0;
+                if ((!is_got && !is_la) || sc->size < 8) continue;
+                uintptr_t base = (uintptr_t)(sc->addr + (uint64_t)slide);
+                vm_protect(mach_task_self(), (vm_address_t)(base & ~0xFFFULL),
+                           (vm_size_t)(sc->size + 0x2000), FALSE,
+                           VM_PROT_READ | VM_PROT_WRITE);
+                for (uint64_t off = 0; off + 8 <= sc->size; off += 8) {
+                    uintptr_t v = 0;
+                    if (!safe_read(base + off, &v)) break;
+                    uintptr_t real = 0, vo = 0;
+                    const char *vm = aia_real_ptr(v, &real, &vo);
+                    if (!vm || !addr_in_jb(vm)) continue;
+                    if (is_got && !AIA_GOT_RESTORE_GOT) continue;
+                    // 主二进制只导入了 dlopen、dlopen_preflight、fork、posix_spawn、
+                    // pthread_atfork、vfork 这几个相关符号；systemhook 把它们换成了
+                    // 自己的实现。按偏移把槽映射回符号名，再解析未被劫持的地址。
+                    const char *sym = NULL;
+                    if (is_la) sym = "_dlopen";
+                    else if (strstr(vm, "systemhook")) {
+                        switch (vo) {
+                            case 0x6ad8: sym = "_dlopen"; break;
+                            case 0x6bd0: sym = "_dlopen_preflight"; break;
+                            case 0x65a8: sym = "_posix_spawn"; break;
+                            case 0x6eb0: sym = "_fork"; break;
+                            case 0x6f0c: sym = "_vfork"; break;
+                            default: break;
+                        }
+                    }
+                    uintptr_t nv = sym ? aia_lookup_clean_symbol(sym) : 0;
+                    if (nv == 0) continue;
+                    *(volatile uintptr_t *)(base + off) = nv;
+                    char b[192];
+                    snprintf(b, sizeof(b), "GOTRESTORE %s %s+0x%llx %#llx -> %#llx\n",
+                             strrchr(nm, '/') ? strrchr(nm, '/') + 1 : nm,
+                             sc->sectname, (unsigned long long)off,
+                             (unsigned long long)v, (unsigned long long)nv);
+                    log_raw(b);
+                    fixed++;
+                }
+            }
+            p += lc->cmdsize;
+        }
+    }
+    char b[96];
+    snprintf(b, sizeof(b), "GOTRESTORE 完成，还原 %d 个槽\n", fixed);
+    log_raw(b);
+}
+#else
+__attribute__((unused)) static void got_restore(void) {}
+#endif
+
+#if AIA_GOT_AUDIT
+// 槽里存的是 systemhook 的地址。systemhook 对自己挂过的符号会返回同一个地址，
+// 所以逐个 dlsym 候选符号并比对，就能把这 5 个槽对应到具体函数名。
+static void slot_symbol_match(void) {
+    static const char *cands[] = {
+        "open", "openat", "stat", "stat64", "lstat", "lstat64", "fstatat", "fstatat64",
+        "access", "getenv", "sysctl", "csops", "csops_audittoken", "dlopen", "dlsym",
+        "posix_spawn", "execve", "readlink", "opendir", "readdir", "closedir", "mkdir",
+        "unlinkat", "select", "statfs", "arc4random", "rand", "ptrace", "fork", "vfork",
+        "canopen", "getpid", "getppid", "proc_pidpath", "sscanf",
+        "execv", "execvp", "execle", "execl", "posix_spawnp", "system", "popen",
+        "kill", "task_for_pid", "thread_get_state", "syscall", "ptrace",
+        "mach_vm_read_overwrite", "vm_read_overwrite", "mach_vm_protect",
+        "csops_audittoken", "task_info", "thread_info", "proc_info", NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        void *a = dlsym(RTLD_DEFAULT, cands[i]);
+        if (!a) continue;
+        uintptr_t o = 0;
+        const char *m = module_for((uintptr_t)a, &o);
+        char b[192];
+        snprintf(b, sizeof(b), "SLOTSYM %s -> %s+0x%lx\n", cands[i], m ? m : "?", (unsigned long)o);
+        log_raw(b);
+    }
+}
+#else
+__attribute__((unused)) static void slot_symbol_match(void) {}
+#endif
+
+#if AIA_BLOCK_LITEHOOK
+// JM 的检查项是各 App 镜像 __got / __la_symbol_ptr 的完整性。
+// systemhook 通过自己导出的 _litehook_apply_global_rebinds 把钩子地址写进这些槽，
+// 于是主二进制的 GOT 里会留下直接指向 /usr/lib/systemhook.dylib 的条目——
+// 这就是 JM 能看到的越狱证据。
+// 这里把这个函数顶成空操作，让重绑定不再发生。
+static int (*lh_orig_apply_all)(void *);
+static int lh_apply_all(void *hooks) {
+    static int n;
+    if (n < 5) { aialog("LITEHOOK block apply_global_rebinds(%p)", hooks); n++; }
+    return 0;
+}
+static int (*lh_orig_apply_one)(void *, const char *);
+static int lh_apply_one(void *img, const char *sym) {
+    static int n;
+    if (n < 20) { aialog("LITEHOOK block rebind %s", sym ? sym : "?"); n++; }
+    return 0;
+}
+static void install_litehook_block(void) {
+    void *f1 = dlsym(RTLD_DEFAULT, "_litehook_apply_global_rebinds");
+    void *f2 = dlsym(RTLD_DEFAULT, "_litehook_rebind_symbol_in_section");
+    if (f1) MSHookFunction(f1, (void *)lh_apply_all, (void **)&lh_orig_apply_all);
+    if (f2) MSHookFunction(f2, (void *)lh_apply_one, (void **)&lh_orig_apply_one);
+    char b[192];
+    snprintf(b, sizeof(b), "LITEHOOK rebinds=%p one=%p\n", f1, f2);
+    log_raw(b);
+}
+#else
+__attribute__((unused)) static void install_litehook_block(void) {}
+#endif
+
 static void log_backtrace(const char *tag) {
     void *frames[32];
     int n = backtrace(frames, 32);
@@ -1604,8 +1995,9 @@ static void dump_fault_state(exc_req_t *req) {
     mach_port_t tskPort = *(const uint32_t *)(b + EXC_TASK_OFF);
     uint64_t ftid = thread_id_of(thrPort);
     snprintf(buf, sizeof(buf),
-             "EXCFAULT main=%d thrId=%llu mainTid=%llu id=%d size=%u thr=%u task=%u type=%d codeCnt=%u code0=%lld code1=%lld flavor=%u stateCnt=%u\n",
-             (int)(ftid && ftid == g_main_tid), (unsigned long long)ftid, (unsigned long long)g_main_tid,
+             "EXCFAULT t=%llums main=%d thrId=%llu mainTid=%llu id=%d size=%u thr=%u task=%u type=%d codeCnt=%u code0=%lld code1=%lld flavor=%u stateCnt=%u\n",
+             (unsigned long long)up_ms(), (int)(ftid && ftid == g_main_tid),
+             (unsigned long long)ftid, (unsigned long long)g_main_tid,
              req->Head.msgh_id, req->Head.msgh_size, thrPort, tskPort, etype, codeCnt,
              (long long)code0, (long long)code1, flavor, stateCnt);
     log_raw(buf);
@@ -3067,6 +3459,29 @@ static void install_ijm_resolver(void) {
              (void *)&aia_ijm_resolver, (void *)&aia_ijm_impl_stub);
 #endif
     log_raw(b);
+    // 槽会被 dyld 或 JM 重新填回，必须持续压住。
+    // 采样间隔放慢到 300 ms（唤醒预算有限），共 100 次，覆盖启动与首屏。
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        int refills = 0;
+        for (int i = 0; i < 100; i++) {
+            usleep(300000);
+            uintptr_t cur2 = 0;
+            if (!safe_read((uintptr_t)slot, &cur2)) continue;
+            if (cur2 != 0) {
+                uintptr_t co2 = 0;
+                const char *cm2 = module_for(cur2, &co2);
+                char b2[224];
+                snprintf(b2, sizeof(b2), "IJMREFILL #%d t=%.1fs = %s+0x%lx -> 再清零\n",
+                         refills, i * 0.3, cm2 ? cm2 : "?", (unsigned long)co2);
+                log_raw(b2);
+                refills++;
+                *(volatile uintptr_t *)slot = 0;
+            }
+        }
+        char b3[128];
+        snprintf(b3, sizeof(b3), "IJMREFILL 结束，共回收 %d 次\n", refills);
+        log_raw(b3);
+    });
 }
 #else
 __attribute__((unused)) static void install_ijm_resolver(void) {}
@@ -3314,10 +3729,94 @@ static void install_dladdr_mask(void) {
 }
 #endif
 
+#if AIA_EXTRA_HOOKS
+// 判定实验用的透传 hook：只把调用转给原函数，不做任何改变。
+static int (*xh_orig_stat)(const char *, struct stat *);
+static int xh_stat(const char *p, struct stat *b) { return xh_orig_stat(p, b); }
+static int (*xh_orig_access)(const char *, int);
+static int xh_access(const char *p, int m) { return xh_orig_access(p, m); }
+static char *(*xh_orig_getenv)(const char *);
+static char *xh_getenv(const char *n) { return xh_orig_getenv(n); }
+static int (*xh_orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
+static int xh_sysctl(int *n, u_int l, void *o, size_t *ol, void *nw, size_t nl) {
+    return xh_orig_sysctl(n, l, o, ol, nw, nl);
+}
+#endif
+
+#if AIA_KILL_PROBE
+// JM 处决的第二种形态是给线程发 SIGUSR1（现场 pc=lr=0xeee1）。
+// 把发信号这一端挂住，就能拿到 JM 内部发起处决的返回地址。
+static int (*kp_orig_kill)(pid_t, int);
+static int kp_kill(pid_t pid, int sig) {
+    static int n;
+    if (n < 30) {
+        char b[256];
+        uintptr_t o = 0;
+        const char *m = module_for((uintptr_t)__builtin_return_address(0), &o);
+        snprintf(b, sizeof(b), "KILLPROBE kill(pid=%d sig=%d) caller=%s+0x%lx\n",
+                 (int)pid, sig, m ? m : "?", (unsigned long)o);
+        log_raw(b);
+        n++;
+    }
+    return kp_orig_kill(pid, sig);
+}
+static int (*kp_orig_raise)(int);
+static int kp_raise(int sig) {
+    static int n;
+    if (n < 30) {
+        char b[256];
+        uintptr_t o = 0;
+        const char *m = module_for((uintptr_t)__builtin_return_address(0), &o);
+        snprintf(b, sizeof(b), "KILLPROBE raise(%d) caller=%s+0x%lx\n", sig, m ? m : "?", (unsigned long)o);
+        log_raw(b);
+        n++;
+    }
+    return kp_orig_raise(sig);
+}
+static int (*kp_orig_pkill)(pthread_t, int);
+static int kp_pkill(pthread_t th, int sig) {
+    static int n;
+    if (n < 30) {
+        char b[256];
+        uintptr_t o = 0;
+        const char *m = module_for((uintptr_t)__builtin_return_address(0), &o);
+        snprintf(b, sizeof(b), "KILLPROBE pthread_kill(%p %d) caller=%s+0x%lx\n",
+                 (void *)th, sig, m ? m : "?", (unsigned long)o);
+        log_raw(b);
+        n++;
+    }
+    return kp_orig_pkill(th, sig);
+}
+static void install_kill_probe(void) {
+    MSHookFunction((void *)kill, (void *)kp_kill, (void **)&kp_orig_kill);
+    MSHookFunction((void *)raise, (void *)kp_raise, (void **)&kp_orig_raise);
+    MSHookFunction((void *)pthread_kill, (void *)kp_pkill, (void **)&kp_orig_pkill);
+    log_raw("KILLPROBE installed\n");
+}
+#else
+__attribute__((unused)) static void install_kill_probe(void) {}
+#endif
+
 __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("===== ctor in %s =====", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
 #if AIA_TRULY_EMPTY
     aialog("truly empty mode");
+#if AIA_GOT_AUDIT
+    // 零 hook 对照：只开日志和 GOT 审计，看越狱基座自己会不会改 App 的 GOT。
+    {
+        NSString *dir0 = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *lp0 = [dir0 stringByAppendingPathComponent:@"aiabypass.log"];
+        g_logfd = open([lp0 fileSystemRepresentation], O_WRONLY | O_APPEND);
+    }
+#if AIA_TE_HOOK
+    // 对照实验：零 hook 基线里只装一个 task_info，看是否会引出 GOT 重绑定。
+    log_raw("GOTPHASE te-pre-hook\n");
+    got_audit();
+    MSHookFunction((void *)task_info, (void *)my_task_info, (void **)&orig_task_info);
+    log_raw("GOTPHASE te-post-hook\n");
+#endif
+    got_audit();
+#endif
     return;
 #endif
 
@@ -3336,7 +3835,25 @@ __attribute__((constructor)) static void aiabypass_init(void) {
         // JM 用 SIGUSR1 处决进程，必须由我们接住。
         sigaction(SIGUSR1, &sa, NULL);
     }
+#if AIA_GOT_AUDIT
+    log_raw("GOTPHASE post-logfile\n");
+    got_audit();
+#endif
+    if (!g_t0) g_t0 = mach_absolute_time();
     snapshot_modules();
+#if AIA_GOT_RESTORE
+    install_got_restore_dlsym();
+    log_raw("GOTPHASE pre-restore\n");
+    got_audit();
+    got_restore();
+    log_raw("GOTPHASE post-restore\n");
+    got_audit();
+#endif
+#if AIA_GOT_AUDIT
+    log_raw("GOTPHASE post-snapshot\n");
+    got_audit();
+    slot_symbol_match();
+#endif
     {
         struct thread_identifier_info tii;
         mach_msg_type_number_t c = THREAD_IDENTIFIER_INFO_COUNT;
@@ -3346,6 +3863,10 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     aialog("module snapshot: %d mainTid=%llu", g_mod_count, (unsigned long long)g_main_tid);
 #if AIA_EXC_HANDLER
     install_exc_handler();
+#if AIA_GOT_AUDIT
+    log_raw("GOTPHASE post-exchandler\n");
+    got_audit();
+#endif
 #endif
 #if AIA_SAMPLE_THREADS
     start_sampler();
@@ -3411,7 +3932,24 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_EMPTY
     // 观测模式：不装任何会改变行为的 hook，只额外记录 task_info 与资源统计。
+#if AIA_GOT_AUDIT
+    log_raw("GOTPHASE pre-taskinfo\n");
+    got_audit();
+#endif
     MSHookFunction((void *)task_info, (void *)my_task_info, (void **)&orig_task_info);
+#if AIA_GOT_AUDIT
+    log_raw("GOTPHASE post-taskinfo\n");
+    got_audit();
+#endif
+#if AIA_EXTRA_HOOKS
+    // 判定实验：多挂几个 libc 函数。若 JM 真在查 __got 完整性，
+    // 命中数会随之增加，处决次数（exc）也应同步上升。
+    MSHookFunction((void *)getenv, (void *)xh_getenv, (void **)&xh_orig_getenv);
+    MSHookFunction((void *)sysctl, (void *)xh_sysctl, (void **)&xh_orig_sysctl);
+    MSHookFunction((void *)stat, (void *)xh_stat, (void **)&xh_orig_stat);
+    MSHookFunction((void *)access, (void *)xh_access, (void **)&xh_orig_access);
+    log_raw("EXTRA hooks installed\n");
+#endif
 #if AIA_EVENT_PROBE
     install_event_probe();
     aialog("empty mode: no hooks (含事件观测)");
@@ -3426,6 +3964,18 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_PROC_FILTER
     install_proc_filter();
+#endif
+#if AIA_BLOCK_LITEHOOK
+    install_litehook_block();
+#endif
+#if AIA_GOT_AUDIT
+    // 分三个时间点看：槽是 App 自己的绑定器填的，还是越狱基座在启动后改的。
+    log_raw("GOTPHASE t=0\n");
+    got_audit();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0, 0), ^{ log_raw("GOTPHASE t=1s\n"); got_audit(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0, 0), ^{ log_raw("GOTPHASE t=4s\n"); got_audit(); });
 #endif
 #if AIA_MSGSEND_PROBE
     install_msgsend_probe();
@@ -3469,10 +4019,22 @@ __attribute__((constructor)) static void aiabypass_init(void) {
     // 补成 NOP 后继续走 0x7c55fc 的 nop 和 0x7c5600 的上下文恢复代码。
     patch_app_code(0x7c55f8, 0xd43bd5a0, 0xd503201f, "ijm-brk");
 #endif
+#if AIA_KILL_PROBE
+    install_kill_probe();
+#endif
+#if AIA_DLSYM_PROBE
+    // App 的 ijm 代码会在运行期解析 libc 函数并存进自己的 __got 槽。
+    // 只要它走 dlsym，我们就能看到它到底要哪些函数。
+    MSHookFunction((void *)dlsym, (void *)my_dlsym, (void **)&orig_dlsym);
+    log_raw("DLSYM probe installed\n");
+#endif
 #if AIA_NEUTER_IJM
     // 稍等片刻：App 的类和分类要等首屏建起来才齐。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ neuter_ijm_telemetry(); });
+#endif
+#if AIA_CHECK_TRACE
+    install_check_trace();
 #endif
     start_stats_thread();
     return;
