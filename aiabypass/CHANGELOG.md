@@ -1,5 +1,16 @@
 # AIABypass 更新日志
 
+## 0.0.4
+
+- **修复异常回复消息的长度**。`exc_reply_t` 的线上头部是 `Head(24) + NDR(8) + RetCode(4) + new_stateCnt(4) = 40` 字节，旧代码写成 `8+8+4+4 = 24`，少发 16 字节，内核拒收我们的回复，`brk` 随即以 `SIGTRAP` 重新投递到同一个 PC。所有回复分支统一改用 `EXC_REPLY_HDR_SIZE`。
+- 在信号层补上 `brk` 的 `SIGTRAP` 处理。Darwin 在把 `EXC_BREAKPOINT` 交给 Mach 异常端口之后仍会补发一次 `SIGTRAP`，只靠 Mach 回复推进 PC 挡不住这条路。
+- **查清主线程跳飞的精确成因**：`JMCodeProtectKit` 的 ijm 解释器（`JM+0x11ee28`，分派表 `JM+0x11ee78`，密钥 `0xff`）拿到的是主二进制 `KYHAppStore` 的 ijm 描述符 `0x7c5500`，于是游标算成 `0x7c5504`，解出 `opcode 0xa2`。JM 的分派表只有 107 项，越界后把后面的代码字节当表项，算出未映射地址 `0x…9258` 直接跳过去。`x10` 与 `ldrsw` 的验算逐位吻合。
+- 记录绑定器慢路径本来就不成立：`0x7c5600` 把 `0x7c5500` 当脚本解释，密钥 0 和 `0xff` 下都会解出越界 opcode。全二进制里只有绑定器自己引用这个地址，也没有任何跳转进入 `0x7c5508`。
+- 记录三条失败路线：绕过 `brk` 必然在 `0x7c564c` 空指针崩溃；把绑定器顶成返回 nil 会让调用方解引用空值；改 `__TEXT` 里的元数据会让同页失去执行权限。
+- 新增 `AIA_EXC_RECOVER_FAULT` / `AIA_EXC_UNWIND_JM` / `AIA_HOOK_IJM_BINDER` 三个实验开关（默认全部关闭），并在分析记录里写明各自的实测结果。
+- 异常现场新增 `VMSLOT` 转储：当 `x0` 指向 VM 的游标槽时，打出 `[sp+0x110]`、`[sp+0x6b8]`、`[sp+0x740..0x750]` 等关键槽位，用来判断 VM 的上下文结构地址。
+- 已知未解决：App 交互若干次后主线程仍会在上述交叉现场跳飞并被挂起，界面失去触摸。重启 App 可恢复。`AIA_KILL_DT_SWIZZLE=1` 能消掉故障，但会让 App 完全不响应触摸，不能作为默认配置。
+
 ## 0.0.3
 
 - **修复"运行几分钟后触摸失效"**。查清了完整机制：App 自己的 `sendEvent:` 埋点会调用 ijm 保护的方法 `requstQueryTaskStateInfo`，绑定失败后走到 `KYHAppStore+0x7c55f8` 的 `brk #0xdead`。这次 `brk` 发生在主线程上，旧版"收到异常一律不回复"的策略把主线程永久挂起。动画由 render server 独立合成，所以界面看起来还在动，只是没人处理触摸。

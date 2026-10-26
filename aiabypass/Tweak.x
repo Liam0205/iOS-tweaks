@@ -121,10 +121,30 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 // 1 = 真把主线程 PC 设成 LR（实验性：x0 现场无效时会二次崩溃）。
 // 0 = 只记录、仍不回复，用来观察主线程挂住后的完整调用链。
 #ifndef AIA_EXC_RECOVER_FAULT
-#define AIA_EXC_RECOVER_FAULT 1
+#define AIA_EXC_RECOVER_FAULT 0
+#endif
+
+// 1 = 主线程在 JM 的 VM 里跳飞时，沿帧链退回到调用方（Dynatrace），
+// 让整次 ijm 埋点调用作废。实测这条路径能避免"返回到 JM+0x186634 必然二次崩溃"。
+#ifndef AIA_EXC_UNWIND_JM
+#define AIA_EXC_UNWIND_JM 0
 #endif
 // 1 = 断点类异常（brk 断言桩）回复"PC 前进 4 字节"，让线程继续执行。
 // 这是主线程不卡死的关键：主线程撞上 brk 后如果一直不回复，触摸就永久失效。
+// 1 = 绑定器的 brk #0xdead 不按"推进 4 字节"处理，而是把线程弹回调用者并返回 nil。
+// 推进 4 字节会进 0x7c55fc 的失败续跑路径，而那条路径拿绑定器自己构造的占位描述符
+// 0x7c5500 当脚本，解释器必然失败，随后在 +0x7cd0f0 空指针崩溃。
+#ifndef AIA_UNWIND_BINDER_BRK
+#define AIA_UNWIND_BINDER_BRK 0
+#endif
+
+// 1 = 用 MSHookFunction 挂住 ijm 导入绑定器入口，让这些导入一律返回 nil。
+// 实测不成立：调用方拿到 nil 后仍然解引用该结果，在 KYHAppStore+0x1685010 一带崩溃。
+// 说明这个导入不只是埋点，它的返回值会被当作有效对象使用。
+#ifndef AIA_HOOK_IJM_BINDER
+#define AIA_HOOK_IJM_BINDER 0
+#endif
+
 #ifndef AIA_EXC_SKIP_BRK
 #define AIA_EXC_SKIP_BRK 1
 #endif
@@ -715,6 +735,22 @@ static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
 #else
     log_raw("SIGNAL (non-arm64)\n");
 #endif
+    // brk 断言：内核在把 EXC_BREAKPOINT 交给 Mach 异常端口之后，仍会补发 SIGTRAP。
+    // 只靠 Mach 回复推进 PC 挡不住这条路，线程会带着原来的 PC 收到信号。
+    // 这里在信号层再推进一次 4 字节，线程继续往下走而不是被 SIGTRAP 打死。
+    if (sig == SIGTRAP) {
+        uint32_t insn = 0;
+        if (safe_read(pc, (uintptr_t *)&insn) && (insn & 0xffe0001f) == 0xd4200000) {
+            static int brk_skipped;
+            if (brk_skipped < 20) {
+                snprintf(buf, sizeof(buf), "  BRKSKIP sigtrap imm=%#x -> +4\n", (insn >> 5) & 0xffff);
+                log_raw(buf);
+                brk_skipped++;
+            }
+            uc->uc_mcontext->__ss.__pc = pc + 4;
+            return;
+        }
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -806,8 +842,50 @@ typedef struct {
     natural_t new_state[128];
 } exc_reply_t;
 
+// 回复消息线上头部固定 40 字节：Head(24) + NDR(8) + RetCode(4) + new_stateCnt(4)。
+// 旧代码写成 8+8+4+4 = 24，少发 16 字节，内核拒收回复，断点异常随即以
+// SIGTRAP 重新投递到同一个 PC，进程照样死。
+#define EXC_REPLY_HDR_SIZE 40
+
 static mach_port_t g_exc_port = MACH_PORT_NULL;
 
+static uintptr_t app_base(void);
+
+#if AIA_UNWIND_BINDER_BRK
+// ijm 导入绑定器 KYHAppStore+0x7c5508 在失败时走到 +0x7c55f8 的 brk #0xdead。
+// 它是个尾调用型桩：进入后先把 x15..x28 成对压到原 sp 下方 0x70 字节，
+// 再把 nzcv 存到原 sp+0x10，然后用 sub sp,sp,#0x130 开工作区。
+// 正常收尾在 0x7c55c0：逐对恢复 x27..x15，从原 sp+0x10 读 nzcv，最后 br 到 import 实现。
+// 失败时没有可用的 import 实现，这里照抄同一套恢复，但把返回地址换成调用者的 lr、
+// 把 x0 置 0，等价于这个导入返回 nil。
+static int binder_brk_unwind(arm_thread_state64_t *st) {
+    uintptr_t base = app_base();
+    if (!base) return 0;
+    uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*st);
+    if (pc != base + 0x7c55f8) return 0;
+    uintptr_t sp = (uintptr_t)__darwin_arm_thread_state64_get_sp(*st);
+    if (!sp) return 0;
+    uintptr_t fs = sp + 0x130;          // 绑定器压栈后的 sp
+    uintptr_t frame[7][2];
+    for (int i = 0; i < 7; i++) {
+        if (!safe_read(fs + (uintptr_t)i * 0x10, &frame[i][0])) return 0;
+        if (!safe_read(fs + (uintptr_t)i * 0x10 + 8, &frame[i][1])) return 0;
+    }
+    uintptr_t nzcv = 0;
+    if (!safe_read(fs + 0x80, &nzcv)) return 0;
+    uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(*st);
+    if (!lr) return 0;
+    for (int i = 0; i < 7; i++) {
+        st->__x[27 - i * 2] = (uint64_t)frame[i][0];
+        st->__x[28 - i * 2] = (uint64_t)frame[i][1];
+    }
+    st->__cpsr = (uint32_t)((st->__cpsr & ~0xf0000000u) | (uint32_t)(nzcv & 0xf0000000u));
+    st->__x[0] = 0;
+    __darwin_arm_thread_state64_set_sp(*st, (void *)(fs + 0x70));
+    __darwin_arm_thread_state64_set_pc_fptr(*st, (void *)lr);
+    return 1;
+}
+#endif
 // 消息线上 port descriptor 是 12 字节，和结构体里的 16 字节不一致，
 // 所以这里全部按显式字节偏移解析，避免被编译器的对齐填充带偏。
 // mach_exception_raise_state_identity 布局：
@@ -1042,6 +1120,33 @@ static void dump_fault_state(exc_req_t *req) {
             fp = prev;
         }
     }
+    // ijm VM 交叉现场：JMCodeProtectKit 的 VM（入口 JM+0x11ee28）拿到了主二进制
+    // KYHAppStore 里 ijm 方法的描述符 0x7c5500，于是它的字节码游标变成 0x7c5504，
+    // 解出 opcode 0xa2。JM 的分派表只有 107 项（JM+0x11ee78 到 JM+0x11f1d0），
+    // 越界后把后面的代码字节当成表项，算出非法地址直接跳飞。
+    // 现场布局（x0 = sp + 0x708）：
+    //   [sp+0x750] VM 入参 x0 = 描述符 0x7c5500
+    //   [sp+0x748] VM 入参 x1 = 上下文结构
+    //   [sp+0x740] VM 入参 x2 = 0x7c558c
+    // 把这些槽打出来，才能确认结构地址并判断能否安全恢复。
+    {
+        uintptr_t x0v = (uintptr_t)st.__x[0];
+        if (x0v > sp && x0v - sp == 0x708) {
+            static const size_t slots[] = { 0x110, 0x118, 0x698, 0x6a0,
+                                            0x6b0, 0x6b8, 0x6c0, 0x6c8,
+                                            0x740, 0x748, 0x750 };
+            for (unsigned si = 0; si < sizeof(slots) / sizeof(slots[0]); si++) {
+                uintptr_t v = 0;
+                if (!safe_read(sp + slots[si], &v)) continue;
+                uintptr_t voff2 = 0;
+                const char *vm2 = module_for(v, &voff2);
+                snprintf(buf, sizeof(buf), "  VMSLOT +0x%zx = %#018lx %s+0x%lx\n",
+                         slots[si], (unsigned long)v, vm2 ? vm2 : "?",
+                         (unsigned long)(vm2 ? voff2 : 0));
+                log_raw(buf);
+            }
+        }
+    }
     int found = 0;
     int main_thread = (ftid && ftid == g_main_tid);
     int limit = main_thread ? 64 : 24;
@@ -1135,7 +1240,7 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
             rep->RetCode = KERN_SUCCESS;
             rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
             memcpy(rep->new_state, buf2, sizeof(arm_thread_state64_t));
-            rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+            rep->Head.msgh_size = EXC_REPLY_HDR_SIZE + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
             kern_return_t sk = mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
                                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
             if (bail_logged < 20) {
@@ -1175,10 +1280,60 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                     rec_logged++;
                 }
 #if AIA_EXC_RECOVER_FAULT
+                // ijm VM 交叉现场里 x0 指向"字节码游标槽"（结构 + 0x708），
+                // 而 JM+0x186634 这条返回路径期望 x0 就是上下文结构。
+                // 直接把 PC 设成 LR 会让它拿游标槽当地址去恢复寄存器，必然二次崩溃。
+                // 这里先把 x0 修回结构地址（VM 入口存在 [sp+0x748] 的入参 x1），再返回。
+                {
+                    uintptr_t x0v = (uintptr_t)nst->__x[0];
+                    uintptr_t spv = (uintptr_t)__darwin_arm_thread_state64_get_sp(*nst);
+                    uintptr_t ctx = 0;
+                    uintptr_t lrOff = 0;
+                    const char *lm = module_for(lr, &lrOff);
+                    BOOL vmSite = lm && strstr(lm, "JMCodeProtectKit") &&
+                                  lrOff >= 0x186600 && lrOff < 0x186700;
+                    if (vmSite && x0v > spv && x0v - spv == 0x708 &&
+                        safe_read(spv + 0x748, &ctx) && ctx) {
+                        char b[192];
+                        snprintf(b, sizeof(b), "  RECOVER ctx=%#lx (x0 %#lx -> ctx)\n",
+                                 (unsigned long)ctx, (unsigned long)x0v);
+                        log_raw(b);
+                        nst->__x[0] = (uint64_t)ctx;
+                    }
+#if AIA_EXC_UNWIND_JM
+                    // 上面那种"fault 返回到 JM+0x186634"的做法实测必然二次崩溃：
+                    // 那条路径会从上下文结构里取出保存的 PC/SP 再 ret，而那些槽本身
+                    // 就是这次出错的计算结果。这里改成沿帧链退回到调用方
+                    // （帧链现场是 Dynatrace），让这次 ijm 埋点调用整体作废。
+                    if (vmSite) {
+                        uintptr_t fp = aia_strip_pac((uintptr_t)__darwin_arm_thread_state64_get_fp(*nst));
+                        uintptr_t prevfp = 0, ra = 0;
+                        if (fp && safe_read(fp, &prevfp) && safe_read(fp + 8, &ra) && ra) {
+                            uintptr_t rao = 0;
+                            const char *ram = module_for(aia_strip_pac(ra), &rao);
+                            char b[192];
+                            snprintf(b, sizeof(b), "  UNWINDJM -> %s+0x%lx fp=%#lx\n",
+                                     ram ? ram : "?", (unsigned long)rao, (unsigned long)fp);
+                            log_raw(b);
+                            if (ram) {
+                                nst->__x[0] = 0;
+                                __darwin_arm_thread_state64_set_fp(*nst, (void *)aia_strip_pac(prevfp));
+                                __darwin_arm_thread_state64_set_lr_fptr(*nst, (void *)aia_strip_pac(ra));
+                                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)aia_strip_pac(ra));
+                                __darwin_arm_thread_state64_set_sp(*nst, (void *)(fp + 0x10));
+                                goto recover_reply;
+                            }
+                        }
+                    }
+#endif
+                }
                 __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)lr);
 #else
                 memset(req, 0, rcv + 2048);
                 continue;
+#endif
+#if AIA_EXC_UNWIND_JM
+            recover_reply:
 #endif
                 rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
                 rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
@@ -1187,7 +1342,7 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                 rep->NDR = NDR_record;
                 rep->RetCode = KERN_SUCCESS;
                 rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
-                rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+                rep->Head.msgh_size = EXC_REPLY_HDR_SIZE + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
                 mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
                          MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
                 memset(req, 0, rcv + 2048);
@@ -1207,6 +1362,21 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                 memcpy(rep->new_state, bb + EXC_STATE_BODY_OFF, sizeof(arm_thread_state64_t));
                 arm_thread_state64_t *nst = (arm_thread_state64_t *)rep->new_state;
                 uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
+#if AIA_UNWIND_BINDER_BRK
+                // KYHAppStore+0x7c55f8 的 brk #0xdead 是 ijm 导入绑定器的失败出口。
+                // 推进 4 字节只会进 0x7c55fc 的失败续跑路径，那条路径把绑定器自己
+                // 构造的占位描述符 0x7c5500 当脚本交给解释器，必然再次出错。
+                // 这里改成按绑定器自己的收尾序列把现场弹回调用者：
+                //   0x7c5544 已把 sp 减掉 0x130，原始现场在 sp+0x130；
+                //   0x7c55c0 起逐对恢复 x27..x15，再读 nzcv，最后回到调用者。
+                // 返回时 x0 = 0，等价于这个被保护的导入返回 nil。
+                if (binder_brk_unwind(nst)) {
+                    char b[128];
+                    snprintf(b, sizeof(b), "  UNWINDBRK pc=%#lx -> caller, x0=0\n",
+                             (unsigned long)oldpc);
+                    log_raw(b);
+                } else
+#endif
                 __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)(oldpc + 4));
                 static int skip_logged;
                 if (skip_logged < 40) {
@@ -1225,9 +1395,17 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                 rep->NDR = NDR_record;
                 rep->RetCode = KERN_SUCCESS;
                 rep->new_stateCnt = ARM_THREAD_STATE64_COUNT;
-                rep->Head.msgh_size = 8 + 8 + 4 + 4 + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
-                mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
-                         MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                rep->Head.msgh_size = EXC_REPLY_HDR_SIZE + ARM_THREAD_STATE64_COUNT * sizeof(natural_t);
+                {
+                    kern_return_t sk = mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
+                                                MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                    if (sk != KERN_SUCCESS) {
+                        char b[96];
+                        snprintf(b, sizeof(b), "  SKIPBRK reply failed: %d size=%u\n",
+                                 sk, rep->Head.msgh_size);
+                        log_raw(b);
+                    }
+                }
                 memset(req, 0, rcv + 2048);
                 continue;
             }
@@ -1247,7 +1425,7 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
         rep->RetCode = KERN_SUCCESS;
         rep->new_stateCnt = req->old_stateCnt;
         memcpy(rep->new_state, req->old_state, req->old_stateCnt * sizeof(natural_t));
-        rep->Head.msgh_size = 8 + 8 + 4 + 4 + req->old_stateCnt * sizeof(natural_t);
+        rep->Head.msgh_size = EXC_REPLY_HDR_SIZE + req->old_stateCnt * sizeof(natural_t);
         mach_msg(&rep->Head, MACH_SEND_MSG, rep->Head.msgh_size, 0,
                  MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     }
@@ -1691,6 +1869,50 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
 #endif
 
 #if AIA_PATCH_BINDER_VALUE
+// 绑定器慢路径：元数据表 +0x10 存的是 0x7c5600，绑定器用它 `blr` 出去做真正的导入解析。
+// 那个"解析器"把 0x7c5500 当脚本交给解释器，但该处按密钥 0 解释两条指令后就出现越界
+// opcode，按密钥 0xff 解释第一条就越界——它不是脚本，是给失败路径准备的占位数据。
+// 于是每次慢路径都必然失败，最后撞 brk #0xdead。
+//
+// 这里把 +0x10 改指向自己的函数。绑定器调用它之后会检查 x15/x14 是否非零，再
+// 把 x14 写进缓存槽并跳过去；跳转前绑定器会自己恢复 x15..x28 和 nzcv，所以这里
+// 只需要设置 x14（真正的目标）和 x15（非零标志），参数寄存器不用管。
+// 目标选成"返回 nil"的桩：这个导入是埋点用的，返回空值即可。
+static id aia_import_nil(void);
+
+// 绑定器入口的替代实现：直接把 x0 置 0 返回，等价于这个 ijm 导入返回 nil。
+// 绑定器是由桩尾跳进来的，lr 已经是桩调用方的返回地址，所以正常返回即可。
+__attribute__((noinline, used)) static id aia_binder_entry(void) {
+    static int logged;
+    if (logged < 20) {
+        char b[96];
+        snprintf(b, sizeof(b), "  IMPORTNIL hit #%d\n", logged);
+        log_raw(b);
+        logged++;
+    }
+    return nil;
+}
+
+__attribute__((unused)) static id aia_import_nil(void) { return nil; }
+
+__attribute__((unused)) static void patch_binder_slow_path(void) {
+    uintptr_t base = app_base();
+    if (!base) return;
+    // 直接改 __TEXT 里的元数据会让该页失去执行权限（iOS 不允许代码页可写），
+    // 绑定器自己也跟着无法执行。改成用 MSHookFunction 挂绑定器入口：
+    // 它由桩尾跳到，lr 就是桩调用方的返回地址，直接返回等价于"这个导入返回 nil"。
+#if AIA_HOOK_IJM_BINDER
+    static void (*orig_binder)(void);
+    MSHookFunction((void *)(base + 0x7c5508), (void *)aia_binder_entry, (void **)&orig_binder);
+    char b[128];
+    snprintf(b, sizeof(b), "BINDER hook at %#lx orig=%p\n",
+             (unsigned long)(base + 0x7c5508), (void *)orig_binder);
+    log_raw(b);
+#else
+    (void)aia_binder_entry;
+#endif
+}
+
 // 绑定器入口在 KYHAppStore+0x7c5508，调用者用 x13=元数据槽、x14=桩、x15=期望值。
 // 直接在 0x7c5590 的 cbz x15 上做不了（静态代码不可改，__TEXT 只读），
 // 所以改为 hook 绑定器回调 0x7c5588 里 blr 出去的那个函数——它是 ijm 运行时的
@@ -1724,6 +1946,7 @@ __attribute__((unused)) static void patch_binder_zero_values(void) {
     uintptr_t x28 = (uintptr_t)0x7c55fc - resolver_off;
     snprintf(b, sizeof(b), "BINDER x28=%#lx\n", (unsigned long)x28);
     log_raw(b);
+    patch_binder_slow_path();
 }
 #endif
 

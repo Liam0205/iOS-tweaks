@@ -199,6 +199,69 @@ Dynatrace 只导入了 `_method_setImplementation` 和 `_class_addMethod` 两个
 
 原因是 `0x7c5600` 之后的代码要从 `x0` 指向的结构里恢复 `x26..x29`、`x30`、`sp`、`nzcv`，绑定失败时这个现场根本不存在。**必须在故障发生之前拦，不能事后补救。**
 
+### 17. 主线程跳飞的精确成因：两套 ijm 解释器的描述符互相串了
+
+这一条把第 13 条的"`x10` 被截断"现象追到了底。
+
+App 主二进制 `KYHAppStore` 自己有一套 ijm 解释器，`KYHAppStore+0x7c56b8` 是入口，`+0x7c5a28` 是分派循环，它用自己的分派表 `+0x7c56d8`，**密钥是 0**。而 `JMCodeProtectKit` 另有自己的一套，`JM+0x11ee28` 是入口，分派表 `JM+0x11ee78`，**密钥是 0xff**。
+
+故障现场一直稳定出现同一组值：
+
+```
+pc   = 0x…d258（未映射）        lr = JMCodeProtectKit+0x186634
+x12  = JM+0x11f388             x13 = KYHAppStore+0x7c5dd0
+x14  = 0xa2                    x15 = 0xff
+x10  = 0x…9258                 x2  = KYHAppStore+0x7c558c
+```
+
+逐条验算后可以完整复原：
+
+1. `x13` 是分派器算出的**下一个**游标。按 `步长 = 2 + 10 × op2`（`低字节×10`，`+0x11f244..0x11f254` 的 `add w17,w17,lsl#2` 再 `lsl#1`）反推，`0x7c5dd0 − 902 = 0x7c5a4a`，这一处正是 `0x7c5a4a` 减 2 得到的游标 `KYHAppStore+0x7c5a48`。
+2. `0x7c5a48` 处的字节解出来就是 `x14 = 0xa2`、`x15 = 0xff`，两个值同时吻合，不是巧合。
+3. `opcode 0xa2 = 162`，而 JM 的分派表从 `JM+0x11ee78` 到 `JM+0x11f1d0` 只有 **107 项**（`0x358 / 8`），合法 opcode 只能是 0..106。于是 `add x12, x10, w14, uxtw #3` 越界，`ldrsw x11, [x12]` 把后面的**代码字节** `0x911c23e0` 当成了表项偏移。
+4. `x10 = 0x109906e78 + 0xffffffff911c23e0 = 0x9AAC9258`，与现场 `x10` 逐位一致；`br x10` 就跳到了这个未映射地址。
+
+所以主线程是**拿着主二进制的字节码、用 JM 的分派表和密钥去解释**。这不是数据被写坏，是两个组件的上下文串了：JM 的导入绑定器把 App 的 ijm 桩接管了，却没有把 App 的解释器上下文一起接管。
+
+### 18. 绑定器慢路径本来就是坏的
+
+绑定器 `KYHAppStore+0x7c5508` 在缓存槽为空时走慢路径，有两条路：
+
+- `[meta+0x48]`（运行时是 `__LINKEDIT` 的 `0x4058008`）→ 若为 0，继续
+- `[meta+0x10]` = `0x7c5600` → 真正被 `blr` 的解析器
+
+而 `0x7c5600` 拿到的是 `0x7c5500`（绑定器自己在 `0x7c5558` 用 `adr` 构造的占位描述符），把它当脚本交给解释器。实测两种密钥下都不成立：
+
+| 密钥 | 结果 |
+|---|---|
+| 0（主二进制解释器自己的密钥） | `5d 00` 合法，`00 00` 合法，`00 00` 也合法，但随后 `cf` 越界（主表 37 项） |
+| 0xff（JM 的密钥） | 第一条 `30 ^ 0xff = 0xcf` 就越界 |
+
+`0x7c5500` 不是脚本，它是给失败路径准备的占位数据。全二进制里只有绑定器自己引用它（`adr` 只有 `0x7c552c`、`0x7c5558`、`0x7c555c` 三处，全部在绑定器内部），也没有任何 `b`/`bl` 直接跳进 `0x7c5508`。**这个导入在本进程里从来没有被真正绑定过。**
+
+### 19. 绕过 brk 一定失败，因为它是设计上的中止点
+
+`brk #0xdead` 在 `0x7c55f8`。推进 4 字节会走 `0x7c5600` 的失败续跑路径：
+
+```
+0x7c5648  bl   #0x7c56b8      ; 慢路径解释器
+0x7c564c  ldr  x1, [x0, #8]   ; x0 = 0 时这里读 0x8
+```
+
+实测日志完全一致：`BRKSKIP sigtrap imm=0xdead -> +4` 之后立刻收到 `EXCFAULT code0=1 code1=-32`（读 `0xffffffe0`），随后 `SIGSEGV addr=0xffffffffffffffe0 pc=KYHAppStore+0x7cd0f0`。
+
+反过来，把绑定器入口用 `MSHookFunction` 顶成"直接返回 nil"也失败：`IMPORTNIL` 确实命中，但调用方在 `KYHAppStore+0x1685010` 一带继续解引用返回值。**这个导入的返回值会被当作有效对象使用，不是单纯的埋点。**
+
+### 20. 改 `__TEXT` 里的元数据会连带失去执行权限
+
+元数据表 `0x7c54b0` 嵌在 `__TEXT` 里。用 `vm_protect(..., VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)` 打开可写后，绑定器自己所在的同一页立刻无法执行（故障现场 `pc = KYHAppStore+0x7c5508`，`code0=2`）。补上 `VM_PROT_EXECUTE` 也一样。在 iOS 上不要试图就地改代码页里的指针。
+
+### 21. 异常回复消息的长度曾经算错
+
+`exc_reply_t` 的线上头部是 `Head(24) + NDR(8) + RetCode(4) + new_stateCnt(4) = 40` 字节，旧代码写成 `8+8+4+4 = 24`，少发 16 字节。内核拒收，`brk` 随即以 `SIGTRAP` 重新投递到同一个 PC。已在所有回复分支统一改成 `EXC_REPLY_HDR_SIZE`。
+
+注意：修好之后内核**仍然**会为 `brk` 补发一次 `SIGTRAP`，这属于 Darwin 的正常行为，需要在信号层再推进 4 字节（`AIA_EXC_SKIP_BRK` 里的 `BRKSKIP` 分支）。
+
 ## 当前状态
 
 **能启动、能进首页、能连续交互，且不再出现主线程卡死。**
@@ -208,13 +271,15 @@ Dynatrace 只导入了 `_method_setImplementation` 和 `_class_addMethod` 两个
 | 层 | 作用 |
 |---|---|
 | Mach 异常端口接管 | 接住处决跳转，进程不退出 |
-| `AIA_KILL_DT_SWIZZLE` | 关掉 Dynatrace 的 swizzle 配置器，消除主线程卡死的根源 |
-| `AIA_BLOCK_DYNATRACE` | 兜底：拦住 Dynatrace 直接调 `method_setImplementation` |
-| `AIA_EXC_SKIP_BRK` | 任意线程的 `brk` 断言推进 4 字节 |
-| `AIA_EXC_RECOVER_MAIN` | 主线程非法跳转时把 PC 设成 LR（实验性，现场无效时会二次崩溃） |
+| `AIA_EXC_SKIP_BRK` | 任意线程的 `brk` 断言推进 4 字节，并在信号层补一次 `SIGTRAP` 跳过 |
+| `AIA_BLOCK_DYNATRACE` | 拦住 Dynatrace 直接调 `method_setImplementation` |
 | 其余处决跳转 | 不回复，线程永久挂起 |
 
 越狱判定仍未真正通过：JM 每次检查都会走到处决分支，只是被我们在异常层接住。这是"能用"而不是"通过"。
+
+**已知未解决**：App 交互若干次之后，主线程会进到第 17 条描述的 ijm 交叉现场并跳飞，被"不回复"策略挂住，界面从此失去触摸（进程仍然活着，动画由 render server 独立合成，所以看起来像卡住而不像崩溃）。重新启动 App 可恢复。
+
+`AIA_KILL_DT_SWIZZLE=1` 能彻底消除这条故障（Dynatrace 不再 swizzle 那些 ijm 方法，主线程也就不会进 JM 的 VM），但代价是 App 完全不响应触摸：视图树只剩 `UIWindow → UITransitionView → UIDropShadowView` 三层系统容器，截图仍有内容是因为 render server 保着最后一帧。所以它只能作为对照实验，不能作为默认配置。
 
 ### 设备上的操作要点
 
@@ -239,6 +304,10 @@ Dynatrace 只导入了 `_method_setImplementation` 和 `_class_addMethod` 两个
 | `AIA_FAKE_PATH=1` | 改写 dyld 镜像表里的 `imageFilePath` |
 | `AIA_LOG_IMAGES=1` | 启动时打印所有非系统镜像路径 |
 | `AIA_BLOCK_EXIT=1` | 拦下 `exit(1)`/`_exit(1)`（实验用，会导致死锁） |
+| `AIA_EXC_RECOVER_FAULT=1` | 主线程跳飞时把 PC 设成 LR（默认关；实测必然二次崩溃） |
+| `AIA_EXC_UNWIND_JM=1` | 主线程跳飞时沿帧链退回调用方（默认关；实验性） |
+| `AIA_HOOK_IJM_BINDER=1` | 把 ijm 导入绑定器顶成"直接返回 nil"（默认关；调用方会解引用返回值） |
+| `AIA_KILL_DT_SWIZZLE=1` | 关掉 Dynatrace 的 swizzle 配置器（默认关；会彻底失去触摸） |
 
 构建（Linux + Theos）：
 
