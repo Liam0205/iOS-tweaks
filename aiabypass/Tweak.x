@@ -78,7 +78,7 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #endif
 
 // 实验：安装自己的 Mach 异常处理器，抢在 ellekit 之前拿到故障线程的现场，
-// 这样能看到"谁跳到了非法地址"。AIA_KILL_THREAD=1 时只终止故障线程，不杀整个进程。
+// 这样能看到"谁跳到了非法地址"。
 #ifndef AIA_EXC_HANDLER
 #define AIA_EXC_HANDLER 1
 #endif
