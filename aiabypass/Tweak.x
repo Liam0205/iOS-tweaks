@@ -138,6 +138,21 @@ extern int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t
 #define AIA_UNWIND_BINDER_BRK 0
 #endif
 
+// 1 = 挂上 ijm 导入绑定器入口只做观察：打印 x13（缓存槽）、x14（桩）、
+// 调用方 LR，然后原样执行原函数。用来定位到底是哪个导入在失败。
+// 与 AIA_HOOK_IJM_BINDER 不同，这个不改行为，可以常开。
+#ifndef AIA_TRACE_IJM_BINDER
+#define AIA_TRACE_IJM_BINDER 0
+#endif
+
+// 1 = 观察主二进制自己的 ijm 解释器（KYHAppStore+0x7c56b8）的每次调用和返回结果。
+// 绑定器慢路径就是 bl 到这里；返回值是寄存器结果区，绑定器随后从 [ret+0x70]
+// 取解析出的函数地址、从 [ret+0x78] 取成功标志。只有看这两个槽，
+// 才能区分"脚本没执行完"和"脚本算出来就是 0"。
+#ifndef AIA_TRACE_IJM_VM
+#define AIA_TRACE_IJM_VM 0
+#endif
+
 // 1 = 用 MSHookFunction 挂住 ijm 导入绑定器入口，让这些导入一律返回 nil。
 // 实测不成立：调用方拿到 nil 后仍然解引用该结果，在 KYHAppStore+0x1685010 一带崩溃。
 // 说明这个导入不只是埋点，它的返回值会被当作有效对象使用。
@@ -772,6 +787,17 @@ static void crash_signal_handler(int sig, siginfo_t *si, void *uctx) {
             return;
         }
     }
+    // JM 的处决路径之一是给进程发 SIGUSR1。这个信号的默认动作是终止进程，
+    // 收不到终止原因的话看起来就像"静默退出"。这里记录后直接返回，
+    // 不把它当作需要放大的致命信号。
+    if (sig == SIGUSR1) {
+        static int usr1_logged;
+        if (usr1_logged < 10) {
+            log_raw("  SIGUSR1 ignored (JM 处决信号)\n");
+            usr1_logged++;
+        }
+        return;
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -924,11 +950,59 @@ static int binder_brk_unwind(arm_thread_state64_t *st) {
 #define EXC_STATE_OFF 88
 #define EXC_STATE_BODY_OFF 92
 
-// arm64e 的返回地址和帧指针带 PAC 签名，比较前要先剥掉高位。
+// arm64e 的返回地址和帧指针带 PAC 签名。大多数指针的签名在最高 16 位，
+// 掩码就够了；但也有把签名混进更高位的情况（实测见过 lr=0x61746d81c1f35be8，
+// 真实地址是 0x1c1f35be8）。那种情况下单纯掩码会得到错误地址，于是本该能恢复的
+// 主线程被判成"返回地址无效"而挂起——这正是"App 内卡死"的直接原因。
+// 优先用编译器内建函数，它按签名密钥正确地剥掉签名。
 __attribute__((unused)) static inline uintptr_t aia_strip_pac(uintptr_t v) {
     uintptr_t t = v & 0x0000FFFFFFFFFFFFULL;
     if (t & 0x0000800000000000ULL) t |= 0xFFFF000000000000ULL;
     return t;
+}
+
+// 在已知模块表里找出这个指针真正指向哪里。
+// 混合签名的指针用掩码剥不干净（签名渗进了 bit32 以上），但低 32 位始终是
+// 真实地址的低半部分。iOS 用户态镜像都落在 0x1_00000000 … 0x3_00000000 之间，
+// 所以拿低 32 位配上这几个高位段逐个试，命中即说明这个指针是可用的代码地址。
+// 与 aia_module_for_ptr 相同，但把重建出的无签名地址一并交出。
+// 栈上和帧链里存的返回地址都带 PAC，必须先用它还原，否则一律识别失败，
+// 这正是之前栈扫描和帧链几乎打不出东西的原因。
+static const char *aia_real_ptr(uintptr_t v, uintptr_t *real_out, uintptr_t *off_out) {
+    uintptr_t t = aia_strip_pac(v);
+    uintptr_t o = 0;
+    const char *m = module_for(t, &o);
+    if (m && o) {
+        if (real_out) *real_out = t;
+        if (off_out) *off_out = o;
+        return m;
+    }
+    uintptr_t lo = v & 0xFFFFFFFFULL;
+    for (uintptr_t hi = 0x1; hi <= 0x3; hi++) {
+        uintptr_t c = (hi << 32) | lo;
+        o = 0;
+        m = module_for(c, &o);
+        if (m && o) {
+            if (real_out) *real_out = c;
+            if (off_out) *off_out = o;
+            return m;
+        }
+    }
+    return NULL;
+}
+
+static const char *aia_module_for_ptr(uintptr_t v, uintptr_t *off_out) {
+    uintptr_t cand = aia_strip_pac(v);
+    const char *m = module_for(cand, off_out);
+    if (m && *off_out) return m;
+    uintptr_t lo = v & 0xFFFFFFFFULL;
+    for (uintptr_t hi = 0x1; hi <= 0x3; hi++) {
+        uintptr_t c = (hi << 32) | lo;
+        uintptr_t o = 0;
+        const char *mm = module_for(c, &o);
+        if (mm && o) { *off_out = o; return mm; }
+    }
+    return NULL;
 }
 
 static uint64_t g_main_tid;
@@ -1149,16 +1223,16 @@ static void dump_fault_state(exc_req_t *req) {
         for (int d = 0; d < 64 && fp; d++) {
             uintptr_t prev = 0, ra = 0;
             if (!safe_read(fp, &prev) || !safe_read(fp + 8, &ra)) break;
-            prev = aia_strip_pac(prev);
-            ra = aia_strip_pac(ra);
-            if (!ra) break;
-            uintptr_t po = 0;
-            const char *pm = module_for(ra, &po);
+            uintptr_t po = 0, pReal = 0;
+            const char *pm = aia_real_ptr(ra, &pReal, &po);
             if (pm) {
-                snprintf(buf, sizeof(buf), "  FP#%02d %s+0x%lx\n", d, pm, (unsigned long)po);
+                snprintf(buf, sizeof(buf), "  FP#%02d %s+0x%lx ra=%#lx\n", d, pm,
+                         (unsigned long)po, (unsigned long)ra);
                 log_raw(buf);
             }
-            if (prev <= fp) break;
+            // 帧指针指向栈，不带代码签名，48 位掩码就够；只有返回地址需要重建。
+            prev = aia_strip_pac(prev);
+            if (!prev || prev <= fp) break;
             fp = prev;
         }
     }
@@ -1196,14 +1270,14 @@ static void dump_fault_state(exc_req_t *req) {
     for (size_t i = 0; i < span / sizeof(uintptr_t) && found < limit; i++) {
         uintptr_t v = 0;
         if (!safe_read(sp + i * sizeof(uintptr_t), &v)) break;
-        uintptr_t voff = 0;
-        const char *vm = module_for(v, &voff);
+        uintptr_t voff = 0, vReal = 0;
+        const char *vm = aia_real_ptr(v, &vReal, &voff);
         if (!vm || voff == 0) continue;
         // 主线程多打印系统库：需要看清是哪条 App/系统调用路径进了 JM。
         if (!main_thread && !strstr(vm, "JMCodeProtectKit") && !strstr(vm, "KYHAppStore")) continue;
         if (main_thread && strstr(vm, "libsystem_") && voff == 0) continue;
         snprintf(buf, sizeof(buf), "  stack[+0x%zx] %p %s+0x%lx\n",
-                 i * 8, (void *)v, vm, (unsigned long)voff);
+                 i * 8, (void *)vReal, vm, (unsigned long)voff);
         log_raw(buf);
         found++;
     }
@@ -1311,6 +1385,14 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                 arm_thread_state64_t *nst = (arm_thread_state64_t *)rep->new_state;
                 uintptr_t oldpc = (uintptr_t)__darwin_arm_thread_state64_get_pc(*nst);
                 uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(*nst);
+                // LR 必须是已知模块里的可执行地址，否则"设 PC=LR"会把线程送到
+                // 垃圾地址。实测有 lr=0x77178a81c1f35be8 这种带垃圾高位的值，
+                // 属于签名/损坏的返回地址，不能用它恢复。
+                uintptr_t lrOff2 = 0;
+                const char *lrMod2 = aia_module_for_ptr(lr, &lrOff2);
+                BOOL lrUsable = lrMod2 && lrOff2 >= 0x1000;
+                // 重建出的真实地址（可能和 lr 本身不同，后者带着签名）。
+                uintptr_t lrReal = aia_strip_pac(lr);
                 static int rec_logged;
                 if (rec_logged < 40) {
                     char b[192];
@@ -1366,33 +1448,52 @@ __attribute__((unused)) static void *aia_exc_server(void *arg) {
                     }
                 }
 #endif
-#if AIA_EXC_RECOVER_FAULT
-                // ijm VM 交叉现场里 x0 指向"字节码游标槽"（结构 + 0x708），
-                // 而 JM+0x186634 这条返回路径期望 x0 就是上下文结构。
-                // 直接把 PC 设成 LR 会让它拿游标槽当地址去恢复寄存器，必然二次崩溃。
-                // 这里先把 x0 修回结构地址（VM 入口存在 [sp+0x748] 的入参 x1），再返回。
-                {
-                    uintptr_t x0v = (uintptr_t)nst->__x[0];
-                    uintptr_t spv = (uintptr_t)__darwin_arm_thread_state64_get_sp(*nst);
-                    uintptr_t ctx = 0;
-                    uintptr_t lrOff = 0;
-                    const char *lm = module_for(lr, &lrOff);
-                    BOOL vmSite = lm && strstr(lm, "JMCodeProtectKit") &&
-                                  lrOff >= 0x186600 && lrOff < 0x186700;
-                    if (vmSite && x0v > spv && x0v - spv == 0x708 &&
-                        safe_read(spv + 0x748, &ctx) && ctx) {
-                        char b[192];
-                        snprintf(b, sizeof(b), "  RECOVER ctx=%#lx (x0 %#lx -> ctx)\n",
-                                 (unsigned long)ctx, (unsigned long)x0v);
+                // 早先的做法是"主线程只要出事就不回复"，结果是主线程永久停在异常里，
+                // 界面失去响应（表现为 App 内卡死）。现在改成：有可用返回地址就让它
+                // 返回、继续跑 runloop；只有返回地址本身是坏值时才挂起。
+                // LR 落在 objc/libdyld 这类运行时库内部时，跳过去等于接着执行
+                // 它们的内部代码：objc_msgSend 的中间点并不接受"消息发送失败"这种
+                // 上下文，实测会让进程直接结束。这种情况下把返回值清零，让它按
+                // "这次消息得到 nil"继续走，是唯一不破坏调用约定的选择。
+                BOOL lrInRuntime = lrMod2 && (strstr(lrMod2, "libobjc") ||
+                                              strstr(lrMod2, "libdyld"));
+                if (lrUsable && lrInRuntime) {
+                    static int rt_logged;
+                    if (rt_logged < 20) {
+                        char b[160];
+                        snprintf(b, sizeof(b), "  RTLR pc=%#lx -> %s+0x%lx x0:=0\n",
+                                 (unsigned long)oldpc, lrMod2, (unsigned long)lrOff2);
                         log_raw(b);
-                        nst->__x[0] = (uint64_t)ctx;
+                        rt_logged++;
                     }
+                    nst->__x[0] = 0;
                 }
-                __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)lr);
-#else
-                memset(req, 0, rcv + 2048);
-                continue;
-#endif
+                if (lrUsable) {
+                    // 用低 32 位重建出无签名的地址再跳，避免把签名位带进 PC。
+                    uintptr_t target = (aia_strip_pac(lr) & 0xFFFFFFFFULL) == (lr & 0xFFFFFFFFULL)
+                                       ? aia_strip_pac(lr) : lrReal;
+                    uintptr_t to = 0;
+                    if (!module_for(target, &to) || !to) {
+                        target = ((uintptr_t)0x1 << 32) | (lr & 0xFFFFFFFFULL);
+                        for (uintptr_t hi = 0x1; hi <= 0x3; hi++) {
+                            uintptr_t c = (hi << 32) | (lr & 0xFFFFFFFFULL);
+                            if (module_for(c, &to) && to) { target = c; break; }
+                        }
+                    }
+                    __darwin_arm_thread_state64_set_pc_fptr(*nst, (void *)target);
+                }
+                else {
+                    static int deadlr_logged;
+                    if (deadlr_logged < 10) {
+                        char b[128];
+                        snprintf(b, sizeof(b), "  DEADLR pc=%#lx lr=%#lx -> 挂起\n",
+                                 (unsigned long)oldpc, (unsigned long)lr);
+                        log_raw(b);
+                        deadlr_logged++;
+                    }
+                    memset(req, 0, rcv + 2048);
+                    continue;
+                }
                 rep->Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
                 rep->Head.msgh_remote_port = req->Head.msgh_remote_port;
                 rep->Head.msgh_local_port = MACH_PORT_NULL;
@@ -1758,6 +1859,115 @@ __attribute__((unused)) __attribute__((unused)) static void log_exception_port_o
 #endif
 
 #if AIA_BLOCK_DYNATRACE
+// 1 = 只拦"目标是 ijm 桩"的 swizzle，而不是把 Dynatrace 的配置器整个关掉。
+// 全关会让 Dynatrace 自身状态不自洽，App 完全不响应触摸（视图树只剩三层系统容器）。
+// 精准拦截既能阻止 ijm 方法被包装后调用，又不影响 Dynatrace 的其它埋点。
+#ifndef AIA_BLOCK_IJM_SWIZZLE
+#define AIA_BLOCK_IJM_SWIZZLE 1
+#endif
+
+#if AIA_BLOCK_IJM_SWIZZLE
+// ijm 导入桩的固定开头：
+//   str  x13, [sp, #-0x30]!
+//   adrp x13, <thunk 页>
+//   add  x13, x13, #<槽偏移>
+//   br   x13
+// 后面经 thunk 一路跳到 KYHAppStore+0x7c5508 的导入绑定器。只要第一个 IMP
+// 长这个样子，这个方法就是由 ijm 保护实现的。
+static int imp_is_ijm_stub(IMP imp) {
+    if (!imp) return 0;
+    uintptr_t base = app_base();
+    uintptr_t a = (uintptr_t)imp;
+    if (!base || a < base || a - base >= 0x35dc000) return 0;
+    uint32_t w0 = 0, w3 = 0;
+    if (!safe_read(a, (uintptr_t *)&w0)) return 0;
+    if (!safe_read(a + 12, (uintptr_t *)&w3)) return 0;
+    return w0 == 0xf81d0fed && w3 == 0xd61f01a0;
+}
+#else
+static int imp_is_ijm_stub(IMP imp) { (void)imp; return 0; }
+#endif
+
+// 1 = 只拦 Dynatrace 对"App 自身实现的方法"装 hook，系统类照常放行。
+// 实测 ijm 保护的方法在 App 里是普通编译代码（例如 KYHAppStore+0xf3426c），
+// 内部再调用 ijm 导入，所以没法靠 IMP 形状识别。但被 Dynatrace 包装后调用时，
+// 这些导入会在错误的上下文里失败，最终撞 brk #0xdead。
+// 把拦截范围收窄到"原实现就在 App 主二进制里"，既断掉这条路径，又不影响
+// Dynatrace 对系统类的埋点——整份关闭配置器（AIA_KILL_DT_SWIZZLE）会让
+// Dynatrace 自身状态不自洽，App 从此完全不响应触摸。
+#ifndef AIA_BLOCK_DT_APP_SWIZZLE
+#define AIA_BLOCK_DT_APP_SWIZZLE 1
+#endif
+
+#if AIA_BLOCK_DT_APP_SWIZZLE
+static int g_dt_app_blocked;
+
+// 沿调用链判断这段代码最终会不会进到 ijm 导入绑定器。
+// 被保护的方法本身是普通编译代码（例如 KYHAppStore+0xf3426c），
+// 但它内部会调用 adrp x14,#0x7c5000 / add x14,x14,#0x508 / br x14 这种导入桩。
+// 逐个精确地反汇编整段不现实，这里用两个廉价特征：
+//   1) 实现落在 App 主二进制里；并且
+//   2) 方法名不是 App 自己追加前缀的业务 swizzle（tyc_/autoLog_/h5_/mt_ 等）。
+// 后者用于避开 App 自己的业务 hook，把它们拦掉会让 App 启动即退出。
+static int imp_is_ijm_protected(IMP imp) {
+    if (!imp) return 0;
+    uintptr_t off = 0;
+    const char *m = module_for((uintptr_t)imp, &off);
+    return m && (strstr(m, "KYHAppStore") || strstr(m, "YoubangHealth"));
+}
+
+// 方法所属的类。arm64 上 Method 结构的前 8 字节就是 class 指针。
+__attribute__((unused)) static Class class_from_method(Method m) { return m ? *(Class *)m : NULL; }
+
+// 这个类本身是否定义在 App 主二进制里。
+__attribute__((unused)) static int class_is_app_class(Class c) {
+    if (!c) return 0;
+    uintptr_t off = 0;
+    const char *m = module_for((uintptr_t)c, &off);
+    return m && (strstr(m, "KYHAppStore") || strstr(m, "YoubangHealth"));
+}
+
+// 方法的当前实现是否位于 App 主二进制里。
+static int imp_is_app_code(IMP imp) {
+    if (!imp) return 0;
+    uintptr_t off = 0;
+    const char *m = module_for((uintptr_t)imp, &off);
+    return m && (strstr(m, "KYHAppStore") || strstr(m, "YoubangHealth"));
+}
+
+// 这个方法是否出现在 c（或其元类）自己的方法列表里，而不是从父类继承来的。
+static int method_is_own(Class c, SEL sel) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    if (ms) {
+        for (unsigned int i = 0; i < n; i++) {
+            if (method_getName(ms[i]) == sel) { free(ms); return 1; }
+        }
+        free(ms);
+    }
+    Class meta = object_getClass((id)c);
+    if (meta && meta != c) {
+        ms = class_copyMethodList(meta, &n);
+        if (ms) {
+            for (unsigned int i = 0; i < n; i++) {
+                if (method_getName(ms[i]) == sel) { free(ms); return 1; }
+            }
+            free(ms);
+        }
+    }
+    return 0;
+}
+
+static void log_dt_app_block(const char *api, Method m) {
+    if (g_dt_app_blocked >= 60) return;
+    char b[224];
+    snprintf(b, sizeof(b), "  DT-APPBLOCK %s %s\n",
+             api, m ? sel_getName(method_getName(m)) : "?");
+    log_raw(b);
+    g_dt_app_blocked++;
+}
+#endif
+
 static int imp_from_dynatrace(IMP imp) {
     if (!imp) return 0;
     uintptr_t off = 0;
@@ -1767,6 +1977,19 @@ static int imp_from_dynatrace(IMP imp) {
 
 static IMP (*orig_method_setImplementation)(Method, IMP);
 static IMP my_method_setImplementation(Method m, IMP imp) {
+#if AIA_BLOCK_DT_APP_SWIZZLE
+    if (m && imp_is_ijm_protected(method_getImplementation(m))) {
+        log_dt_app_block("setImplementation", m);
+        return method_getImplementation(m);
+    }
+#endif
+    if (m && imp_is_ijm_stub(method_getImplementation(m))) {
+        char b[224];
+        snprintf(b, sizeof(b), "  DT-IJMBLOCK setImplementation %s\n",
+                 sel_getName(method_getName(m)));
+        log_raw(b);
+        return method_getImplementation(m);
+    }
     if (imp_from_dynatrace(imp)) {
         char b[224];
         uintptr_t off = 0;
@@ -1782,6 +2005,20 @@ static IMP my_method_setImplementation(Method m, IMP imp) {
 
 static void (*orig_method_exchangeImplementations)(Method, Method);
 static void my_method_exchangeImplementations(Method a, Method b) {
+#if AIA_BLOCK_DT_APP_SWIZZLE
+    if (a && (imp_is_ijm_protected(method_getImplementation(a)))) {
+        log_dt_app_block("exchange", a);
+        return;
+    }
+#endif
+    if (a && b && (imp_is_ijm_stub(method_getImplementation(a)) ||
+                   imp_is_ijm_stub(method_getImplementation(b)))) {
+        char b2[224];
+        snprintf(b2, sizeof(b2), "  DT-IJMBLOCK exchange %s <-> %s\n",
+                 sel_getName(method_getName(a)), sel_getName(method_getName(b)));
+        log_raw(b2);
+        return;
+    }
     if (a && b && (imp_from_dynatrace(method_getImplementation(a)) ||
                    imp_from_dynatrace(method_getImplementation(b)))) {
         char buf[224];
@@ -1795,6 +2032,13 @@ static void my_method_exchangeImplementations(Method a, Method b) {
 
 static BOOL (*orig_class_addMethod)(Class, SEL, IMP, const char *);
 static BOOL my_class_addMethod(Class c, SEL sel, IMP imp, const char *types) {
+    if (imp_is_ijm_stub(imp)) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "  DT-IJMBLOCK addMethod %s %s\n",
+                 c ? class_getName(c) : "?", sel ? sel_getName(sel) : "?");
+        log_raw(buf);
+        return NO;
+    }
     if (imp_from_dynatrace(imp)) {
         char buf[224];
         snprintf(buf, sizeof(buf), "  DT-BLOCK class_addMethod %s %s\n",
@@ -1807,6 +2051,26 @@ static BOOL my_class_addMethod(Class c, SEL sel, IMP imp, const char *types) {
 
 static IMP (*orig_class_replaceMethod)(Class, SEL, IMP, const char *);
 static IMP my_class_replaceMethod(Class c, SEL sel, IMP imp, const char *types) {
+#if AIA_BLOCK_DT_APP_SWIZZLE
+    // 注意不能用 class_getInstanceMethod：它在子类上也会返回从父类继承来的方法，
+    // 那样会把 App 自己的业务 swizzle（tyc_*、autoLog_*、mt_*、h5_* 等）一并拦掉，
+    // 实测会让 App 在启动阶段就退出。这里只认"这个方法就声明在 c 自己的方法列表里"。
+    if (c && sel && method_is_own(c, sel) && imp_is_app_code(imp)) {
+        Method ex = class_getInstanceMethod(c, sel);
+        if (!ex) ex = class_getClassMethod(c, sel);
+        if (ex) {
+            log_dt_app_block("replaceMethod", ex);
+            return method_getImplementation(ex);
+        }
+    }
+#endif
+    if (imp_is_ijm_stub(imp)) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "  DT-IJMBLOCK replaceMethod %s %s\n",
+                 c ? class_getName(c) : "?", sel ? sel_getName(sel) : "?");
+        log_raw(buf);
+        return (IMP)NULL;
+    }
     if (imp_from_dynatrace(imp)) {
         char buf[224];
         snprintf(buf, sizeof(buf), "  DT-BLOCK class_replaceMethod %s %s\n",
@@ -1840,7 +2104,10 @@ static uintptr_t app_base(void);
 // 它们的实现由 JMCodeProtectKit 的 ijm VM 接管。VM 在本进程里把导入绑定器的代码区
 // 当成字节码解释，解出越界的跳转表项后跳飞。这些方法只是埋点，直接返回 nil 即可。
 #ifndef AIA_NEUTER_IJM
-#define AIA_NEUTER_IJM 1
+// 默认关闭。这个功能会在运行 3 秒后遍历所有类、把落在 ijm 绑定器区域的
+// 方法实现替换成返回空值的桩。在 arm64e 上这样做会破坏方法缓存的一致性，
+// 实测主线程随即在 objc_msgSend 里 PAC 认证失败（pc=libobjc+0x7f8c）。
+#define AIA_NEUTER_IJM 0
 #endif
 
 #if AIA_NEUTER_IJM
@@ -1855,7 +2122,7 @@ static BOOL aia_return_no(id self, SEL _cmd) {
 }
 
 // 一个方法的实现是否落在 ijm 保护桩区域（KYHAppStore 里那段导入绑定器）。
-static int imp_is_ijm_stub(IMP imp, uintptr_t *off_out) {
+static int imp_in_binder_region(IMP imp, uintptr_t *off_out) {
     uintptr_t a = (uintptr_t)imp;
     uintptr_t base = app_base();
     if (!base || a < base) return 0;
@@ -1882,7 +2149,7 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
             for (unsigned int k = 0; k < n; k++) {
                 IMP imp = method_getImplementation(ms[k]);
                 uintptr_t off = 0;
-                if (!imp_is_ijm_stub(imp, &off)) continue;
+                if (!imp_in_binder_region(imp, &off)) continue;
                 const char *name = sel_getName(method_getName(ms[k]));
                 BOOL isBool = strstr(name, "is") == name || strstr(name, "has") == name;
                 snprintf(b, sizeof(b), "  IJM %s%s%s stub=+0x%lx\n",
@@ -1917,6 +2184,22 @@ __attribute__((unused)) static void neuter_ijm_telemetry(void) {
 // 这里 hook 绑定器入口，把 0 换成元数据表里记录的合法桩地址。
 #ifndef AIA_PATCH_BINDER_VALUE
 #define AIA_PATCH_BINDER_VALUE 1
+#endif
+
+// 1 = 把 ijm 导入绑定器真正使用的解析器换成我们自己的。
+//
+// 绑定器 KYHAppStore+0x7c5508 在缓存槽为空时，先看 [meta+0x48]。这个位置存的是
+// 偏移 0x4058008，指向 __DATA 尾部的一个槽；运行时该槽被填成某个别的 ijm 运行时的
+// 入口（实测主线程从这里进去后，会拿着主二进制的字节码用 JMCodeProtectKit 的
+// 分派表和密钥去解释，opcode 越界直接跳到未映射地址）。
+//
+// 槽在 __DATA，可写，改它不会像改 __TEXT 那样让代码页失去执行权限。
+// 解析器契约（从 0x7c5600 逆出）：调用时 sp 已下移，返回时必须在 sp 上留一个
+// 0x30 字节的帧、[sp] 放返回地址，并用 x14 给出实现地址、x15 给出成功标志。
+// 1 = 我们自己的解析器桩；2 = 把槽清零，让绑定器回退到元数据里的 0x7c5600
+// （App 自己的解析器 + 自己的 VM + 自己的描述符，ABI 天然一致）。
+#ifndef AIA_IJM_RESOLVER
+#define AIA_IJM_RESOLVER 2
 #endif
 // 1 = 把 ijm 绑定器失败出口的 brk #0xdead 补成 NOP。
 // 实测有害：brk 之后 0x7c55fc 的上下文恢复依赖一个并不存在的现场，
@@ -1953,6 +2236,67 @@ __attribute__((noinline, used)) static id aia_binder_entry(void) {
 
 __attribute__((unused)) static id aia_import_nil(void) { return nil; }
 
+#if AIA_TRACE_IJM_BINDER
+// 绑定器是尾调用进来的：进来时 x0/x1/x2 是调用方留下的寄存器，
+// x13 是缓存槽地址、x14 是桩地址。这里只记录不改写，然后调原函数。
+static int g_binder_traced;
+static void (*g_orig_binder_entry)(void);
+__attribute__((noinline, used)) static void aia_binder_trace(void) {
+    if (g_binder_traced < 40) {
+        uintptr_t sp, x13v, x14v, lr;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        __asm__ volatile("mov %0, x13" : "=r"(x13v));
+        __asm__ volatile("mov %0, x14" : "=r"(x14v));
+        __asm__ volatile("mov %0, x30" : "=r"(lr));
+        uintptr_t o1 = 0, o2 = 0, o3 = 0;
+        const char *m1 = module_for(lr, &o1);
+        const char *m2 = module_for(x14v, &o2);
+        const char *m3 = module_for(x13v, &o3);
+        char b[256];
+        snprintf(b, sizeof(b), "  BNDTRACE #%d lr=%s+0x%lx stub=%s+0x%lx slot=%s+0x%lx\n",
+                 g_binder_traced, m1 ? m1 : "?", (unsigned long)o1,
+                 m2 ? m2 : "?", (unsigned long)o2, m3 ? m3 : "?", (unsigned long)o3);
+        log_raw(b);
+        g_binder_traced++;
+    }
+    ((void (*)(void))g_orig_binder_entry)();
+}
+#endif
+
+#if AIA_TRACE_IJM_VM
+static uint64_t (*g_orig_app_vm)(uint64_t, uint64_t, uint64_t);
+static int g_appvm_log;
+
+// 与解释器同样的 C 调用约定：x0=描述符、x1=寄存器结果区、x2=返回地址。
+__attribute__((noinline, used)) static uint64_t aia_app_vm_trace(uint64_t x0, uint64_t x1,
+                                                                  uint64_t x2) {
+    (void)x2;
+    uint64_t r = g_orig_app_vm(x0, x1, x2);
+    if (g_appvm_log < 60) {
+        uint64_t d0 = 0, d4 = 0, v0 = 0, v8 = 0, v70 = 0, v78 = 0, v110 = 0;
+        safe_read((uintptr_t)x0, (uintptr_t *)&d0);
+        safe_read((uintptr_t)x0 + 4, (uintptr_t *)&d4);
+        safe_read((uintptr_t)r, (uintptr_t *)&v0);
+        safe_read((uintptr_t)r + 8, (uintptr_t *)&v8);
+        safe_read((uintptr_t)r + 0x70, (uintptr_t *)&v70);
+        safe_read((uintptr_t)r + 0x78, (uintptr_t *)&v78);
+        safe_read((uintptr_t)r + 0x110, (uintptr_t *)&v110);
+        char b[288];
+        snprintf(b, sizeof(b),
+                 "  APPVM #%d desc=%#llx [d0]=%#llx [d4]=%#llx ret=%#llx"
+                 " r0=%#llx r8=%#llx r70=%#llx r78=%#llx r110=%#llx\n",
+                 g_appvm_log, (unsigned long long)x0,
+                 (unsigned long long)d0, (unsigned long long)d4,
+                 (unsigned long long)r, (unsigned long long)v0,
+                 (unsigned long long)v8, (unsigned long long)v70,
+                 (unsigned long long)v78, (unsigned long long)v110);
+        log_raw(b);
+        g_appvm_log++;
+    }
+    return r;
+}
+#endif
+
 static void install_vm_probe(void);
 
 __attribute__((unused)) static void patch_binder_slow_path(void) {
@@ -1961,6 +2305,11 @@ __attribute__((unused)) static void patch_binder_slow_path(void) {
     // 直接改 __TEXT 里的元数据会让该页失去执行权限（iOS 不允许代码页可写），
     // 绑定器自己也跟着无法执行。改成用 MSHookFunction 挂绑定器入口：
     // 它由桩尾跳到，lr 就是桩调用方的返回地址，直接返回等价于"这个导入返回 nil"。
+#if AIA_TRACE_IJM_BINDER
+    MSHookFunction((void *)(base + 0x7c5508), (void *)aia_binder_trace,
+                   (void **)&g_orig_binder_entry);
+    log_raw("BINDER trace installed\n");
+#endif
 #if AIA_HOOK_IJM_BINDER
     static void (*orig_binder)(void);
     MSHookFunction((void *)(base + 0x7c5508), (void *)aia_binder_entry, (void **)&orig_binder);
@@ -1970,6 +2319,11 @@ __attribute__((unused)) static void patch_binder_slow_path(void) {
     log_raw(b);
 #else
     (void)aia_binder_entry;
+#endif
+#if AIA_TRACE_IJM_VM
+    MSHookFunction((void *)(base + 0x7c56b8), (void *)aia_app_vm_trace,
+                   (void **)&g_orig_app_vm);
+    log_raw("APPVM hook installed\n");
 #endif
 #if AIA_VM_PROBE
     install_vm_probe();
@@ -2042,6 +2396,68 @@ __attribute__((unused)) static void install_vm_probe(void) {
 // 直接在 0x7c5590 的 cbz x15 上做不了（静态代码不可改，__TEXT 只读），
 // 所以改为 hook 绑定器回调 0x7c5588 里 blr 出去的那个函数——它是 ijm 运行时的
 // 导入解析器。解析失败的判据是返回 0，我们改成返回元数据表里的 PTR。
+#if AIA_IJM_RESOLVER
+// 我们给出的"实现"：被那批 ijm 桩当成真实函数调用。这些桩都是 App 的埋点类方法，
+// 返回空值即可；x0 清零保证返回 nil，而不是把上一个调用的残留值当对象用。
+__attribute__((naked, used)) static void aia_ijm_impl_stub(void) {
+    __asm__ volatile("mov x0, #0\n\t"
+                     "ret\n\t");
+}
+
+// 非 static：naked 函数里的汇编要按符号名引用它，符号必须留在符号表里。
+__attribute__((used)) void *aia_ijm_impl_ptr = (void *)&aia_ijm_impl_stub;
+
+// 绑定器 blr 解析器时期望的收尾方式：sp 上留 0x30 字节帧。
+// 少了这一步，绑定器在 0x7c558c 的 ldr x30,[sp],#0x30 会读回垃圾返回地址。
+__attribute__((naked, used)) static void aia_ijm_resolver(void) {
+    __asm__ volatile("sub sp, sp, #0x30\n\t"
+                     "str x30, [sp]\n\t"
+                     "adrp x14, _aia_ijm_impl_ptr@PAGE\n\t"
+                     "add  x14, x14, _aia_ijm_impl_ptr@PAGEOFF\n\t"
+                     "ldr  x14, [x14]\n\t"
+                     "mov  x15, #1\n\t"
+                     "ret\n\t");
+}
+
+// 槽的运行时地址 = 镜像基址 + 0x4058008（绑定器用 x28=基址 做 add）。
+static void *g_ijm_slot_addr(void) {
+    uintptr_t base = app_base();
+    return base ? (void *)(base + 0x4058008) : NULL;
+}
+
+static void install_ijm_resolver(void) {
+    void *slot = g_ijm_slot_addr();
+    if (!slot) { log_raw("IJMRES no app base\n"); return; }
+    uintptr_t cur = 0;
+    if (!safe_read((uintptr_t)slot, &cur)) { log_raw("IJMRES unreadable slot\n"); return; }
+    uintptr_t coff = 0;
+    const char *cm = module_for(cur, &coff);
+    char b[224];
+    snprintf(b, sizeof(b), "IJMRES slot=%p cur=%#lx %s+0x%lx\n", slot,
+             (unsigned long)cur, cm ? cm : "?", (unsigned long)coff);
+    log_raw(b);
+    if (vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)slot & ~0xFFFULL), 0x4000,
+                   FALSE, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        snprintf(b, sizeof(b), "IJMRES vm_protect failed\n");
+        log_raw(b);
+        return;
+    }
+#if AIA_IJM_RESOLVER == 2
+    // 清零后绑定器走 cbz x16 -> [meta+0x10] = 0x7c5600 的回退分支。
+    *(volatile uintptr_t *)slot = 0;
+    snprintf(b, sizeof(b), "IJMRES -> 0 (回退到 %#lx)\n",
+             (unsigned long)(app_base() + 0x7c5600));
+#else
+    *(volatile uintptr_t *)slot = (uintptr_t)&aia_ijm_resolver;
+    snprintf(b, sizeof(b), "IJMRES -> resolver=%p impl=%p\n",
+             (void *)&aia_ijm_resolver, (void *)&aia_ijm_impl_stub);
+#endif
+    log_raw(b);
+}
+#else
+__attribute__((unused)) static void install_ijm_resolver(void) {}
+#endif
+
 __attribute__((unused)) static void patch_binder_zero_values(void) {
     uintptr_t base = app_base();
     if (!base) { log_raw("BINDER no app base\n"); return; }
@@ -2303,6 +2719,8 @@ __attribute__((constructor)) static void aiabypass_init(void) {
         sigaction(SIGBUS, &sa, NULL);
         sigaction(SIGILL, &sa, NULL);
         sigaction(SIGTRAP, &sa, NULL);
+        // JM 用 SIGUSR1 处决进程，必须由我们接住。
+        sigaction(SIGUSR1, &sa, NULL);
     }
     snapshot_modules();
     {
@@ -2398,6 +2816,11 @@ __attribute__((constructor)) static void aiabypass_init(void) {
 #endif
 #if AIA_PATCH_BINDER_VALUE
     patch_binder_zero_values();
+#endif
+#if AIA_IJM_RESOLVER
+    // 槽要等 App 自己的初始化写完之后再换，否则会被覆盖回原值。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0, 0), ^{ install_ijm_resolver(); });
 #endif
 #if AIA_NOP_IJM_BRK
     // 绑定器失败出口 KYHAppStore+0x7c55f8 是 brk #0xdead，主线程撞上就会被 SIGTRAP 打死。
