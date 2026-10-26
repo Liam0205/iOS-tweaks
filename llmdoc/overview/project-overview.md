@@ -13,6 +13,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 | `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
 | `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-95) |
 | `page.0x01.lianjiabypass` | 链家 / 贝壳找房 | `com.exmart.HomeLink` / `com.lianjia.beike` | 链家 9.86.91 / 贝壳 3.06.21 | 已发布 0.1.0 |
+| `page.0x01.aiabypass` | 友邦友享 | `com.aia.china.YoubangHealthRelease` | 6.9.33 | 已发布 1.0.0（判定未绕过，处决被接住） |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
 
@@ -39,6 +40,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
 - abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
 - simtouch 当前版本：`0.1.0`，已发布到 Sileo 源；backboardd hook 触摸注入已验证（tap/swipe/longpress），事件录制已完成，回放待调试；截图 MVP 正常（功能进展详见 `llmdoc/architecture/simtouch-architecture.md`）
+- aiabypass 当前版本：`1.0.0`，友邦友享 6.9.33 不再一打开就闪退，首页加载、5 个 tab 切换、滚动、前后台往返正常，连续三次冷启动验证通过。**但这是全仓唯一一个判定没绕过的 tweak**：JM（JMCodeProtectKit）的判定发生在它自己初始化阶段，早于任何 tweak 代码，启动期仍有 2 次处决由 Mach 异常端口接住。手段与边界详见 `llmdoc/architecture/aiabypass-architecture.md`
 - lianjiabypass 当前版本：`0.1.0`，已发布，完全绕过链家（`com.exmart.HomeLink`）与贝壳找房（`com.lianjia.beike`）共用检测栈的四层越狱检测（文件检测 + dyld 镜像枚举 + 主线程注入检测 + JGBSDK 内联 svc exit），两个 App 主界面均验证完整加载
 
 ## 软件源与 CI/CD 架构
@@ -75,6 +77,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `bankcommbypass/Tweak.x`：交通银行 Hook 主入口
 - `icbcbypass/Tweak.x`：工商银行 Hook 主入口（fishhook + Logos）
 - `abcbypass/Tweak.x`：农业银行 Hook 主入口（fishhook + MSHookFunction + Logos，ARM64 栈切换）；实验日志 `abcbypass/analysis.md`（12 轮迭代，v1-v95）
+- `aiabypass/Tweak.x`：友邦友享 Hook 主入口（Mach 异常端口接管 + ijm 解析器槽清零，无 Logos）；实验日志 `aiabypass/analysis.md`（54 节，结论在第 41–54 节）
 - `lianjiabypass/Tweak.x`：链家/贝壳找房 Hook 主入口（fishhook + MSHookFunction + 运行时 __text patch，四层对抗）；实验日志 `lianjiabypass/analysis.md`（14 轮迭代，v0.0.1 → 0.1.0）
 - `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + 进程存活健康检查 + sysctl 孤儿检测 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
 - `simtouch/`：远程触摸模拟与截图捕获工具（`Tweak.x` 注入 SpringBoard、`BackboardHook.x` 注入 backboardd hook 触摸事件管道、`SocketServer.m` AF_UNIX IPC、`ScreenCapture.m` 截图管道、`TouchInjector.m` IPC 中继、`tools/simtouch.c` CLI、`simtouchprefs/` 设置面板；详见 `llmdoc/architecture/simtouch-architecture.md`）
