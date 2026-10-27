@@ -3,7 +3,9 @@
 ## 目的
 
 本文档汇总汇丰香港 App 已查明的检测组件、退出机制排查结论与当前进度。
-**状态：排查中，没有可用版本。死因已确认为主动 `exit(1)`，但退出路径未定位。**
+**状态：排查中，没有可用版本。** 判定引擎已确认为 `hsbchkmobilebankingx`（Promon
+SHIELD 的 libshield），已能接管它的私有系统调用网关并观察全部系统调用，退出点已定位到
+`+0x5d842c`；但还没能让 App 正常使用。
 
 ## 目标与背景
 
@@ -15,15 +17,21 @@
 - 测试设备：iPhone 13 Pro / iOS 15.4.1（22215，rootless Dopamine + ElleKit）
 - 对应 tweak：项目目录 `hsbchkbypass/`，包名 `page.0x01.hsbchkbypass`
 
-> ⚠️ **汇丰香港与汇丰中国是两套完全不相干的技术栈。** 中国版 3.75.0 用 ZDefend，
-> 香港版既没有 ZDefend 也没有 Promon，更没有 OneSpan 的 RASP 实现。中国版的做法
-> （把自杀线程入口改 `ret`、让威胁列表返回空）在香港版上不起任何作用。
-> 中国版见 `llmdoc/reference/hsbc-china-detection-vectors.md`。
+> ⚠️ **2026-10-27 更正：香港版用 Promon SHIELD。**
+> `hsbchkmobilebankingx.framework`（9 MB）就是 Promon 的 libshield，
+> `__cstring` 里有 263 条 `/mobile/release/shield/third_party/libressl/` 构建路径，
+> 主二进制引用 `PRMShieldEventManager`。它的网关偏移、全局槽偏移、安装点、mach 封装
+> 地址与本文档记录的中国版 3.72.15（Promon 时代）**逐字节一致**，是同一份构建。
+>
+> 两边仍然不能共用同一份 tweak：中国版 3.75.0 已经换成 ZDefend，香港版还是 Promon；
+> 而且香港版的判定跑在 `hsbchkmobilebankingx` 里，中国版在 `hsbcchinax` 里。
+> 中国版现状见 `llmdoc/reference/hsbc-china-detection-vectors.md`。
 
 ## 检测栈
 
 | 组件 | 大小 | 作用 |
 |---|---|---|
+| **`hsbchkmobilebankingx.framework`** | **9 MB** | **Promon SHIELD 的 libshield，判定与退出都在这里** |
 | `TransmitSDK3.framework` | 4.1 MB | 含 `libDeviceSecurityAssessment`，**内嵌开源 IOSSecuritySuite**，另有自建 `JailbreakCheck` 枚举 |
 | `TechnicalPlatform.framework` | 31.8 MB | 含 `WafMobileSdk.JailBrokenHelper`（F5/Shape 的 WAF 移动端 SDK），读 `/Applications/Cydia.app` 一类路径 |
 | `DataProvider.framework` | 3.9 MB | 把各项结果汇成 `deviceJailbroken`、`applicationRepackaged`、`debuggerAttached`、`hookingFrameworks`、`nativeCodeHooks` 等布尔标记 |
@@ -216,6 +224,98 @@ exit 前   4 条指令：d503237f a9be4ff4 a9017bfd 910043fd   ← 真实代码�
 2. 关注 `UIApplication` 的私有终止路径（`_terminateWithStatus:` 一类）；
 3. 在越狱本体层面做进程外隐藏（roothide 一类做法）——与「不动越狱本体」的约束冲突，
     需要用户先松开这条约束。
+
+## Promon SHIELD 的私有系统调用网关（2026-10-27 Round 4）
+
+这一节是当前最有价值的部分：它解释了为什么前十几种拦截手段全部零命中。
+
+### 结构
+
+| 项 | 镜像内偏移 | 说明 |
+|---|---|---|
+| 系统调用网关 | `+0x78befc` | `svc #0x80; ret; brk #1`，在 `__TEXT,__const` |
+| 网关全局槽 | `+0x8510c8` | 存网关的运行时地址，在 `__common` |
+| 网关安装点 | `+0x346c68` | `adrp/add` 算出网关地址后 `str` 进槽 |
+| mach trap 封装 | `+0x40c698` | `mov x16,#-0x1f` → 读槽 → `blr x17` |
+| 退出函数 | `+0x5d842c` | 无条件 `exit(1)`，四个守卫函数调用 |
+
+全镜像共 **83 个**封装用 `ldr x17,[0x8510c8]; blr x17` 走这条网关。
+`x16` 是系统调用号，`x0..x7` 是参数。
+
+**因为这些调用一条都不经过 libSystem 的具名符号**，fishhook 改 GOT、
+`MSHookFunction` 挂 `exit`/`_exit`、hook `syscall`、扫内联 `svc` 全都覆盖不到。
+
+### 接管方式：只改一个数据槽
+
+网关槽是普通可写数据，83 个封装每次调用都重新读它。把它换成自己的入口就完成接管，
+**不需要改任何代码，不需要 `vm_protect`，不碰 `__TEXT`**。
+
+网关入口有两条硬约束：
+
+1. **不能调用 libc。** 盾会在 libc 尚未就绪的线程上调用网关，处理函数里一进
+   `snprintf`（要读区域设置和线程局部存储）就踩空。实测崩溃栈是
+   `hsbchkmobilebankingx +0x448da0 → gw_entry → gw_log → snprintf → SIGSEGV@0x50`。
+   正确做法是处理函数只把寄存器写进环形缓冲，手写格式化，用裸 `svc #0x80` 的
+   `write` 落地。
+2. **`x0..x15` 必须全部保存。** 原网关只有 `svc; ret`，除了 `x0`/`x1` 什么都不改。
+   中间插一次 `bl` 会按 AAPCS64 把 `x0..x18` 全当调用者保存寄存器用，只备份
+   `x0..x7` 会让盾里内联在循环中的计数器悄悄变值。
+
+### 观察到的判定输入
+
+接管后解码 `mach_msg` 请求头：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| `msgh_id` | 4808 | `mach_vm_read_overwrite` |
+| `w3` | `0x1_0000_0000` | 目标 task（自己） |
+| `w4` | 地址 | 要读的位置 |
+| `w5` | 长度 | 常见 `0x20`（32 字节 Mach-O 头）与后续节表 |
+
+一次冷启动约 **750–1500 次**这样的读取，依次扫过进程里每个镜像的基址。
+注入库（`libellekit.dylib`、`libinjector.dylib`、tweak 自身）确实在里面。
+
+### 没有导入任何 dyld 枚举接口
+
+`hsbchkmobilebankingx` 的导入表里**一个镜像枚举符号都没有**：没有
+`_dyld_image_count`、没有 `_dyld_get_image_header`、没有 `_dyld_get_image_name`，
+也没有 `dlopen`。dyld 相关只有 `__dyld_find_unwind_sections`、
+`__dyld_register_func_for_remove_image`、`dyld_stub_binder` 三个。
+`dlsym` 导入了，但 hook 之后观察到一个调用都没有。
+
+**所以它那份准确的镜像列表从哪来，目前还没查明**，这是当前的核心盲点。
+也就没法从输入侧切断判定。
+
+### 已试过但无效的干预
+
+| 干预 | 结果 |
+|---|---|
+| 拦退出系统调用（网关处返回） | 进程从 ~100ms 活到 15 秒以上，但停在启动图；截断状态机后主线程不再恢复 |
+| 置空盾的 71 个 `__mod_init_func` | 无效。盾的初始化走 ObjC `+load`，不走 C 构造函数 |
+| hook 三个 `_dyld_*` 枚举接口 | 无效，盾根本不调用它们 |
+| hook `dlsym` | 无效，盾一次都没调用；而且挂上之后当次运行 2 秒内就死，疑为自曝 |
+| 改写注入库的 `LC_ID_DYLIB` 路径 | 无效。改完必须把代码页恢复成 `r-x`，否则 SIGBUS（代码签名） |
+| 把退出函数首条指令改 `ret` | 部分：偶发活过 8 秒，但也出现主线程 `pc/lr/sp/fp` 全零的崩溃 |
+| 把注入库的 mach 读取重定向到系统 dylib | 生效 9 次，盾仍在同一处退出 |
+
+重定向那版有个细节：替身**不能选盾自己**——它是可执行文件，第一个 load command 是
+`LC_SEGMENT_64`，而解析器期待 `LC_ID_DYLIB`，会顺着垃圾偏移读崩。换成
+`libobjc.A.dylib` 这类真 dylib 才不崩。
+
+### ⚠️ 盾可能在做自身的完整性检查
+
+它导入了 `_class_copyMethodList`、`_method_getImplementation`、`_method_getName`、
+`_timingsafe_bcmp`、`_dlsym`——这套组合与 ZDefend 的 `apptampering_hooked`
+（比对自己导入的函数有没有被换过）属于同一类。
+
+**所以对盾做实验时，应当只改数据、不碰任何代码，并且一次只上一个变量。**
+
+### 平台无关的可复用点
+
+- 遇到「所有基于符号的 hook 零命中」，先怀疑目标有私有 syscall 网关，
+  去它的 `__TEXT` 里搜 `svc` 指令和 `ldr xN,[全局槽]; blr xN` 的封装形状。
+- 网关槽是可写数据，改它比改代码安全得多。
+- 接管任何底层入口时，先想清楚"原实现到底改了哪些寄存器"，按调用约定完整保存。
 
 ## 排查方法（可复用）
 
