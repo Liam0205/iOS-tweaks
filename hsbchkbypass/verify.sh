@@ -83,12 +83,28 @@ for n in $(seq 1 "$RUNS"); do
 killall -9 HongKong 2>/dev/null
 sleep 2
 uiopen --bundle hk.com.hsbc.hsbchkmobilebanking >/dev/null 2>&1
+# 进程外的观察者要在进程还在的时候就挂上去，所以这里抢着找 pid，
+# 找到立刻交给 procwatch。找不到就退化成只看存活时间。
+PW=""
+for i in \$(seq 1 300); do
+  P=\$(ps -eo pid,args | grep -F 'HongKong.app/HongKong' | grep -v grep | awk '{print \$1}' | head -1)
+  if [ -n "\$P" ]; then
+    PW=\$P
+    /var/jb/usr/local/bin/procwatch "\$P" 8 > /var/mobile/hkout/pw_$n.txt 2>&1 &
+    break
+  fi
+done
 for i in \$(seq 1 $SECS); do
   sleep 1
   ps -eo args | grep -F 'HongKong.app/HongKong' | grep -v grep >/dev/null || { echo "第 \${i}s 退出"; exit 0; }
 done
 echo "存活 ${SECS}s"
 EOF
+done
+
+scp -P "$PORT" -o BatchMode=yes -q "$HOST:/var/mobile/hkout/pw_*.txt" /var/tmp/hk/log/ 2>/dev/null
+for f in /var/tmp/hk/log/pw_*.txt; do
+  [ -f "$f" ] && { echo "--- $f ---"; cat "$f"; }
 done
 
 OUT=/var/tmp/hk/log
