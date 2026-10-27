@@ -160,6 +160,8 @@ static volatile int  g_probe_done;
 
 static int safe_read(uint64_t addr, void *dst, size_t n);
 static void *heartbeat(void *arg);
+static int disguise_one(uintptr_t base, const char *newname);
+static void *neutralizer(void *arg);
 
 static volatile uint64_t g_last_fp;
 
@@ -581,9 +583,40 @@ static void *poller(void *arg) {
         pthread_t th;
         pthread_create(&th, NULL, heartbeat, NULL);
     }
-    // 代码级改动全部关闭：实测把报警项改成恒返回 0 之后，退出点从检查表
-    // 换到初始化路径（+0x43a190），并且两次运行里有一次是 SIGSEGV。
-    // 说明判定不止一处，单点改代码只会换一条路，还可能把自己打崩。
+    // 就地改 LC_ID_DYLIB 会 SIGBUS（写的是代码页），已关闭。
+    if (0 && g_inj_n > 0) {
+        char want[256];
+        want[0] = 0;
+        const char *mainp = NULL;
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && strstr(nm, "/HongKong.app/HongKong")) { mainp = nm; break; }
+        }
+        if (mainp) {
+            const char *cut = strstr(mainp, "/HongKong.app/");
+            if (cut) {
+                size_t pre = (size_t)(cut - mainp) + 14;   // 含 "/HongKong.app/"
+                if (pre < sizeof(want) - 64) {
+                    memcpy(want, mainp, pre);
+                    strcpy(want + pre, "Frameworks/RASPFramework.framework/RASPFramework");
+                    for (int i = 0; i < g_inj_n; i++) {
+                        int ok = disguise_one((uintptr_t)g_inj_lo[i], want);
+                        say_hex("伪装 ok=", ok);
+                        if (ok) say(want), say("\n");
+                    }
+                }
+            }
+        }
+    }
+
+    // 所有威胁上报最后都汇到 +0x40e7e4（w0=原因码，x1=描述）。它是个正常函数，
+    // 由 callers 用 bl 调用、返回后 callers 各自继续走自己的清理流程。
+    // 把它换成直接返回，等于"上报了但什么都不做"——比改更深处的 exit 安全得多，
+    // 因为不动调用方的栈假设。
+    if (g_base) {
+        // 已证实改代码会被盾的自检抓到（SIGBUS），关闭。
+    }
         if (g_taken == 1) {
             uint64_t want = (uint64_t)(uintptr_t)&gw_entry;
             uint64_t cur = *g_slot;
@@ -905,6 +938,39 @@ static volatile int g_checks_dumped;
 
 // 主动把报警那一项调一次，前后打时刻标记。它在这段时间里发的系统调用
 // 就是它的全部输入——比静态读虚拟机快得多。
+// 把注入库的 LC_ID_DYLIB 路径就地改成 App 包内的路径。
+// 关键点：这条字符串就是库镜像自己的 load command 里的那份，改它等于同时改了
+// "dyld 列表里的路径"和"LC_ID_DYLIB"，两边始终一致，不会出现对不上的破绽。
+static int disguise_one(uintptr_t base, const char *newname) {
+    const uint32_t *h = (const uint32_t *)base;
+    if (h[0] != 0xfeedfacf) return 0;
+    uint32_t ncmds = h[4];
+    uintptr_t lc = base + 32;
+    for (uint32_t i = 0; i < ncmds && i < 400; i++) {
+        uint32_t cmd  = *(const uint32_t *)lc;
+        uint32_t size = *(const uint32_t *)(lc + 4);
+        if (size < 8 || size > 0x10000) return 0;
+        if (cmd == 0x0d) {                       // LC_ID_DYLIB
+            uint32_t stroff = *(const uint32_t *)(lc + 8);
+            char *str = (char *)(lc + stroff);
+            size_t oldlen = strlen(str);
+            size_t newlen = strlen(newname);
+            if (newlen > oldlen) return 0;       // 不能写长，会踩到后面的数据
+            uintptr_t page = (uintptr_t)str & ~(uintptr_t)0xfff;
+            size_t span = (((uintptr_t)str + newlen + 1) - page + 0xfff) & ~(size_t)0xfff;
+            if (mach_vm_protect(mach_task_self(), page, span, 0,
+                                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0;
+            for (size_t k = 0; k < newlen; k++) str[k] = newname[k];
+            for (size_t k = newlen; k < oldlen; k++) str[k] = 0;
+            sys_icache_invalidate((void *)page, span);
+            mach_vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+            return 1;
+        }
+        lc += size;
+    }
+    return 0;
+}
+
 static volatile int g_called;
 
 static volatile int g_diag;
@@ -944,10 +1010,11 @@ static void neutralize_checks(void);
 static void *neutralizer(void *arg) {
     (void)arg;
     // 不预建单例：盾的初始化完成之前调 getter 会崩。只能等它自己出现。
-    for (int i = 0; i < 4000; i++) {
+    // 向量被清空之后还可能被重新填回来，所以不能清一次就收工，
+    // 要一直盯着，直到判定窗口过去。
+    for (int i = 0; i < 20000; i++) {
         neutralize_checks();
-        if (g_neutralized && i > 20) break;
-        usleep(500);
+        usleep(200);
     }
     return NULL;
 }
@@ -1412,15 +1479,11 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.106 启动（只观察）=====\n");
+    say("===== 0.0.111 启动（只观察）=====\n");
 
     try_takeover();
     {
-        pthread_t th;
-        {
-            pthread_t th;
-            pthread_create(&th, NULL, neutralizer, NULL);
-        }
+        // 干预全部关闭：只观察。
     }
     dump_images();
     if (getenv("HSB_PROBE")) { probe_all_image_infos(find_cache_base()); dump_main_header(); }
