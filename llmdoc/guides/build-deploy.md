@@ -98,6 +98,26 @@ make package FINALPACKAGE=1 \
 
 `ADDITIONAL_LDFLAGS` 确保系统 clang 使用工具链的 ld64 而非 GNU ld。`libtinfo.so.5` 版本警告可忽略。
 
+### 两个环境坑
+
+**`PERL5LIB` 指向别人的 perl5 会让 logos 直接失败。** 症状是预处理阶段就退出：
+
+```
+Can't locate warnings.pm: /home/liam/perl5/lib/perl5/warnings.pm: Permission denied
+BEGIN failed--compilation aborted at <theos>/bin/logos.pl line 4.
+```
+
+这不是 Theos 装坏了，而是 shell 里带着一个指向别的用户家目录的 `PERL5LIB`。
+用 `env -u PERL5LIB` 跑构建即可，不必去改那个环境变量本身：
+
+```bash
+env -u PERL5LIB THEOS=/home/safe/theos make package FINALPACKAGE=1
+```
+
+**各 tweak 的 Makefile 不再写死 `export THEOS`。** 现在统一由调用方通过环境变量传入，
+和 CI 的做法一致（CI 里是 `echo "THEOS=$HOME/theos" >> $GITHUB_ENV`）。
+本地构建时记得带上 `THEOS=<theos 路径>`，否则 `$(THEOS)/makefiles/common.mk` 找不到。
+
 ## sshtunnel 构建与部署
 
 sshtunnel 是 Theos Application（`APPLICATION_NAME`），不是 tweak。构建和安装步骤与 tweak 相同，但有以下差异：

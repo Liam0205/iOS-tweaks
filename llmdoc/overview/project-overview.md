@@ -15,10 +15,10 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 | `page.0x01.lianjiabypass` | 链家 / 贝壳找房 | `com.exmart.HomeLink` / `com.lianjia.beike` | 链家 9.86.91 / 贝壳 3.06.21 | 已发布 0.1.0 |
 | `page.0x01.aiabypass` | 友邦友享 | `com.aia.china.YoubangHealthRelease` | 6.9.33 | 已发布 1.0.0（判定未绕过，处决被接住） |
 | `page.0x01.whbypass` | 国家网络身份认证 | `cn.cyberIdentity.certification` | 1.2.38 | 已发布 1.0.0 |
-| `page.0x01.hsbcchinabypass` | 汇丰中国 | `cn.com.hsbc.hsbcchina` | 汇丰中国 3.75.0 | 已发布 1.0.0（判定未绕过，后果可控） |
+| `page.0x01.hsbcchinabypass` | 汇丰中国 | `cn.com.hsbc.hsbcchina` | 汇丰中国 3.75.0 | 已发布 1.0.1（判定未绕过，后果可控） |
 | `page.0x01.hsbchkbypass` | 汇丰香港 | `hk.com.hsbc.hsbchkmobilebanking` | 汇丰香港 3.69.12 | 排查中，未发布 |
 
-mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。
+mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。汇丰两个包原名合一的 `page.0x01.hsbcbypass`，2026-10-27 因两者技术栈完全不同而拆分，`hsbcchinabypass` 用 `Conflicts`/`Replaces` 接替旧包。
 
 ## 开发工具
 
@@ -46,6 +46,8 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - aiabypass 当前版本：`1.0.0`，友邦友享 6.9.33 不再一打开就闪退，首页加载、5 个 tab 切换、滚动、前后台往返正常，连续三次冷启动验证通过。**但这是全仓唯一一个判定没绕过的 tweak**：JM（JMCodeProtectKit）的判定发生在它自己初始化阶段，早于任何 tweak 代码，启动期仍有 2 次处决由 Mach 异常端口接住。手段与边界详见 `llmdoc/architecture/aiabypass-architecture.md`
 - whbypass 当前版本：`1.0.0`，国家网络身份认证 1.2.38 打开即闪退的问题已根治。检测引擎是梆梆安全 Everisk；闪退根因是主程序里 6 个"炸弹函数"把 `sp`/`lr` 改成上下文值后 `br` 到 `0xb5a0X000`（`__PAGEZERO` 里无法映射的地址），这些函数只通过 block 的 `invoke` 字段被调用。把这些入口改成 `ret` 之后启动期异常归零，因此不再需要接管 Mach 异常端口、关 KSCrash 或拦 `thread_suspend`。日志由 `DEBUG` 宏自动开关：`make package` 带日志，`make package FINALPACKAGE=1` 不带。三次冷启动各 40 秒、再持续 3 分钟以上稳定，首页到申领流程全程可交互。详见 `llmdoc/architecture/whbypass-architecture.md`
 - lianjiabypass 当前版本：`0.1.0`，已发布，完全绕过链家（`com.exmart.HomeLink`）与贝壳找房（`com.lianjia.beike`）共用检测栈的四层越狱检测（文件检测 + dyld 镜像枚举 + 主线程注入检测 + JGBSDK 内联 svc exit），两个 App 主界面均验证完整加载
+- hsbcchinabypass 当前版本：`1.0.1`，汇丰中国 3.75.0 不再闪退也不再显示拦截页，首页到「设置您的手机银行」全程可交互。1.0.1 只改包名（原名 `hsbcbypass`），功能与 1.0.0 一致。手段是把 ZDefend 自杀线程入口（`ZDefend+0x23a380`）改成 `ret`，再让威胁列表返回空。**判定没有被消除**：ZDefend 照样报 11 条威胁，只是既杀不掉进程也没人把威胁拿去渲染。详见 `llmdoc/reference/hsbc-china-detection-vectors.md`
+- hsbchkbypass 当前版本：无可用版本，排查中。汇丰香港 3.69.12 是另一套技术栈（`TransmitSDK3` 内嵌开源 IOSSecuritySuite + `TechnicalPlatform` 的 WafMobileSdk），基线是启动约 900ms 静默消失，libc 终止原语与信号处理器全部零命中，退出机制尚未定位。详见 `llmdoc/reference/hsbc-hk-detection-vectors.md`
 
 ## 软件源与 CI/CD 架构
 
@@ -84,6 +86,8 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - `aiabypass/Tweak.x`：友邦友享 Hook 主入口（Mach 异常端口接管 + ijm 解析器槽清零，无 Logos）；实验日志 `aiabypass/analysis.md`（54 节，结论在第 41–54 节）
 - `whbypass/Tweak.x`：国家网络身份认证 Hook 主入口（主二进制指令补丁：6 个炸弹函数入口改 `ret` + 反调试守卫改 `ret`）；实验日志 `whbypass/analysis.md`
 - `lianjiabypass/Tweak.x`：链家/贝壳找房 Hook 主入口（fishhook + MSHookFunction + 运行时 __text patch，四层对抗）；实验日志 `lianjiabypass/analysis.md`（14 轮迭代，v0.0.1 → 0.1.0）
+- `hsbcchinabypass/Tweak.x`：汇丰中国 Hook 主入口（运行时 patch `ZDefend+0x23a380` 为 `ret` + MSHookMessageEx 清空威胁列表，无 Logos）；实验日志 `hsbcchinabypass/analysis.md`（结论在 Round 78）
+- `hsbchkbypass/Tweak.x`：汇丰香港探针（终止原语 hook + hook 自检 + 内联 svc 扫描 + 心跳线程，只观察不改行为）；排查日志 `hsbchkbypass/analysis.md`；`hsbchkbypass/verify.sh` 负责部署探针、关掉其它 tweak、冷启动观测与回捞日志
 - `sshtunnel/`：SSH 反向隧道应用（`TunnelManager.m` 为核心，4 态状态机 + 进程存活健康检查 + sysctl 孤儿检测 + 指数退避自动重连 + LaunchDaemon 开机持久化；详见 `llmdoc/architecture/sshtunnel-architecture.md`）
 - `simtouch/`：远程触摸模拟与截图捕获工具（`Tweak.x` 注入 SpringBoard、`BackboardHook.x` 注入 backboardd hook 触摸事件管道、`SocketServer.m` AF_UNIX IPC、`ScreenCapture.m` 截图管道、`TouchInjector.m` IPC 中继、`tools/simtouch.c` CLI、`simtouchprefs/` 设置面板；详见 `llmdoc/architecture/simtouch-architecture.md`）
 - `mybankbypass/Makefile` / `bankcommbypass/Makefile` / `icbcbypass/Makefile`：Theos 构建配置

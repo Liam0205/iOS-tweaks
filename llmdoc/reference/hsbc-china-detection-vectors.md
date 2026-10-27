@@ -11,6 +11,14 @@
 - 主 Binary：`China.app/China`（arm64, ~12.6 MB）
 - 测试设备：iPhone 13 Pro / iOS 15.4.1（22215，rootless Dopamine + ElleKit）
 - 判定引擎：**ZDefend.framework（Zimperium）**
+- 对应 tweak：项目目录 `hsbcchinabypass/`，包名 `page.0x01.hsbcchinabypass`，
+  1.0.1 起生效（1.0.0 及更早叫 `hsbcbypass` / `page.0x01.hsbcbypass`，已由
+  `Conflicts`/`Replaces` 接替）
+
+> ⚠️ **本文档只讲汇丰中国。** 汇丰香港（`hk.com.hsbc.hsbchkmobilebanking`）是另一套
+> 技术栈，既没有 ZDefend 也没有 Promon，见
+> `llmdoc/reference/hsbc-hk-detection-vectors.md`。两者曾在同一个 `hsbcbypass` 包里，
+> 2026-10-27 拆分改名。
 
 > ⚠️ **本文档在 Round 78 重写。** 3.75.0 之前的版本用的是 Promon SHIELD，
 > 可执行文件也是 `Frameworks/hsbcchinax.framework/hsbcchinax`，两者都已不存在。
