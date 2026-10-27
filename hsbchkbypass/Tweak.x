@@ -306,6 +306,49 @@ static void emit_rec(const rec_t *r, uint64_t now) {
     o_ch(&o, '\n');
     emit(buf, (size_t)(o.p - buf));
 
+    // 报警项是纯内存判定（调用期间没有任何系统调用），而且可重复调用。
+    // 那就拿它当预言机：逐个字段清零，看哪个字段一清，结果就从 1 变 0。
+    if (g_base) {
+        uint64_t obj2 = *(volatile uint64_t *)(g_base + 0x8509d0);
+        if (obj2 > 0x100000000ULL && obj2 < 0x800000000ULL) {
+            uint64_t bg = *(volatile uint64_t *)(obj2 + 0x10);
+            uint64_t en = *(volatile uint64_t *)(obj2 + 0x18);
+            if (bg > 0x100000000ULL && en > bg && (en - bg) / 8 <= 64) {
+                uint64_t e1 = ((const uint64_t *)(uintptr_t)bg)[1];
+                uint64_t vt2 = *(const uint64_t *)(uintptr_t)e1;
+                uint64_t vf = *(const uint64_t *)(uintptr_t)(vt2 + 0x10);
+                if (vf > g_base && vf < g_base + 0x8c0000) {
+                    int r0 = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
+                    out_t q = { buf, buf + sizeof(buf) - 1 };
+                    o_s(&q, "预言机 基线="); o_d(&q, r0); o_ch(&q, '\n');
+                    emit(buf, (size_t)(q.p - buf));
+
+                    for (int off = 8; off < 0xb0; off += 8) {
+                        if (off == 0x10 || off == 0x18) continue;   // 跳过向量本身
+                        volatile uint64_t *f = (volatile uint64_t *)(uintptr_t)(e1 + (uint64_t)off);
+                        uint64_t saved = *f;
+                        if (!saved) continue;
+                        // 只碰不像指针的值：指向地址空间的值一律跳过，解引用会崩。
+                        if (saved > 0x100000000ULL && saved < 0x800000000ULL) continue;
+                        *f = 0;
+                        int r = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
+                        *f = saved;
+                        if (r != r0) {
+                            out_t q2 = { buf, buf + sizeof(buf) - 1 };
+                            o_s(&q2, "命中字段 +"); o_h(&q2, (unsigned long long)off);
+                            o_s(&q2, " 原值="); o_h(&q2, saved);
+                            o_s(&q2, " 清零后="); o_d(&q2, r); o_ch(&q2, '\n');
+                            emit(buf, (size_t)(q2.p - buf));
+                        }
+                    }
+                    out_t q3 = { buf, buf + sizeof(buf) - 1 };
+                    o_s(&q3, "字段扫描结束\n");
+                    emit(buf, (size_t)(q3.p - buf));
+                }
+            }
+        }
+    }
+
     // 判定就在此刻：把盾的检查表就地读出来，看是哪一项在报警。
     if (!g_base) return;
     uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
@@ -388,6 +431,49 @@ static void emergency_line(const rec_t *r) {
     }
     o_ch(&o, '\n');
     emit(buf, (size_t)(o.p - buf));
+
+    // 报警项是纯内存判定（调用期间没有任何系统调用），而且可重复调用。
+    // 那就拿它当预言机：逐个字段清零，看哪个字段一清，结果就从 1 变 0。
+    if (g_base) {
+        uint64_t obj2 = *(volatile uint64_t *)(g_base + 0x8509d0);
+        if (obj2 > 0x100000000ULL && obj2 < 0x800000000ULL) {
+            uint64_t bg = *(volatile uint64_t *)(obj2 + 0x10);
+            uint64_t en = *(volatile uint64_t *)(obj2 + 0x18);
+            if (bg > 0x100000000ULL && en > bg && (en - bg) / 8 <= 64) {
+                uint64_t e1 = ((const uint64_t *)(uintptr_t)bg)[1];
+                uint64_t vt2 = *(const uint64_t *)(uintptr_t)e1;
+                uint64_t vf = *(const uint64_t *)(uintptr_t)(vt2 + 0x10);
+                if (vf > g_base && vf < g_base + 0x8c0000) {
+                    int r0 = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
+                    out_t q = { buf, buf + sizeof(buf) - 1 };
+                    o_s(&q, "预言机 基线="); o_d(&q, r0); o_ch(&q, '\n');
+                    emit(buf, (size_t)(q.p - buf));
+
+                    for (int off = 8; off < 0xb0; off += 8) {
+                        if (off == 0x10 || off == 0x18) continue;   // 跳过向量本身
+                        volatile uint64_t *f = (volatile uint64_t *)(uintptr_t)(e1 + (uint64_t)off);
+                        uint64_t saved = *f;
+                        if (!saved) continue;
+                        // 只碰不像指针的值：指向地址空间的值一律跳过，解引用会崩。
+                        if (saved > 0x100000000ULL && saved < 0x800000000ULL) continue;
+                        *f = 0;
+                        int r = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
+                        *f = saved;
+                        if (r != r0) {
+                            out_t q2 = { buf, buf + sizeof(buf) - 1 };
+                            o_s(&q2, "命中字段 +"); o_h(&q2, (unsigned long long)off);
+                            o_s(&q2, " 原值="); o_h(&q2, saved);
+                            o_s(&q2, " 清零后="); o_d(&q2, r); o_ch(&q2, '\n');
+                            emit(buf, (size_t)(q2.p - buf));
+                        }
+                    }
+                    out_t q3 = { buf, buf + sizeof(buf) - 1 };
+                    o_s(&q3, "字段扫描结束\n");
+                    emit(buf, (size_t)(q3.p - buf));
+                }
+            }
+        }
+    }
 
     // 判定就在此刻：把盾的检查表就地读出来，看是哪一项在报警。
     if (!g_base) return;
@@ -1001,6 +1087,7 @@ static void call_verdict(void) {
 // 把终点写成起点，遍历就一项都不跑，判定自然落到"无威胁"。
 // 只改这一个数据字，不碰任何代码。
 static volatile int g_neutralized;
+static volatile unsigned long long g_clear_count;
 static volatile unsigned g_neutralized_mark;
 static void *neutralizer(void *arg);
 static void neutralize_checks(void);
@@ -1010,11 +1097,10 @@ static void neutralize_checks(void);
 static void *neutralizer(void *arg) {
     (void)arg;
     // 不预建单例：盾的初始化完成之前调 getter 会崩。只能等它自己出现。
-    // 向量被清空之后还可能被重新填回来，所以不能清一次就收工，
-    // 要一直盯着，直到判定窗口过去。
-    for (int i = 0; i < 20000; i++) {
+    // 填充到复制之间的空档只有微秒级，休眠轮询会漏掉。这里忙等，一直盯到判定窗口过去。
+    uint64_t t0 = up_ms();
+    while (up_ms() - t0 < 400) {
         neutralize_checks();
-        usleep(200);
     }
     return NULL;
 }
@@ -1037,6 +1123,7 @@ static void neutralize_checks(void) {
         if (*mask == 0xffffffffffff0701ULL) *mask = 0;
     }
 
+    g_clear_count++;
     if (!g_neutralized) {
         g_neutralized = 1;
         say_hex("检查表已改指：项数=", n);
@@ -1130,6 +1217,114 @@ static void dump_main_header(void) {
         say("HDRDUMP 结束\n");
         return;
     }
+}
+
+// 把注入库从 dyld 的镜像数组里摘掉。
+// 数组在 AllImages 对象的 +0x28，条目数是 +0x30，每项是 Loader*（其 +0x8 是 Mach-O 头）。
+// 做法是把要摘的项和末尾一项对调，再把条目数减一——只动两个数字和一个指针，
+// 不碰任何代码页，也不留下"被改过"的痕迹。
+static int hide_injected_images(uintptr_t cache_base) {
+    if (!cache_base || g_inj_n <= 0) return 0;
+    uint64_t g = 0;
+    if (!safe_read(cache_base + (0x202acdcd0ULL - 0x1a8ef4000ULL), &g, 8)) return 0;
+    if (g < 0x100000000ULL || g > 0x800000000ULL) return 0;
+
+    uint64_t arr = 0, cnt = 0, cap = 0;
+    if (!safe_read(g + 0x28, &arr, 8)) return 0;
+    if (!safe_read(g + 0x30, &cnt, 8)) return 0;
+    if (!safe_read(g + 0x38, &cap, 8)) return 0;
+    if (arr < 0x100000000ULL || cnt < 10 || cnt > cap || cap > 100000) return 0;
+    say_hex("dyld 镜像数组=", arr);
+    say_hex("  条目数=", cnt);
+    say_hex("  容量=", cap);
+
+    int removed = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t p = 0, hdr = 0;
+        if (!safe_read(arr + i * 8, &p, 8)) break;
+        if (p < 0x100000000ULL || p > 0x800000000ULL) continue;
+        if (!safe_read(p + 8, &hdr, 8)) continue;
+        int bad = 0;
+        for (int k = 0; k < g_inj_n; k++)
+            if (hdr >= g_inj_lo[k] && hdr < g_inj_hi[k]) { bad = 1; break; }
+        if (!bad) {
+            // 兜底：Loader 里可能还有别处记着头，按路径再认一次。
+            uint64_t pp = 0;
+            if (safe_read(p + 0x10, &pp, 8) && pp > 0x100000000ULL && pp < 0x800000000ULL) {
+                char nm[160];
+                if (safe_read(pp, nm, sizeof(nm) - 1)) {
+                    nm[sizeof(nm) - 1] = 0;
+                    if (strstr(nm, "preboot") || strstr(nm, "systemhook") ||
+                        strstr(nm, "TweakInject") || strstr(nm, "ellekit")) bad = 1;
+                }
+            }
+        }
+        if (!bad) continue;
+        uint64_t last = 0;
+        if (!safe_read(arr + (cnt - 1) * 8, &last, 8)) break;
+        *(volatile uint64_t *)(uintptr_t)(arr + i * 8) = last;
+        cnt--;
+        *(volatile uint64_t *)(uintptr_t)(g + 0x30) = cnt;
+        removed++;
+        say_hex("  摘掉一个注入镜像，头=", hdr);
+        say_hex("    剩=", cnt);
+        if (i > 0) i--;
+    }
+    say_hex("共摘掉=", removed);
+    return removed;
+}
+
+// _dyld_get_image_header 的桩里有这么两条：
+//     adrp x8, #0x202acd000 ; ldr x0, [x8, #0xcd0]
+// 取到的就是 dyld 的 AllImages 对象，镜像数组就在它身上。
+// 那个全局在共享缓存里的偏移是固定的，换算成 cache_base + 固定偏移即可。
+static void probe_all_images_object(uintptr_t cache_base) {
+    if (!cache_base) { say("没有缓存基址\n"); return; }
+    uintptr_t g = cache_base + (0x202acdcd0ULL - 0x1a8ef4000ULL);
+    uint64_t obj = 0;
+    if (!safe_read(g, &obj, 8)) { say("读不到全局\n"); return; }
+    say_hex("AllImages 全局=", g);
+    say_hex("  → 对象=", obj);
+    if (obj < 0x100000000ULL || obj > 0x800000000ULL) return;
+
+    const char *hx = "0123456789abcdef";
+    for (int off = 0; off < 0x60; off += 16) {
+        char lb[96];
+        out_t o = { lb, lb + sizeof(lb) - 1 };
+        o_s(&o, "  +"); o_h(&o, (unsigned long long)off); o_s(&o, "  ");
+        for (int k = 0; k < 16; k++) {
+            unsigned v = *(const volatile unsigned char *)(obj + off + k);
+            o_ch(&o, hx[(v >> 4) & 0xf]); o_ch(&o, hx[v & 0xf]); o_ch(&o, ' ');
+        }
+        o_ch(&o, '\n');
+        emit(lb, (size_t)(o.p - lb));
+    }
+
+    // 逐个字段当成"可能是数组指针"来试：指向的内存里连续几项都指向已知镜像头，就是它。
+    say_hex("  已知镜像头个数=", g_known_n);
+    for (int off = 0; off < 0x60; off += 8) {
+        uint64_t p = 0;
+        if (!safe_read(obj + off, &p, 8)) continue;
+        if (p < 0x100000000ULL || p > 0x800000000ULL) continue;
+        for (int k = 0; k < 0x100; k += 8) {
+            int run = 0;
+            for (int j = 0; j < 6; j++) {
+                uint64_t q = 0, h = 0;
+                if (!safe_read(p + j * 8, &q, 8)) break;
+                if (q < 0x100000000ULL || q > 0x800000000ULL) break;
+                if (!safe_read(q + k, &h, 8) || !is_known_header(h)) break;
+                run++;
+            }
+            if (run >= 6) {
+                say_hex("  数组字段 +", (unsigned long long)off);
+                say_hex("    数组=", p);
+                say_hex("    头偏移=", (unsigned long long)k);
+                goto found;
+            }
+        }
+    }
+found:
+    ;
 }
 
 static void probe_all_image_infos(uintptr_t cache_base) {
@@ -1479,14 +1674,19 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.111 启动（只观察）=====\n");
+    say("===== 0.0.120 启动（只观察）=====\n");
 
     try_takeover();
     {
-        // 干预全部关闭：只观察。
+        // 干预关闭：这一版只找 dyld 的镜像数组
     }
     dump_images();
-    if (getenv("HSB_PROBE")) { probe_all_image_infos(find_cache_base()); dump_main_header(); }
+    if (0) {
+        uintptr_t cb = find_cache_base();
+        probe_all_image_infos(cb);
+        probe_all_images_object(cb);
+        dump_main_header();
+    }
     if (g_base) {
         g_shield_lo = g_base;
         g_shield_hi = g_base + 0x8c0000;
@@ -1517,6 +1717,10 @@ __attribute__((constructor)) static void ctor(void) {
         say_hex("注入库个数=", k);
     }
 
+    // 摘除 dyld 镜像数组里的注入条目：实测无效（盾不用这份数组），
+    // 而且范围匹配会误伤邻近镜像，已关闭。
+    if (0) hide_injected_images(find_cache_base());
+
     {
         // 替身优先选 libobjc / libsystem，它们本身就是 dylib，load command 结构齐全。
         const char *want[] = { NULL };
@@ -1535,7 +1739,7 @@ __attribute__((constructor)) static void ctor(void) {
         }
         // 本轮只观察，不参与：重定向整轮关闭，保证只有一个变量。
         for (int i = 0; i < g_inj_n; i++) g_decoys[i] = decoy;
-        g_decoys_n = decoy ? g_inj_n : 0;
+        g_decoys_n = 0;   // 本轮只找字段，重定向关掉
         say_hex("替身库基址=", decoy);
     }
 
