@@ -4,9 +4,34 @@
 
 绕过国家网络身份认证（Bundle `cn.cyberIdentity.certification`，可执行文件 `WHClient`）在越狱设备上打开即闪退的问题。子项目 `whbypass/`，包名 `page.0x01.whbypass`。目标版本 1.2.38（build 13），rootless，验证环境 iPhone 13 Pro / iOS 15.4.1 / Dopamine + ElleKit。完整实验过程见 `whbypass/analysis.md`。
 
-当前版本 `0.1.77`。启动期不再发生任何异常跳转（`EXCFAULT` 计数为 0），连续三次冷启动
-各 40 秒、再持续运行 3 分钟以上都稳定，线程数固定 15，首页 → 管理 → 我的 →
+当前版本 `1.0.0`。启动期不再发生任何异常跳转（`EXCFAULT` 计数为 0），连续三次冷启动
+各 40 秒、再持续运行 3 分钟以上都稳定，线程数稳定在 15 上下，首页 → 管理 → 我的 →
 网号网证申领 → 同意协议 → 证件类型选择全程可交互。
+
+## 日志：由构建类型自动开关
+
+日志的开关是编译期的，不在运行时判断：
+
+```c
+#ifndef WH_LOG_ENABLED
+#ifdef DEBUG
+#define WH_LOG_ENABLED 1
+#else
+#define WH_LOG_ENABLED 0
+#endif
+#endif
+```
+
+theos 的 debug 构建会加 `-DDEBUG`，`make package` 默认就是这种；`make package FINALPACKAGE=1`
+是 release 构建，不带 `-DDEBUG`。所以：
+
+- `make package` → 带日志，写 `Library/Caches/gtcfg.log`，供排查用；
+- `make package FINALPACKAGE=1` → 所有日志调用被编译掉，`open_log()` 不创建任何文件，
+  信号处理器与异常现场导出也不安装。
+
+发布包用后者。实测 release 包运行一分钟以上，容器里没有出现 `gtcfg.log`。
+
+**改完这个宏必须 `make clean`**，否则 `.theos/obj` 里会残留上一次构建的产物。
 
 ## 检测栈与判定位置
 
