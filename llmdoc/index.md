@@ -35,6 +35,7 @@
 - `llmdoc/reference/whbypass-detection-vectors.md`：国家网络身份认证（`cn.cyberIdentity.certification` / WHClient 1.2.38）检测向量——Bangcle Everisk（`everisk_ZDAX iOS5.1.2.SP2-250207`）+ 27 个 checker 与其可读名、`SecureUtilityPlus` 在本 App 里零方法、6 个炸弹函数的偏移/跳向/构造点清单与毒地址 `0xb5a0X000` 的生成方式（`mov`+`movk` 拼两个立即数相加）、反调试守卫 `+0x1406b0` 的指令级清单与"计数自增会被观察"的实测、KSCrash 的 `thread_suspend` 调用点、已排除手法。
 - `llmdoc/reference/simtouch-technical-decisions.md`：SimTouch 技术决策——Phase 1（_UICreateScreenUIImage、JPEG 压缩、CIImage redraw、CLI CoreFoundation）+ Phase 2（事件克隆 vs 从零创建、hook 选型、Darwin notification IPC 复用、backboardd 沙箱录制路径、单次 IPC swipe 消除合并竞态、gesture arbiter 投递路径限制迫使系统手势走 SpringBoard API、edge mask 诊断用途）+ Phase 3（从零创建多指事件、cubic-bezier、HID keyboard、killall backboardd）。
 - `llmdoc/reference/hsbc-china-detection-vectors.md`：汇丰中国（`cn.com.hsbc.hsbcchina`）检测向量。**Round 78 已按 3.75.0 重写**：判定引擎换成 **ZDefend（Zimperium）**，Promon 的 `ShieldSDK.framework` 与旧的 `hsbcchinax.framework` 都已不在包里。要点：ZDefend 的判定不看越狱路径，只比“自己导入的函数有没有被换过”（`apptampering_hooked`）、dlopen 是否指向 systemhook（`app_tampering_interposed`）、`statfs("/usr/lib")` 是否 bindfs（`JB Dopamine-Roothide`）；判定结果可由 `+[ZDefendImpl getAllThreats]` 直接读出，每条带 `threatJson` 证据。终止链 `+0x23a3c8 → +0x23a380 → +0x1e569c → exit`。3.72.15 及更早的 Promon 结论存档在 `memory/reflections/hsbc-china-promon-poc.md`。
+- `hsbcbypass/CHANGELOG.md`：HSBCBypass 1.0.0 发布说明——ZDefend 自杀线程入口改 `ret` + 威胁列表返回空；判定未消除（八条 hook 证据、一条 systemhook 证据、两条 bindfs 挂载证据仍在），release 构建不写日志。
 
 ## guides/
 
