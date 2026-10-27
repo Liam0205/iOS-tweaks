@@ -2305,3 +2305,114 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
    "构造自洽合法库伪装"降级(只覆盖 systemhook 头一个向量, 已知还有环境层检测)。
 - 用户态 PoC 到此收束。详见 llmdoc reference/hsbc-china-detection-vectors.md(Round77段) 与
   memory/reflections/hsbc-china-unject-round77.md。
+
+## Round 78 / 3.75.0 重新摸底：拿到 ZDefend 的判定原文（2026-10-27,★★★★ 已解决）
+
+前提变了：汇丰中国已从 3.72.15 升到 **3.75.0（build 129890）**，可执行文件从
+`Frameworks/hsbcchinax.framework/hsbcchinax`（6.9 MB）变成主二进制 `China.app/China`（12.6 MB）。
+Round 55～77 记下的所有地址全部失效，检测栈也换了：
+
+| 组件 | 状态 |
+|---|---|
+| `ZDefend.framework`（Zimperium） | **存在**，4.5 MB，实际判定方 |
+| `ShieldSDK.framework`（Promon） | **不存在** |
+| `PlatformRASP.framework` | 存在，Swift 胶水层，负责把威胁转成拦截页 |
+| `BioCatchSDK` / `ThreatmetrixWrapper` / `TuringShield*` | 存在，与本问题无关 |
+
+也就是说，前几轮针对 Promon 的所有结论都不再适用于这一版。
+
+### 终止链
+
+裸启动约 2.8 秒退出，栈是：
+
+```
+ZDefend+0x23a3c8 → ZDefend+0x23a380（在新建的线程里）→ ZDefend+0x1e569c
+                 → mov w0,#0 / bl exit
+```
+
+`+0x1e569c` 按一个静态全局 `0x33e06c` 的值分派：等于 1 就正常返回，其余取值都走 exit。
+这个全局在文件里的初值是 0，也没找到任何写入点，所以这条退出路径基本是必然的。
+
+### 关键一步：直接问 ZDefend 要判定结果
+
+ZDefend 的 ObjC 接口是给它自己的平台层用的。App 起来之后调用
+`+[ZDefendImpl getAllThreats]`，拿到 **11 个 `ZDefendThreat` 对象**，每个都带
+`humanThreatName`、`threatVector`、`threatJson`。三类内容：
+
+**第一类：`apptampering_hooked`（8 项，"Library hooking detected"）**
+
+```json
+{"Reasons":"Library hooking detected","_rule_name":"apptampering_hooked",
+ "forensic_function_hooks":[
+   {"function":"_dlsym","image":"/usr/lib/system/libdyld.dylib","status":"not restored (variant)"},
+   {"function":"_fopen","image":"/usr/lib/system/libsystem_c.dylib","status":"not restored (variant)"},
+   {"function":"_getenv",...},{"function":"_sysctl",...},{"function":"_sysctlbyname",...},
+   {"function":"_access",...},{"function":"_lstat",...},{"function":"_open",...}]}
+```
+
+这八项**全部是我们自己装的探针**。ZDefend 不比代码字节，它比的是"自己导入的函数指针
+和实际实现是否一致"——只要有任何 tweak 对这些符号做了 MSHookFunction，同一进程里的
+其它调用方也会看到被换过的实现，所以这一条对"注入即被测"是必然成立的。
+
+**第二类：`app_tampering_interposed`（1 项，"Interposed Functions"）**
+
+```json
+{"interposed_functions":[
+  {"funcname":"_dlopen","name":"BioCatchSDK","value":"/usr/lib/systemhook.dylib"},
+  {"funcname":"_dlopen","name":"HKEApiFramework","value":"/usr/lib/systemhook.dylib"},
+  {"funcname":"_dlopen","name":"TMXProfiling","value":"/usr/lib/systemhook.dylib"}]}
+```
+
+这是 systemhook 本身被看见，和 Round 77 的结论一致。
+
+**第三类：`JB Dopamine-Roothide`（2 项，"Behaves like Dopamine jailbreak"）**
+
+```json
+{"jb_forensics":{"f_fstypename":"bindfs","f_mntonname":"/usr/lib",
+ "f_mntfromname":"/private/preboot/.../jb-0/procursus/basebin/.fakelib", ...}}
+```
+
+`statfs("/usr/lib")` 在 rootless 越狱上是 bindfs，挂载源直接写着 `.fakelib`。
+原版设备这里应该是根分区的 apfs。**这是唯一一条与"我们自己注入"无关的检测。**
+
+另外还有一条 `ios_combined_classifier`，28 维特征向量里第一维是 1，`injected_libs`
+列出 TweakInject 目录下的所有 dylib——属于同一类，都是注入痕迹。
+
+### 有效的两步
+
+**一、把自杀线程的入口改成 `ret`。** 在 `ZDefend+0x23a380` 写 `0xD65F03C0`。
+这个入口没有直接调用者（地址被写进结构体后由新线程进入），所以改一条指令即可。
+
+试过但更差的做法：把 `+0x1e569c` 里那条"状态不对就 exit"的 `b.eq` 改成无条件跳转。
+App 能多活十秒，随后变成 `SIGILL`——清理流程照常执行，破坏了别的状态。
+
+**二、把威胁列表清空。** 挂 `+[ZDefend getAllThreats]`、`+[ZDefendImpl getAllThreats]`、
+`-[ZDeviceStatus allThreats/activeThreats/activeNewThreats]`，返回空数组。
+PlatformRASP 拿不到威胁就不弹拦截页，App 正常进入首页。
+
+判定本身在 ZDefend 的 C++ 核心里、不走 ObjC，所以这一步只是拦住了"交付"，
+它内部照样认为设备有问题、照样跑自己的流程，只是没人去读。
+
+### 结果
+
+删掉所有探针、只留本 tweak 之后：
+
+- 连续 3 次冷启动，各观察 40 秒，全部存活；
+- 日常使用路径完整走通：隐私政策 → 用户条款 → 新功能引导 → 位置/通知授权
+  → 首页（四个标签页齐全）→ 去注册/登录 → 跨境传输授权 → 数字证书授权
+  → 「设置您的手机银行」，进程全程不中断，已连续运行 3 分钟以上；
+- 没有再产生新的崩溃报告。
+
+没有继续往下走"设置您的手机银行"之后的三步（手机号、证件、设备密码），
+那需要真实客户信息。
+
+### 仍然成立的那条矛盾
+
+第一类和第二类证据（hook 被换过、dlopen 指向 systemhook）无法在"已经注入"的前提下消除：
+只要还挂着任何一个 hook，ZDefend 就能看见。要它看不见，唯一办法是不注入，
+而那就没有任何手段可以干预——Round 77 记下的那条二律背反在这里依然成立。
+
+本轮真正的变化不是"消除了判定"，而是**判定结果不再有人消费**：它照样认为设备不安全，
+只是既杀不掉进程，也弹不出拦截页。第三类（bindfs 挂载）理论上可以靠 hook `statfs`
+改返回值，但一旦这么做，第一类立刻会因为多了一个被换过的 `_statfs` 而多一条记录，
+净效果不会更好，所以没有采用。
