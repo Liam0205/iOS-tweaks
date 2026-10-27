@@ -30,11 +30,12 @@
 extern int ptrace(int, pid_t, caddr_t, int);
 #import <substrate.h>
 
-static int g_logfd = -1;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+// release 包不写日志，这两个只被 #if WH_LOG_ENABLED 里的代码引用。
+static int g_logfd __attribute__((unused)) = -1;
+static pthread_mutex_t g_lock __attribute__((unused)) = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_t0;
 
-static uint64_t wh_now_ms(void) {
+__attribute__((unused)) static uint64_t wh_now_ms(void) {
     if (!g_t0) g_t0 = mach_absolute_time();
     // 只在日志里用，精度到毫秒即可，不做 timebase 换算的精确性追求。
     static mach_timebase_info_data_t tb;
@@ -43,20 +44,45 @@ static uint64_t wh_now_ms(void) {
     return d * tb.numer / tb.denom / 1000000ULL;
 }
 
+// ============================================================
+// 日志开关：由构建类型决定，不在运行时判断
+//
+// theos 的 debug 构建会加 -DDEBUG，`make package` 默认就是这种；
+// `make package FINALPACKAGE=1` 是 release 构建，不带 -DDEBUG。
+// 所以下面这个宏等价于「是不是 debug 包」：debug 包照常写日志方便排查，
+// release 包里所有日志调用都被编译掉，不会创建任何文件。
+// ============================================================
+#ifndef WH_LOG_ENABLED
+#ifdef DEBUG
+#define WH_LOG_ENABLED 1
+#else
+#define WH_LOG_ENABLED 0
+#endif
+#endif
+
 // 信号处理器里不能拿锁：可能死锁在别人持有的互斥量上，表现成整个进程卡住。
 // 这里只做一次裸 write，调用方自己把整行拼好。
 static void log_unsafe(const char *s) {
+#if WH_LOG_ENABLED
     if (g_logfd >= 0) (void)!write(g_logfd, s, strlen(s));
+#else
+    (void)s;
+#endif
 }
 
 static void log_raw(const char *s) {
+#if WH_LOG_ENABLED
     if (g_logfd < 0) return;
     pthread_mutex_lock(&g_lock);
     (void)!write(g_logfd, s, strlen(s));
     pthread_mutex_unlock(&g_lock);
+#else
+    (void)s;
+#endif
 }
 
 static void aialog(const char *fmt, ...) {
+#if WH_LOG_ENABLED
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -65,9 +91,13 @@ static void aialog(const char *fmt, ...) {
     char line[1100];
     snprintf(line, sizeof(line), "[%llums] %s\n", (unsigned long long)wh_now_ms(), buf);
     log_raw(line);
+#else
+    (void)fmt;
+#endif
 }
 
 static void open_log(void) {
+#if WH_LOG_ENABLED
     // 日志文件放在 App 容器里会被加固壳清掉（实测 Documents 里的日志整份消失），
     // 所以写到设备控制台。syslog 由 launchd 收，App 自己没有删除权限。
     // 实测加固壳会清掉 Documents 里的非常规文件，控制台又只可写不可读。
@@ -84,6 +114,8 @@ static void open_log(void) {
             g_logfd = open([lp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
         }
     }
+#endif
+    // release 包里 g_logfd 保持 -1，任何残留的写日志路径都会直接跳过。
 }
 
 // 打印一个类的方法清单。SecureUtilityPlus 是 Swift 类，方法多半没导出名字，
@@ -350,7 +382,11 @@ static void logfmt_unsafe(const char *fmt, ...) {
     log_unsafe(buf);
 }
 
-static void fault_handler(int sig, siginfo_t *si, void *uctx) {
+__attribute__((unused)) static void fault_handler(int sig, siginfo_t *si, void *uctx) {
+#if !WH_LOG_ENABLED
+    (void)sig; (void)si; (void)uctx;
+    return;
+#endif
     ucontext_t *uc = (ucontext_t *)uctx;
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
     uint64_t lr = uc->uc_mcontext->__ss.__lr;
@@ -416,7 +452,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uctx) {
 // 加固壳会在启动后的某一刻把 SIGILL/SIGSEGV/SIGTRAP 的处理器换成指向
 // __objc_methname 数据段的坏指针（实测 5.5 秒时三个都是 0x10199ed8c），
 // 之后任何信号都会直接要命。这里做成可反复调用的，好让定时器不断装回自己。
-static void arm_fault_handlers(void) {
+__attribute__((unused)) static void arm_fault_handlers(void) {
     struct sigaction sa = {0};
     sa.sa_sigaction = fault_handler;
     sa.sa_flags = SA_SIGINFO;
@@ -428,8 +464,11 @@ static void arm_fault_handlers(void) {
 }
 
 static void install_fault_handler(void) {
+#if WH_LOG_ENABLED
     arm_fault_handlers();
     aialog("已安装故障信号处理器");
+#endif
+    // release 包里故障处理器只用来抓现场，不抓现场就没有安装的必要。
 }
 
 
@@ -694,6 +733,10 @@ static void scan_regs_for_blocks(const arm_thread_state64_t *st) {
 }
 
 static void dump_fault(const wh_exc_req_t *req) {
+#if !WH_LOG_ENABLED
+    (void)req;
+    return;
+#endif
     const uint8_t *b = (const uint8_t *)req;
     uint32_t etype = *(const uint32_t *)(b + EXC_TYPE_OFF);
     uint32_t codeCnt = *(const uint32_t *)(b + EXC_CODED_OFF);

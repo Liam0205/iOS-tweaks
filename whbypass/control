@@ -1,6 +1,6 @@
 Package: page.0x01.whbypass
 Name: WHBypass-国家网络身份认证反检测-rootless
-Version: 0.1.77
+Version: 1.0.0
 Architecture: iphoneos-arm64
 Description: 绕过国家网络身份认证（cn.cyberIdentity.certification）的越狱环境检测。适用于 rootless 越狱（Dopamine 等）。在 1.2.38 版本验证。
 Maintainer: Liam
