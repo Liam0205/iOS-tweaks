@@ -1,4 +1,4 @@
-// HSBCHKBypass 0.0.45：接管网关，把盾要问内核的东西原样抄下来。
+// HSBCHKBypass 0.0.131：接管网关，把盾要问内核的东西原样抄下来。
 //
 // 进展与结论：
 //   0.0.41 证明网关接管可行（槽 0x8510c8，网关 0x78befc，83 个封装走它）。
@@ -18,12 +18,16 @@
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
 #import <mach/vm_region.h>
+#import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
 #import <unistd.h>
 #import <fcntl.h>
 #import <string.h>
 #import <stdlib.h>
 #import <dlfcn.h>
 #import <pthread.h>
+#import <signal.h>
+#import <setjmp.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
@@ -39,6 +43,16 @@
 #define GW_SVC_WORD  0xd4001001u
 
 #define RING 4096
+
+// 两个干预开关。0.0.130 之前把"让盾对注入库的读取失败"留在了代码里，
+// 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
+// 现在分开关，一次只上一个。
+#define DO_TAKEOVER 0   // 接管网关（0 = 完全不干预，只留着当对照）
+#define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
+#define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
+
+#define ZERO_PAGE 0x4000
+static char g_zero_page[ZERO_PAGE] __attribute__((aligned(ZERO_PAGE)));
 
 // 1 = 把盾对注入库的那几次内存读取改指到盾自己的镜像上，用来确认这是不是判定依据
 #define PAY   24         // 消息头 6 个字，或者完整路径（192 字节）
@@ -111,8 +125,6 @@ static volatile int g_taken;
 static uint64_t g_t0;
 static volatile uint64_t g_ts0;
 
-static int my_verdict(void *self) { (void)self; return 0; }
-
 extern kern_return_t mach_vm_protect(vm_map_t, uint64_t, uint64_t, boolean_t, vm_prot_t);
 static void say(const char *s);
 static void say_hex(const char *label, unsigned long long v);
@@ -162,6 +174,10 @@ static int safe_read(uint64_t addr, void *dst, size_t n);
 static void *heartbeat(void *arg);
 static int disguise_one(uintptr_t base, const char *newname);
 static void *neutralizer(void *arg);
+static void patch_verdict_slots(void);
+static void probe_install_handlers(void);
+static void scan_subobjects(uint64_t e1, int (*vf)(void *), int r0);
+static void run_oracle_scan(void);
 
 static volatile uint64_t g_last_fp;
 
@@ -213,26 +229,27 @@ static void ring_push(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64
 
 static void emit(const char *s, size_t n) { if (g_fd >= 0) raw_write(g_fd, s, n); }
 
-static uint64_t g_pct_at;    // 标定用的计数
-static uint64_t g_ms_at;     // 与之对应的毫秒
 static uint64_t g_pct_per_ms = 24000;
 
 static void calibrate_pct(void) {
     uint64_t a = read_pct(), ma = up_ms();
-    usleep(50 * 1000);
+    usleep(5 * 1000);
     uint64_t b = read_pct(), mb = up_ms();
     if (mb > ma && b > a) {
-        g_pct_per_ms = (b - a) / (mb - ma);
-        if (!g_pct_per_ms) g_pct_per_ms = 24000;
+        uint64_t v = (b - a) / (mb - ma);
+        if (v) g_pct_per_ms = v;
     }
-    g_pct_at = read_pct();
-    g_ms_at = up_ms();
 }
 
+// 相对构造函数开始时刻的毫秒数。0.0.130 之前这里是"以标定时刻为锚点"的算法，
+// 而标定发生在 ctor 末尾、还带 50ms 睡眠，结果所有记录的时间戳都等于标定时刻
+// （每段日志里所有记录都是同一个数字），时序信息全丢。现在直接用 g_ts0 作锚点。
 static uint64_t rec_ms(uint64_t ts) {
-    if (!ts || ts > g_pct_at) return g_ms_at;
-    return g_ms_at - (g_pct_at - ts) / g_pct_per_ms;
+    if (!g_ts0 || !ts || ts < g_ts0) return 0;
+    return (ts - g_ts0) / (g_pct_per_ms ? g_pct_per_ms : 24000);
 }
+
+static volatile int64_t g_fake_rw;       // 检查项一共被改写过几次
 
 static void emit_rec(const rec_t *r, uint64_t now) {
     char buf[768];
@@ -241,7 +258,7 @@ static void emit_rec(const rec_t *r, uint64_t now) {
 
     (void)now;
     o_ch(&o, '[');
-    o_u(&o, (unsigned long long)(rec_ms(r->ts) - g_t0));
+    o_u(&o, (unsigned long long)rec_ms(r->ts));
     o_s(&o, "ms] ");
 
     if (nr == -31) {
@@ -266,10 +283,16 @@ static void emit_rec(const rec_t *r, uint64_t now) {
         o_s(&o, "] 长度="); o_u(&o, r->a1);
         o_s(&o, " 值0="); o_h(&o, r->pay[12]);
         o_s(&o, " 值1="); o_h(&o, r->pay[13]);
+    } else if (nr == -77) {
+        o_s(&o, "假判定被调用 项="); o_h(&o, r->a0);
+        o_s(&o, " 返回点=");
+        if (r->caller >= g_base && r->caller < g_base + 0x8c0000) { o_s(&o, "+0x"); o_h(&o, r->caller - g_base); }
+        else { o_h(&o, r->caller); }
     } else if (nr == 26) {
         o_s(&o, "!! ptrace 请求="); o_u(&o, r->a0);
     } else if (nr == 1) {
         o_s(&o, "!! exit code="); o_u(&o, r->a0);
+        o_s(&o, " 改动="); o_d(&o, g_fake_rw);
     } else if (nr == 5 || nr == 33) {
         char p[PAY * 8 + 1];
         int n = 0;
@@ -305,49 +328,6 @@ static void emit_rec(const rec_t *r, uint64_t now) {
     o_s(&o, " tid="); o_u(&o, r->tid);
     o_ch(&o, '\n');
     emit(buf, (size_t)(o.p - buf));
-
-    // 报警项是纯内存判定（调用期间没有任何系统调用），而且可重复调用。
-    // 那就拿它当预言机：逐个字段清零，看哪个字段一清，结果就从 1 变 0。
-    if (g_base) {
-        uint64_t obj2 = *(volatile uint64_t *)(g_base + 0x8509d0);
-        if (obj2 > 0x100000000ULL && obj2 < 0x800000000ULL) {
-            uint64_t bg = *(volatile uint64_t *)(obj2 + 0x10);
-            uint64_t en = *(volatile uint64_t *)(obj2 + 0x18);
-            if (bg > 0x100000000ULL && en > bg && (en - bg) / 8 <= 64) {
-                uint64_t e1 = ((const uint64_t *)(uintptr_t)bg)[1];
-                uint64_t vt2 = *(const uint64_t *)(uintptr_t)e1;
-                uint64_t vf = *(const uint64_t *)(uintptr_t)(vt2 + 0x10);
-                if (vf > g_base && vf < g_base + 0x8c0000) {
-                    int r0 = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
-                    out_t q = { buf, buf + sizeof(buf) - 1 };
-                    o_s(&q, "预言机 基线="); o_d(&q, r0); o_ch(&q, '\n');
-                    emit(buf, (size_t)(q.p - buf));
-
-                    for (int off = 8; off < 0xb0; off += 8) {
-                        if (off == 0x10 || off == 0x18) continue;   // 跳过向量本身
-                        volatile uint64_t *f = (volatile uint64_t *)(uintptr_t)(e1 + (uint64_t)off);
-                        uint64_t saved = *f;
-                        if (!saved) continue;
-                        // 只碰不像指针的值：指向地址空间的值一律跳过，解引用会崩。
-                        if (saved > 0x100000000ULL && saved < 0x800000000ULL) continue;
-                        *f = 0;
-                        int r = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
-                        *f = saved;
-                        if (r != r0) {
-                            out_t q2 = { buf, buf + sizeof(buf) - 1 };
-                            o_s(&q2, "命中字段 +"); o_h(&q2, (unsigned long long)off);
-                            o_s(&q2, " 原值="); o_h(&q2, saved);
-                            o_s(&q2, " 清零后="); o_d(&q2, r); o_ch(&q2, '\n');
-                            emit(buf, (size_t)(q2.p - buf));
-                        }
-                    }
-                    out_t q3 = { buf, buf + sizeof(buf) - 1 };
-                    o_s(&q3, "字段扫描结束\n");
-                    emit(buf, (size_t)(q3.p - buf));
-                }
-            }
-        }
-    }
 
     // 判定就在此刻：把盾的检查表就地读出来，看是哪一项在报警。
     if (!g_base) return;
@@ -432,49 +412,6 @@ static void emergency_line(const rec_t *r) {
     o_ch(&o, '\n');
     emit(buf, (size_t)(o.p - buf));
 
-    // 报警项是纯内存判定（调用期间没有任何系统调用），而且可重复调用。
-    // 那就拿它当预言机：逐个字段清零，看哪个字段一清，结果就从 1 变 0。
-    if (g_base) {
-        uint64_t obj2 = *(volatile uint64_t *)(g_base + 0x8509d0);
-        if (obj2 > 0x100000000ULL && obj2 < 0x800000000ULL) {
-            uint64_t bg = *(volatile uint64_t *)(obj2 + 0x10);
-            uint64_t en = *(volatile uint64_t *)(obj2 + 0x18);
-            if (bg > 0x100000000ULL && en > bg && (en - bg) / 8 <= 64) {
-                uint64_t e1 = ((const uint64_t *)(uintptr_t)bg)[1];
-                uint64_t vt2 = *(const uint64_t *)(uintptr_t)e1;
-                uint64_t vf = *(const uint64_t *)(uintptr_t)(vt2 + 0x10);
-                if (vf > g_base && vf < g_base + 0x8c0000) {
-                    int r0 = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
-                    out_t q = { buf, buf + sizeof(buf) - 1 };
-                    o_s(&q, "预言机 基线="); o_d(&q, r0); o_ch(&q, '\n');
-                    emit(buf, (size_t)(q.p - buf));
-
-                    for (int off = 8; off < 0xb0; off += 8) {
-                        if (off == 0x10 || off == 0x18) continue;   // 跳过向量本身
-                        volatile uint64_t *f = (volatile uint64_t *)(uintptr_t)(e1 + (uint64_t)off);
-                        uint64_t saved = *f;
-                        if (!saved) continue;
-                        // 只碰不像指针的值：指向地址空间的值一律跳过，解引用会崩。
-                        if (saved > 0x100000000ULL && saved < 0x800000000ULL) continue;
-                        *f = 0;
-                        int r = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
-                        *f = saved;
-                        if (r != r0) {
-                            out_t q2 = { buf, buf + sizeof(buf) - 1 };
-                            o_s(&q2, "命中字段 +"); o_h(&q2, (unsigned long long)off);
-                            o_s(&q2, " 原值="); o_h(&q2, saved);
-                            o_s(&q2, " 清零后="); o_d(&q2, r); o_ch(&q2, '\n');
-                            emit(buf, (size_t)(q2.p - buf));
-                        }
-                    }
-                    out_t q3 = { buf, buf + sizeof(buf) - 1 };
-                    o_s(&q3, "字段扫描结束\n");
-                    emit(buf, (size_t)(q3.p - buf));
-                }
-            }
-        }
-    }
-
     // 判定就在此刻：把盾的检查表就地读出来，看是哪一项在报警。
     if (!g_base) return;
     uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
@@ -532,6 +469,11 @@ static void emergency_line(const rec_t *r) {
     emit(buf, (size_t)(p3.p - buf));
 }
 
+// ---------------------------------------------------------------- 网关入口
+
+// 从网关处理函数里直接落地的一行：纯算术 + 裸 write。
+
+
 // 由 gw_entry 调用，6 个参数：x0..x5（x5 是返回地址）。
 void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t caller) {
     ring_push(nr, a0, a1, a2, a3, caller);
@@ -541,6 +483,7 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     //
     // 注意不能拿盾自己当替身——它是可执行文件，第一个 load command 是 LC_SEGMENT_64，
     // 而解析器期待 LC_ID_DYLIB，会顺着垃圾偏移读崩（0.0.48 就是这么死的）。
+#if DO_REDIRECT
     if (nr == (uint64_t)-31 && a0 > 0x1000 && g_decoys_n > 0) {
         volatile uint32_t *msg = (volatile uint32_t *)(uintptr_t)a0;
         if (msg[5] == 4808) {                      // msgh_id 在消息头偏移 20
@@ -552,9 +495,19 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
             for (int i = 0; i < n; i++) {
                 if (src >= g_inj_lo[i] && src < g_inj_hi[i]) {
                     uint64_t rel = src - g_inj_lo[i];
-                    if (rel + len <= 0x400000 && g_decoys_n > 0 && 0) {
-                        *srcp = 0x400000000000ULL;
-                        g_redirects++;
+                    if (DO_REDIRECT == 1) {
+                        if (rel + len <= 0x400000 && g_decoys[i] > 0x100000000ULL) {
+                            // 搬到替身库（App 自己的一个框架）上，相对偏移不变：
+                            // 盾读到的是一份结构完整、签名有效的 dylib 头。
+                            *srcp = g_decoys[i] + rel;
+                            g_redirects++;
+                        }
+                    } else if (DO_REDIRECT == 2) {
+                        // 让它读到一整页零：没有 Mach-O magic，就不像镜像。
+                        if (len <= ZERO_PAGE) {
+                            *srcp = (uint64_t)(uintptr_t)g_zero_page;
+                            g_redirects++;
+                        }
                     }
                     break;
                 }
@@ -562,6 +515,7 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
         }
     }
 
+#endif
     if (nr == 1) {
         unsigned h = (g_head + RING - 1) % RING;
         emergency_line(&g_ring[h]);
@@ -620,16 +574,35 @@ static uintptr_t find_shield(void) {
     return 0;
 }
 
-static void say(const char *s) { emit(s, strlen(s)); }
-
-static void say_hex(const char *label, unsigned long long v) {
-    char buf[128];
+// 直接写的日志也带上真实时刻。否则它和环形缓冲排出来的记录混在一个文件里，
+// 文件顺序并不等于时间顺序（排空会落后上千条），事后没法把两边的线索对上。
+// 整行一次 write() 写完：多个线程写同一个文件时，分成两次写会把行切碎
+// （0.0.131 之前的日志里出现过 "[1003ms] [1003ms] 线程快照" 这种断行）。
+static void emit_ts(const char *s, size_t n) {
+    char buf[1024];
     out_t o = { buf, buf + sizeof(buf) - 1 };
-    o_s(&o, label); o_h(&o, v); o_ch(&o, '\n');
+    o_ch(&o, '[');
+    o_u(&o, rec_ms(read_pct()));
+    o_s(&o, "ms] ");
+    if (n > 900) n = 900;
+    memcpy(o.p, s, n);
+    o.p += n;
     emit(buf, (size_t)(o.p - buf));
 }
 
+static void say(const char *s) { emit_ts(s, strlen(s)); }
+
+static void say_hex(const char *label, unsigned long long v) {
+    char buf[160];
+    out_t o = { buf, buf + sizeof(buf) - 1 };
+    o_s(&o, label); o_h(&o, v); o_ch(&o, '\n');
+    emit_ts(buf, (size_t)(o.p - buf));
+}
+
 static void try_takeover(void) {
+#if !DO_TAKEOVER
+    return;
+#endif
     if (g_taken == -1) return;
     if (!g_base) {
         g_base = find_shield();
@@ -663,12 +636,10 @@ static void *poller(void *arg) {
     (void)arg;
     for (int i = 0; i < 30000; i++) {
         try_takeover();
-    {
-        // 观测线程必须最早起来：构造函数的其余部分（枚举镜像等）要花几十毫秒，
-        // 而盾的判定就发生在那几十毫秒里。
-        pthread_t th;
-        pthread_create(&th, NULL, heartbeat, NULL);
-    }
+    probe_install_handlers();
+    // 心跳线程只在构造函数开头创建一次。0.0.131 之前这里是每轮循环各建一个，
+    // 一次启动里会有成百上千个线程同时改写检查项、同时写日志，结果既没法归因，
+    // 日志行也被切碎。这个循环只负责重新接管网关槽。
     // 就地改 LC_ID_DYLIB 会 SIGBUS（写的是代码页），已关闭。
     if (0 && g_inj_n > 0) {
         char want[256];
@@ -1055,6 +1026,232 @@ static int disguise_one(uintptr_t base, const char *newname) {
         lc += size;
     }
     return 0;
+}
+
+// 判定函数是纯内存的、可重复调用的。把它当预言机做大规模实验时，
+// 必然会有一些改动让它解引用坏指针而崩溃。这里用信号恢复把崩溃接住：
+// 崩溃就当"这个字段不能碰"，恢复原值继续下一个。
+static sigjmp_buf g_jmp;
+static volatile int g_in_probe;
+static volatile int g_crashed;
+
+static void probe_handler(int sig) {
+    if (g_in_probe) {
+        g_crashed = 1;
+        siglongjmp(g_jmp, 1);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static char g_sigstack[64 * 1024];
+
+static void probe_install_handlers(void) {
+    stack_t ss;
+    ss.ss_sp = g_sigstack;
+    ss.ss_size = sizeof(g_sigstack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = probe_handler;
+    sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+}
+
+// 受保护的实验体：写内存和调用判定都放在 setjmp 范围内，
+// 这样"写只读页"和"判定解引用坏指针"两种崩溃都能接住。
+typedef void (*probe_fn)(void);
+static probe_fn g_probe_fn;
+static int       g_probe_ret;
+static volatile uint64_t *g_probe_slot;
+static uint64_t  g_probe_val;
+static int       g_probe_skip_write;
+static int     (*g_probe_vf)(void *);
+static void     *g_probe_arg;
+
+static void probe_body(void) {
+    if (!g_probe_skip_write) *g_probe_slot = g_probe_val;
+    g_probe_ret = g_probe_vf(g_probe_arg);
+}
+
+// 返回判定结果；-1 表示这次崩了。
+static int run_probe(void) {
+    if (sigsetjmp(g_jmp, 1) == 0) {
+        g_crashed = 0;
+        g_in_probe = 1;
+        g_probe_fn();
+        g_in_probe = 0;
+        return g_probe_ret;
+    }
+    g_in_probe = 0;
+    return -1;
+}
+
+// 递归式找判据：把检查对象指向的每个子对象里的每个字段清零，
+// 看哪一个能把判定从 1 翻成 0。崩了就恢复原值、跳过。
+static void scan_subobjects(uint64_t e1, int (*vf)(void *), int r0) {
+    g_probe_fn = probe_body;
+    g_probe_vf = vf;
+    g_probe_arg = (void *)(uintptr_t)e1;
+    g_probe_skip_write = 1;
+
+    char buf[320];
+    int hits = 0, tried = 0, crashes = 0;
+
+    // 窗口只有几毫秒，所以只扫最可能是"检测结果容器"的几个指针，
+    // 每个只看前 8 个字段。vtable（+0x0）跳过——动它必然崩，还占时间。
+    static const int offs[] = { 0x10, 0x18, 0x20, 0x30, 0x40, 0x50, 0x70, -1 };
+    for (int oi = 0; offs[oi] >= 0; oi++) {
+        int off = offs[oi];
+        uint64_t p = *(volatile uint64_t *)(uintptr_t)(e1 + (uint64_t)off);
+        if (p < 0x100000000ULL || p > 0x800000000ULL) continue;
+        for (int k = 0; k < 0x40; k += 8) {
+            uint64_t saved = 0;
+            if (!safe_read(p + (uint64_t)k, &saved, 8)) break;
+            if (!saved) continue;
+            g_probe_slot = (volatile uint64_t *)(uintptr_t)(p + (uint64_t)k);
+            g_probe_val = 0;
+            g_probe_skip_write = 0;
+            int r = run_probe();
+            *g_probe_slot = saved;          // 崩没崩都要恢复
+            g_probe_skip_write = 1;
+            tried++;
+            if (r == -1) { crashes++; continue; }
+            if (r != r0) {
+                out_t o = { buf, buf + sizeof(buf) - 1 };
+                o_s(&o, "命中 子对象+"); o_h(&o, (unsigned long long)off);
+                o_s(&o, " 字段+"); o_h(&o, (unsigned long long)k);
+                o_s(&o, " 原值="); o_h(&o, saved);
+                o_s(&o, " 变成="); o_d(&o, r); o_ch(&o, '\n');
+                emit(buf, (size_t)(o.p - buf));
+                hits++;
+                if (hits >= 6) return;
+            }
+        }
+    }
+    out_t o = { buf, buf + sizeof(buf) - 1 };
+    o_s(&o, "扫描结束 试了="); o_d(&o, tried);
+    o_s(&o, " 崩溃="); o_d(&o, crashes);
+    o_s(&o, " 命中="); o_d(&o, hits);
+    o_s(&o, " 结束 ms="); o_u(&o, up_ms() - g_t0); o_ch(&o, '\n');
+    emit(buf, (size_t)(o.p - buf));
+}
+
+// 在心跳线程里做预言机扫描：线程上下文完整，信号恢复可靠。
+static volatile int g_scan_done;
+
+static void run_oracle_scan(void) {
+    if (g_scan_done || !g_base) return;
+    uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
+    if (obj < 0x100000000ULL || obj > 0x800000000ULL) return;
+    uint64_t bg = *(volatile uint64_t *)(obj + 0x10);
+    uint64_t en = *(volatile uint64_t *)(obj + 0x18);
+    if (bg < 0x100000000ULL || en <= bg || (en - bg) / 8 > 64) return;
+    uint64_t e1 = ((const uint64_t *)(uintptr_t)bg)[1];
+    if (e1 < 0x100000000ULL) return;
+    uint64_t vt = *(const uint64_t *)(uintptr_t)e1;
+    uint64_t vf = *(const uint64_t *)(uintptr_t)(vt + 0x10);
+    if (vf < g_base || vf > g_base + 0x8c0000) return;
+
+    g_scan_done = 1;
+    say_hex("预言机 起始 ms=", up_ms() - g_t0);
+    int r0 = ((int (*)(void *))(uintptr_t)vf)((void *)(uintptr_t)e1);
+    say_hex("预言机 基线=", (unsigned long long)(int64_t)r0);
+    if (r0 != 0) scan_subobjects(e1, (int (*)(void *))(uintptr_t)vf, r0);
+}
+
+static int my_verdict(void *self) { (void)self; return 0; }
+
+// 检查表里的每一项都是"对象 + 虚表"。与其改虚表（会被自检记账），
+// 不如把向量里的项整体换成一个自己构造的假对象：
+// 它的虚表 +0x10 指向盾自己代码段里的 "mov w0,#0; ret"，地址完全合法。
+// 向量里的元素指针是被复制进副本的，所以必须在复制之前换。
+static void ring_push(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t caller);
+
+// 假对象的判定函数。用环形缓冲记一笔只是为了回答一个问题：
+// 迭代器到底有没有调用到我们换进去的对象。它返回 0，语义上与盾自己的
+// "mov w0,#0; ret" 相同，但能让我们看见调用。
+static uint64_t fake_verdict(uint64_t self) __attribute__((noinline));
+static uint64_t fake_verdict(uint64_t self) {
+    ring_push((uint64_t)-77, self,
+              (uint64_t)(uintptr_t)__builtin_return_address(0), 0, 0, 0);
+    return 0;
+}
+
+static uint64_t g_fake_vt[4];
+static uint64_t g_fake_obj[2];
+static uint64_t g_fake_bg, g_fake_en;   // 上一次改写时的向量范围
+static uint64_t g_seen_obj;              // 上一次看到的单例地址
+
+// 0.0.130 只在第一次成功时改写一次，之后同一次启动里再也不动。可这条向量是
+// 边构造边增长的标准容器：追加第三项时可能整块重分配，新缓冲区里是货真价实的
+// 对象，先前写进去的假对象根本不在那儿了。所以现在每次轮询都回读第一格，
+// 只要发现被换掉（或范围变了）就整条重写，并把每次变化连同时刻一起记下来。
+static void install_fake_checks(void) {
+    if (!g_base) return;
+    uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
+    if (obj < 0x100000000ULL || obj > 0x800000000ULL) return;
+    if (obj != g_seen_obj) {
+        g_seen_obj = obj;
+        say_hex("检查表单例出现=", obj);
+    }
+    uint64_t bg = *(volatile uint64_t *)(obj + 0x10);
+    uint64_t en = *(volatile uint64_t *)(obj + 0x18);
+    if (bg < 0x100000000ULL || en <= bg) return;
+    uint32_t n = (uint32_t)((en - bg) / 8);
+    if (n < 1 || n > 64) return;
+
+    g_fake_vt[2] = g_base + 0x15984;          // vtable+0x10 → mov w0,#0; ret
+    g_fake_obj[0] = (uint64_t)(uintptr_t)g_fake_vt;
+    g_fake_obj[1] = 0;
+
+    int moved = (bg != g_fake_bg || en != g_fake_en);
+    if (moved) {
+        // 改写前先把原来的三项是谁记下来，事后再判断是不是我们以为的那三个。
+        for (uint32_t i = 0; i < n && i < 6; i++) {
+            uint64_t it = *(volatile uint64_t *)(uintptr_t)(bg + (uint64_t)i * 8);
+            uint64_t vt = 0;
+            if (it > 0x100000000ULL && it < 0x800000000ULL) safe_read(it, &vt, 8);
+            say_hex("  原项对象=", it);
+            say_hex("  原项虚表=", vt);
+            if (vt >= g_base && vt < g_base + 0x8c0000) say_hex("    虚表相对盾=+0x", vt - g_base);
+        }
+    }
+    // 范围没变时再确认第一格还是我们的假对象，不是就说明被重新填充过。
+    if (!moved && *(volatile uint64_t *)(uintptr_t)bg == (uint64_t)(uintptr_t)g_fake_obj) return;
+    for (uint32_t i = 0; i < n; i++)
+        *(volatile uint64_t *)(uintptr_t)(bg + (uint64_t)i * 8) = (uint64_t)(uintptr_t)g_fake_obj;
+    g_fake_bg = bg; g_fake_en = en;
+    g_fake_rw++;
+    say_hex(moved ? "检查项换假对象，项数=" : "检查项被重新填充，项数=", n);
+    say_hex("  向量起点=", bg);
+    say_hex("  回读第一格=", *(volatile uint64_t *)(uintptr_t)bg);
+}
+
+// 三个检查项的虚表都在可写的 __DATA 里（镜像内固定偏移），判定函数在 vtable+0x10。
+// 把这三个槽改指到自己的恒返回 0 函数——只写数据，不碰任何代码页，
+// 因此不会触发代码签名；改完之后立刻回读确认。
+static void patch_verdict_slots(void) {
+    static const uint64_t vt_off[3] = { 0x820d50, 0x832a60, 0x819cf8 };
+    if (!g_base) return;
+    for (int i = 0; i < 3; i++) {
+        volatile uint64_t *slot = (volatile uint64_t *)(g_base + vt_off[i] + 0x10);
+        uint64_t old = *slot;
+        // 不能指向自己 dylib 里的函数：地址不在盾的镜像范围内，盾会据此判"被改过"
+        // （原因码 4）。改成指向盾自己 __TEXT 里现成的 "mov w0,#0; ret" 片段，
+        // 地址完全合法，行为和我们要的一样。
+        *slot = (uint64_t)(g_base + 0x15984);
+        uint64_t now = *slot;
+        say_hex("判定槽 项=", i);
+        say_hex("  原值=", old);
+        say_hex("  现值=", now);
+    }
 }
 
 static volatile int g_called;
@@ -1647,21 +1844,87 @@ static void dump_probe(void) {
     }
 }
 
+// 在指定时刻把所有线程的 PC/LR 拍下来。3098ms 那次运行里 App 活了三秒才死，
+// 但不知道主线程那三秒在等什么。这里直接看它卡在哪个地址。
+static void dump_threads(int tag_ms) {
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    kern_return_t kr = task_threads(mach_task_self(), &list, &cnt);
+    if (kr != KERN_SUCCESS) { say_hex("线程快照失败 kr=", (unsigned long long)kr); return; }
+    say_hex("线程快照 时刻=", (unsigned long long)tag_ms);
+    say_hex("  线程数=", cnt);
+    for (mach_msg_type_number_t i = 0; i < cnt && i < 40; i++) {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64,
+                             (thread_state_t)&st, &sc) == KERN_SUCCESS) {
+            uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(st);
+            uint64_t lr = (uint64_t)__darwin_arm_thread_state64_get_lr(st);
+            char buf[96];
+            out_t o = { buf, buf + sizeof(buf) - 1 };
+            int in_shield = (pc >= g_base && pc < g_base + 0x8a0000);
+            o_s(&o, "  t"); o_u(&o, i);
+            o_s(&o, " pc=");
+            if (in_shield) { o_s(&o, "+0x"); o_h(&o, pc - g_base); }
+            else { o_h(&o, pc); }
+            o_s(&o, " lr=");
+            if (lr >= g_base && lr < g_base + 0x8a0000) { o_s(&o, "+0x"); o_h(&o, lr - g_base); }
+            else { o_h(&o, lr); }
+            if (in_shield) {
+                // 落在盾里时把参数寄存器也带上：判定函数正在处理哪段内存，只能这样看。
+                static const char *nm[9] = {" x0="," x1="," x2="," x3="," x4="," x5="," x6="," x7="," x8="};
+                const uint64_t *rv = (const uint64_t *)&st;
+                for (int k = 0; k < 9; k++) {
+                    o_s(&o, nm[k]);
+                    o_h(&o, rv[k]);
+                }
+            }
+            o_ch(&o, '\n');
+            emit_ts(buf, (size_t)(o.p - buf));
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list,
+                  (vm_size_t)(cnt * sizeof(thread_t)));
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
-    for (int i = 0; i < 3000; i++) {
+    static const int g_snap_at[] = { 40, 43, 46, 49, 52, 55, 58, 61, 64, 1000 };
+#define SNAP_N ((int)(sizeof(g_snap_at)/sizeof(g_snap_at[0])))
+    int g_snap_i = 0;
+    uint64_t last_hb = 0;
+    for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
-        neutralize_checks();
-        char buf[128];
-        out_t o = { buf, buf + sizeof(buf) - 1 };
-        o_s(&o, "心跳 pid="); o_d(&o, getpid());
-        o_s(&o, " 累计="); o_d(&o, g_total);
-        o_s(&o, " 待排="); o_u(&o, (g_head + RING - g_tail) % RING);
-        o_s(&o, " 已重定向="); o_u(&o, (unsigned long long)g_redirects);
-        o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
-        o_ch(&o, '\n');
-        emit(buf, (size_t)(o.p - buf));
-        usleep(i < 400 ? 1000 : 20 * 1000);
+#if DO_FAKE
+        install_fake_checks();
+#endif
+        uint64_t el = rec_ms(read_pct());
+        if (el > 12000) break;
+        if (g_snap_i < SNAP_N && el >= g_snap_at[g_snap_i]) {
+            dump_threads(g_snap_at[g_snap_i]);
+            g_snap_i++;
+        }
+        if (el - last_hb >= 50) {
+            last_hb = el;
+            char buf[192];
+            out_t o = { buf, buf + sizeof(buf) - 1 };
+            o_s(&o, "心跳 pid="); o_d(&o, getpid());
+            o_s(&o, " 累计="); o_d(&o, g_total);
+            o_s(&o, " 待排="); o_u(&o, (g_head + RING - g_tail) % RING);
+            o_s(&o, " 已重定向="); o_u(&o, (unsigned long long)g_redirects);
+            o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
+            o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
+            o_ch(&o, '\n');
+            emit_ts(buf, (size_t)(o.p - buf));
+        }
+        // 检查表是"刚重建、马上复制"，中间没有可睡的缝。判定发生在 40-60ms，
+        // 这一段只能不留空隙地盯着；过了 300ms 再恢复到普通节奏。
+        if (el < 300) {
+            __asm__ volatile("yield");
+        } else {
+            usleep(el < 1000 ? 200 : 5000);
+        }
     }
     return NULL;
 }
@@ -1674,11 +1937,17 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.120 启动（只观察）=====\n");
+    say("===== 0.0.140 启动（对照：完全不接管网关）=====\n");
 
     try_takeover();
     {
-        // 干预关闭：这一版只找 dyld 的镜像数组
+        // 观测线程必须最早起来：下面枚举镜像要几十毫秒，而盾的判定就发生在那段时间里。
+        static int started;
+        if (!started) {
+            started = 1;
+            pthread_t hb;
+            pthread_create(&hb, NULL, heartbeat, NULL);
+        }
     }
     dump_images();
     if (0) {
@@ -1739,7 +2008,7 @@ __attribute__((constructor)) static void ctor(void) {
         }
         // 本轮只观察，不参与：重定向整轮关闭，保证只有一个变量。
         for (int i = 0; i < g_inj_n; i++) g_decoys[i] = decoy;
-        g_decoys_n = 0;   // 本轮只找字段，重定向关掉
+        g_decoys_n = decoy ? g_inj_n : 0;
         say_hex("替身库基址=", decoy);
     }
 
