@@ -18,6 +18,7 @@
 #import <fcntl.h>
 #import <string.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <dlfcn.h>
 #include <execinfo.h>
 #include <libkern/OSCacheControl.h>
@@ -505,6 +506,193 @@ static volatile int g_unwind_count;
 #define WH_UNWIND_BAD_PC 0
 #endif
 
+// ============================================================
+// 找跳转的发起方：block 扫描
+//
+// 跳飞线程是 GCD 工作线程。发起跳转的那段代码既没有建栈帧，也把 lr 覆盖掉了
+// （lr=0x1、sp=0x1），所以帧链和返回地址扫描都落空。但它是作为 block 被
+// dispatch 调起来的，而 Block_layout 的布局是固定的：
+//     +0x00 isa      +0x08 flags     +0x10 invoke     +0x18 descriptor
+// 只要在栈上找到 block 对象指针，读它的 invoke 就能拿到调用方所在的函数地址。
+// 这是纯读取，不安装任何 hook。
+// ============================================================
+#ifndef WH_SCAN_BLOCKS
+#define WH_SCAN_BLOCKS 0
+#endif
+
+// ============================================================
+// 取现场：把主程序的混淆代码区按运行时字节原样落盘
+//
+// 静态反汇编显示，这些跳飞点是「立刻数相加 + br」的无条件跳转：
+//
+//   1001484ac  mov  w8, #0x7998
+//   1001484b0  movk w8, #0x92ab, lsl #16     ; w8 = 0x92ab7998
+//   1001484b4  mov  w9, #0xf668
+//   1001484b8  movk w9, #0x22f4, lsl #16     ; w9 = 0x22f4f668
+//   100148bc  mov  x3, x8
+//   100148c0  mov  x5, x9
+//   100148c4  add  x14, x3, x5               ; 0x92ab7998 + 0x22f4f668 = 0xb5a07000
+//   100148c8  br   x14
+//
+// 当时的假设是"运行时被改写过"。把运行时字节拉下来和磁盘上的二进制
+// 逐字节比对之后，假设被推翻：__TEXT 段 12 MB 内 0 处差异，代码本来
+// 就长这样。保留这段落盘代码，供以后判断同类问题。
+// ============================================================
+#ifndef WH_TEXT_DUMP
+#define WH_TEXT_DUMP 0
+#endif
+
+#define WH_DUMP_OFF_LO 0x1000000ULL
+#define WH_DUMP_OFF_HI 0x1C00000ULL
+
+static int main_image_index(void);   // 定义在后面，按可执行路径找主程序
+
+__attribute__((unused)) static void dump_text_region(void) {
+    int idx = main_image_index();
+    if (idx < 0) { aialog("TEXTDUMP 找不到主镜像"); return; }
+    const uint8_t *h = (const uint8_t *)_dyld_get_image_header((uint32_t)idx);
+    if (!h) { aialog("TEXTDUMP 头为空"); return; }
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!caches) return;
+    NSString *path = [caches stringByAppendingPathComponent:@"whdump.bin"];
+    int fd = open([path fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { aialog("TEXTDUMP 打不开 %s", [path fileSystemRepresentation]); return; }
+    uint64_t total = 0, bad = 0;
+    const size_t chunk = 0x10000;
+    uint8_t buf[0x10000];
+    for (uint64_t off = WH_DUMP_OFF_LO; off < WH_DUMP_OFF_HI; off += chunk) {
+        vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+            (vm_address_t)((uintptr_t)h + off), chunk, (vm_address_t)buf, &got);
+        if (kr != KERN_SUCCESS || got != chunk) {
+            memset(buf, 0, sizeof buf);
+            if (bad < 8) aialog("TEXTDUMP %#llx 读失败 kr=%d got=%lu", (unsigned long long)off, kr, (unsigned long)got);
+            bad++;
+        }
+        (void)!write(fd, buf, chunk);
+        total += chunk;
+    }
+    close(fd);
+    aialog("TEXTDUMP 完成 共 %llu 字节 失败块 %llu", (unsigned long long)total, (unsigned long long)bad);
+}
+
+static void log_signal_handlers(const char *tag) {
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP };
+    static const char *names[] = { "SEGV", "BUS", "ILL", "TRAP" };
+    for (int i = 0; i < 4; i++) {
+        struct sigaction sa;
+        if (sigaction(sigs[i], NULL, &sa) != 0) continue;
+        char d[160];
+        describe((uintptr_t)sa.sa_sigaction, d, sizeof d);
+        aialog("SIG%s[%s] handler=%s flags=%#x", names[i], tag, d, (unsigned)sa.sa_flags);
+    }
+}
+
+static void dump_stack_raw(uintptr_t fp, const char *file) {
+    if (!fp || fp < 0x100000000ULL) return;
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!caches) return;
+    NSString *path = [caches stringByAppendingPathComponent:[NSString stringWithUTF8String:file]];
+    int fd = open([path fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    uintptr_t lo = fp - 0x800;
+    for (uintptr_t p = lo; p < fp + 0x200; p += 8) {
+        uintptr_t v = 0;
+        memcpy(&v, (void *)p, 8);
+        (void)!write(fd, &v, 8);
+    }
+    close(fd);
+}
+
+static int main_image_index(void);   // 定义在后面，按可执行路径找主程序
+
+static uintptr_t g_mtext_base;
+static uintptr_t g_mtext_size;
+
+static void resolve_main_text(void) {
+    if (g_mtext_size) return;
+    int idx = main_image_index();
+    if (idx < 0) return;
+    const struct mach_header_64 *h =
+        (const struct mach_header_64 *)_dyld_get_image_header((uint32_t)idx);
+    if (!h) return;
+    const uint8_t *p = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (strcmp(sg->segname, "__TEXT") == 0) {
+                const struct section_64 *sec = (const struct section_64 *)(sg + 1);
+                for (uint32_t k = 0; k < sg->nsects; k++) {
+                    if (strcmp(sec[k].sectname, "__text") == 0) {
+                        g_mtext_base = (uintptr_t)h + sec[k].offset;
+                        g_mtext_size = sec[k].size;
+                        return;
+                    }
+                }
+            }
+        }
+        p += lc->cmdsize;
+    }
+}
+
+// 一个候选值若是 block 对象指针，它 +0x10 处就是 invoke，且应落在主程序 __text。
+static int block_invoke_of(uintptr_t c, uintptr_t *invoke_out) {
+    if (c < 0x100000000ULL || c > 0x8000000000ULL || (c & 7)) return 0;
+    uintptr_t inv = 0;
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)(c + 0x10),
+                                         8, (vm_address_t)&inv, &got);
+    if (kr != KERN_SUCCESS || got != 8) return 0;
+    if (inv < g_mtext_base || inv >= g_mtext_base + g_mtext_size) return 0;
+    *invoke_out = inv;
+    return 1;
+}
+
+static void scan_stack_for_blocks(uintptr_t fp) {
+    if (!WH_SCAN_BLOCKS) return;
+    resolve_main_text();
+    if (!g_mtext_size) { log_raw("  block 扫描：主程序 __text 未知\n"); return; }
+
+    log_raw("  ---- block 扫描 ----\n");
+    uintptr_t lo = fp > 0x8000 ? fp - 0x8000 : 0x100000000ULL;
+    uintptr_t hi = fp + 0x800;
+    int hits = 0;
+    for (uintptr_t p = lo; p < hi; p += 8) {
+        uintptr_t v = 0;
+        memcpy(&v, (void *)p, 8);
+        if (!v) continue;
+        uintptr_t cands[2] = { v, real_ptr(v) };
+        for (int k = 0; k < 2; k++) {
+            uintptr_t inv = 0;
+            if (!block_invoke_of(cands[k], &inv)) continue;
+            char d[160];
+            describe(inv, d, sizeof d);
+            aialog("  BLOCK p=%#lx(%+ld) 对象=%#lx invoke=%s",
+                   p, (long)(p - (intptr_t)fp), cands[k], d);
+            hits++;
+        }
+    }
+    aialog("  ---- block 扫描结束 命中=%d ----", hits);
+}
+
+static void scan_regs_for_blocks(const arm_thread_state64_t *st) {
+    if (!WH_SCAN_BLOCKS) return;
+    resolve_main_text();
+    if (!g_mtext_size) return;
+    for (int i = 0; i < 29; i++) {
+        uintptr_t v = (uintptr_t)st->__x[i];
+        uintptr_t cands[2] = { v, real_ptr(v) };
+        for (int k = 0; k < 2; k++) {
+            uintptr_t inv = 0;
+            if (!block_invoke_of(cands[k], &inv)) continue;
+            char d[160];
+            describe(inv, d, sizeof d);
+            aialog("  寄存器 x%d=%#lx 是 block，invoke=%s", i, cands[k], d);
+        }
+    }
+}
+
 static void dump_fault(const wh_exc_req_t *req) {
     const uint8_t *b = (const uint8_t *)req;
     uint32_t etype = *(const uint32_t *)(b + EXC_TYPE_OFF);
@@ -578,6 +766,18 @@ static void dump_fault(const wh_exc_req_t *req) {
         }
     }
     log_raw("  ---- 栈扫描结束 ----\n");
+
+    log_signal_handlers("现场");
+    if (g_exc_count <= 1) {
+        char fn[64];
+        snprintf(fn, sizeof fn, "whstack_%d.bin", g_exc_count);
+        dump_stack_raw(fp, fn);
+    }
+#if WH_TEXT_DUMP
+    if (g_exc_count == 1) dump_text_region();
+#endif
+    scan_regs_for_blocks(&st);
+    scan_stack_for_blocks(fp);
 }
 
 // 把卡在哨兵地址上的线程沿帧链退回调用方。
@@ -815,7 +1015,7 @@ static __attribute__((unused)) void restore_orig_exc_ports(void) {
 // 只记录调用方，并让它空转（返回成功但不真正挂起）——先确认假设。
 // ============================================================
 #ifndef WH_BLOCK_SUSPEND
-#define WH_BLOCK_SUSPEND 1
+#define WH_BLOCK_SUSPEND 0
 #endif
 
 // 构造函数在主线程跑，记录主线程的 mach port（冻结判断与异常端口都用它）。
@@ -844,7 +1044,7 @@ static kern_return_t wh_thread_suspend(mach_port_t th) {
 // 现象就是"界面卡死 → 十几秒后进程消失"。
 // 我们已经在异常端口上接住了跳飞，所以这里让 KSCrash 干脆别安装。
 #ifndef WH_DISABLE_KSCRASH
-#define WH_DISABLE_KSCRASH 1
+#define WH_DISABLE_KSCRASH 0
 #endif
 
 static void wh_noop_void(id self, SEL _cmd) { (void)self; (void)_cmd; }
@@ -1043,6 +1243,229 @@ __attribute__((unused)) static void install_antidebug_patch(void) {
     patch_nops(kAntidebugCallOff, 1);
 }
 
+// ============================================================
+// 跳板入口探针
+//
+// 0x148470 这一族小块没有静态调用者——它们是靠计算跳转进入的。
+// 进去之后先把 sp、lr 一起覆盖成 [x0+0x20]，再 br 到 0xb5a0X000。
+// __TEXT 的运行时字节已经和磁盘逐字节比对过，完全一致，所以这不是
+// 自解密没生效，而是这段代码就长这样：无条件跳向一个没映射的地址。
+//
+// 那么剩下的问题就是「谁把它当跳板用」。入口处 x0 是调用方传进来的
+// 上下文、x30 基本还是调用方自己的返回地址，这两个正是要抓的东西。
+// ============================================================
+#ifndef WH_TRAP_HOOK
+#define WH_TRAP_HOOK 0
+#endif
+
+static void wh_trap_log(void *ctx, uintptr_t lr, const char *tag) {
+    static int n;
+    if (++n > 24) return;
+    char d[160];
+    describe(strip_pac(lr), d, sizeof d);
+    aialog("TRAP[%s] 第 %d 次 ctx=%p lr=%#lx -> %s", tag, n, ctx, (unsigned long)lr, d);
+    uintptr_t c = (uintptr_t)ctx;
+    if (c < 0x100000000ULL || (c & 7)) { aialog("  ctx 不像指针"); return; }
+    for (int i = 0; i < 8; i++) {
+        char sd[160];
+        uintptr_t v = 0;
+        memcpy(&v, (void *)(c + i * 8), 8);
+        describe(v, sd, sizeof sd);
+        aialog("  ctx+%#-3x = %#018lx %s", i * 8, (unsigned long)v, sd);
+    }
+}
+
+typedef void (*wh_trap_fn)(void *);
+
+static wh_trap_fn g_trap_orig0;
+static wh_trap_fn g_trap_orig1;
+
+// 陷阱块是 libdispatch 在 _dispatch_call_block_and_release 里用 blr 调进来的，
+// 入口这一瞬间 sp、lr 都还是好的。钩子直接返回，等于这一块"执行完毕但没有
+// 效果"：libdispatch 接着做 _Block_release，工作线程活着，不再每 6.1 秒丢一个线程。
+#ifndef WH_TRAP_SKIP
+#define WH_TRAP_SKIP 1
+#endif
+
+static void wh_trap0(void *ctx) {
+    wh_trap_log(ctx, (uintptr_t)__builtin_return_address(0), "0x148470");
+#if WH_TRAP_SKIP
+    return;
+#else
+    g_trap_orig0(ctx);
+#endif
+}
+
+static void wh_trap1(void *ctx) {
+    wh_trap_log(ctx, (uintptr_t)__builtin_return_address(0), "0x1484d0");
+#if WH_TRAP_SKIP
+    return;
+#else
+    g_trap_orig1(ctx);
+#endif
+}
+
+static const uintptr_t kTrapOffs[] = { 0x148470, 0x1484d0 };
+
+// ============================================================
+// 把 6 个"炸弹 block"的函数体换成 ret
+//
+// 这 6 个地址是主程序里唯一被 6 处代码写进 block 的 invoke 字段的值
+// （adrp+add 直接算出，别处没有引用）。它们的函数体开头都是
+// `ldr w8, [x0, #0x20]`，随后把 sp、lr 全改成这个值，再 br 到毒地址。
+// 入口改成 `ret`，block 照常被 dispatch、照常结束，但不会再跳飞。
+//
+// 不用 MSHookFunction：一来它会留下跳板，二来这个 App 自带
+// MSHookFunctionChecker。静态补一条指令，代价最小。
+// ============================================================
+#ifndef WH_BOMB_RET
+#define WH_BOMB_RET 1
+#endif
+
+static void patch_word(uintptr_t off, uint32_t insn, const char *tag);
+
+static const uintptr_t kBombEntries[] = {
+    0x148470, 0x1484d0, 0x149db8, 0x14a1b0, 0x14a4cc, 0x14a7dc,
+};
+
+__attribute__((unused)) static void install_bomb_ret(void) {
+    for (size_t i = 0; i < sizeof(kBombEntries) / sizeof(kBombEntries[0]); i++)
+        patch_word(kBombEntries[i], 0xD65F03C0, "炸弹入口 ret");
+}
+
+// ============================================================
+// 追发起方：谁把这个"炸弹 block"交给 libdispatch
+//
+// 探针抓到的事实：libdispatch 在 +0x1e68 直接调了一块 Block_layout，
+// 它的 invoke 就是 0x148470 这个陷阱。也就是说有人构造了一个 invoke
+// 指向陷阱的 block，再交给 dispatch。钩住 dispatch_async 与
+// dispatch_source_set_event_handler，只在这个 block 出现时记录队列标签
+// 和调用栈，其他调用原样放行。
+// ============================================================
+#ifndef WH_DISPATCH_TRACE
+#define WH_DISPATCH_TRACE 0
+#endif
+#ifndef WH_TRACE_SRC
+#define WH_TRACE_SRC 0
+#endif
+#ifndef WH_WATCH_VM
+#define WH_WATCH_VM 0
+#endif
+#define WH_WATCH_LO 0x130000ULL
+#define WH_WATCH_HI 0x150000ULL
+
+static void (*g_orig_d_async)(dispatch_queue_t, dispatch_block_t);
+static void (*g_orig_d_src)(dispatch_source_t, dispatch_block_t);
+static void (*g_orig_d_async_f)(dispatch_queue_t, void *, dispatch_function_t);
+
+static uintptr_t g_trap_runtime;
+static uintptr_t g_main_base;
+
+static uintptr_t block_invoke_of_ptr(void *b) {
+    if (!b) return 0;
+    uintptr_t v = 0;
+    memcpy(&v, (void *)((uintptr_t)b + 0x10), 8);
+    return v;
+}
+
+static void log_backtrace(void) {
+    void *bt[32];
+    int n = backtrace(bt, 32);
+    for (int i = 1; i < n; i++) {
+        char d[160];
+        describe(strip_pac((uintptr_t)bt[i]), d, sizeof d);
+        aialog("    bt[%d] %s", i, d);
+    }
+}
+
+static void trace_hit(const char *what, const char *label, void *b) {
+    static int n;
+    if (n >= 12) return;
+    n++;
+    char d[160];
+    describe(strip_pac(g_trap_runtime), d, sizeof d);
+    aialog("%s 第 %d 次 队列=%s block=%p 陷阱=%s", what, n, label ? label : "?", b, d);
+    uintptr_t c = (uintptr_t)b;
+    for (int i = 0; i < 6; i++) {
+        uintptr_t v = 0;
+        memcpy(&v, (void *)(c + i * 8), 8);
+        char sd[160];
+        describe(v, sd, sizeof sd);
+        aialog("    blk+%#-3x = %#018lx %s", i * 8, (unsigned long)v, sd);
+    }
+    log_backtrace();
+}
+
+static void wh_d_async(dispatch_queue_t q, dispatch_block_t b) {
+    static int cnt;
+    uintptr_t inv = block_invoke_of_ptr((__bridge void *)b);
+    if (g_trap_runtime && inv == g_trap_runtime) {
+        trace_hit("D_ASYNC", q ? dispatch_queue_get_label(q) : "?", (__bridge void *)b);
+    } else if (cnt < 5) {
+        cnt++;
+        char d[160];
+        describe(strip_pac(inv), d, sizeof d);
+        aialog("D_ASYNC 样例 %d 队列=%s invoke=%s", cnt,
+               q ? dispatch_queue_get_label(q) : "?", d);
+    }
+#if WH_WATCH_VM
+    {
+        static int wn;
+        extern uintptr_t g_main_base;
+        if (wn < 24 && g_main_base && inv >= g_main_base + WH_WATCH_LO &&
+            inv < g_main_base + WH_WATCH_HI) {
+            wn++;
+            char d[160];
+            describe(strip_pac(inv), d, sizeof d);
+            aialog("WATCH 第 %d 次 队列=%s invoke=%s", wn,
+                   q ? dispatch_queue_get_label(q) : "?", d);
+            log_backtrace();
+        }
+    }
+#endif
+    g_orig_d_async(q, b);
+}
+
+static void wh_d_async_f(dispatch_queue_t q, void *ctx, dispatch_function_t fn) {
+    if (g_trap_runtime && (uintptr_t)fn == g_trap_runtime)
+        trace_hit("D_ASYNC_F", q ? dispatch_queue_get_label(q) : "?", ctx);
+    g_orig_d_async_f(q, ctx, fn);
+}
+
+__attribute__((unused)) static void wh_d_src(dispatch_source_t src, dispatch_block_t b) {
+    if (g_trap_runtime && block_invoke_of_ptr((__bridge void *)b) == g_trap_runtime)
+        trace_hit("D_SRC", "?", (__bridge void *)b);
+    g_orig_d_src(src, b);
+}
+
+__attribute__((unused)) static void install_dispatch_trace(void) {
+    int idx = main_image_index();
+    if (idx < 0) { aialog("DTRACE 找不到主镜像"); return; }
+    g_main_base = (uintptr_t)_dyld_get_image_header((uint32_t)idx);
+    g_trap_runtime = g_main_base + kTrapOffs[0];
+
+    void *p_async = dlsym(RTLD_DEFAULT, "dispatch_async");
+    void *p_async_f = dlsym(RTLD_DEFAULT, "dispatch_async_f");
+    void *p_src = dlsym(RTLD_DEFAULT, "dispatch_source_set_event_handler");
+    aialog("DTRACE 符号 async=%p async_f=%p src=%p", p_async, p_async_f, p_src);
+    if (p_async) MSHookFunction(p_async, (void *)wh_d_async, (void **)&g_orig_d_async);
+    if (p_async_f) MSHookFunction(p_async_f, (void *)wh_d_async_f, (void **)&g_orig_d_async_f);
+#if WH_TRACE_SRC
+    if (p_src) MSHookFunction(p_src, (void *)wh_d_src, (void **)&g_orig_d_src);
+#endif
+}
+
+__attribute__((unused)) static void install_trap_hook(void) {
+    int idx = main_image_index();
+    if (idx < 0) { aialog("TRAP 探针：找不到主镜像"); return; }
+    uintptr_t base = (uintptr_t)_dyld_get_image_header((uint32_t)idx);
+    void *f0 = (void *)(base + kTrapOffs[0]);
+    void *f1 = (void *)(base + kTrapOffs[1]);
+    MSHookFunction(f0, (void *)wh_trap0, (void **)&g_trap_orig0);
+    MSHookFunction(f1, (void *)wh_trap1, (void **)&g_trap_orig1);
+    aialog("TRAP 探针已装 %p %p", f0, f1);
+}
+
 // 分派器本体 0x134730 的入口改成 ret：无论谁调进来都立刻返回，
 // 不再进入那套会 br 到 0xb5a01000 的虚拟机。
 #ifndef WH_DISPATCH_RET
@@ -1186,6 +1609,10 @@ __attribute__((unused)) static void install_ptrace_hook(void) {
 
 // 异常端口接管延迟多少毫秒。用来判断"跳转是不是被我们改端口这个动作引出来的"：
 // 设成 800 的话，如果 App 能活过 800ms，说明前 800ms 里并没有跳转。
+#ifndef WH_EXC_TAKEOVER
+#define WH_EXC_TAKEOVER 0
+#endif
+
 #ifndef WH_EXC_DELAY_MS
 #define WH_EXC_DELAY_MS 0
 #endif
@@ -1226,7 +1653,7 @@ __attribute__((unused)) static void install_park_page(void) {
     aialog("停放页已就绪 addr=%#lx 权限=%d", (unsigned long)addr, kr);
 }
 
-static void install_exc_handler(void) {
+__attribute__((unused)) static void install_exc_handler(void) {
     kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
     if (kr != KERN_SUCCESS) { aialog("异常端口分配失败 %d", kr); return; }
     mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND);
@@ -1243,7 +1670,7 @@ static void install_exc_handler(void) {
 // ============================================================
 // 线程级异常端口接管
 // ============================================================
-static void arm_thread_exc_ports(void) {
+__attribute__((unused)) static void arm_thread_exc_ports(void) {
     thread_act_array_t list = NULL;
     mach_msg_type_number_t cnt = 0;
     if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return;
@@ -1599,6 +2026,15 @@ __attribute__((constructor)) static void wh_init(void) {
 #if WH_GUARD_RET
     install_guard_ret();
 #endif
+#if WH_BOMB_RET
+    install_bomb_ret();
+#endif
+#if WH_TRAP_HOOK
+    install_trap_hook();
+#endif
+#if WH_DISPATCH_TRACE
+    install_dispatch_trace();
+#endif
 #if WH_CHECKSAFE_OFF
     install_safe_switch_off();
 #endif
@@ -1612,11 +2048,13 @@ __attribute__((constructor)) static void wh_init(void) {
     install_suspend_hook();
 #endif
     save_orig_exc_ports();
+#if WH_EXC_TAKEOVER
 #if WH_EXC_DELAY_MS > 0
     aialog("异常端口推迟到 %dms 接管", WH_EXC_DELAY_MS);
 #else
     install_exc_handler();
     arm_thread_exc_ports();
+#endif
 #endif
 
 #if WH_TICK
