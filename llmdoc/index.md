@@ -62,4 +62,5 @@
 - `llmdoc/memory/reflections/simtouch-phase2-development.md`：SimTouch Phase 2 (v1-v24) 开发反思——事件克隆优于从零创建、Darwin notification 新通道不可靠、backboardd 沙箱写入限制、录制分析方法论、回放无效待查。
 - `llmdoc/memory/reflections/simtouch-phase3-development.md`：SimTouch Phase 3 (v25-v36) 开发反思——pinch 从零创建 vs 克隆的条件性规则、sbreload 不重启 backboardd 部署陷阱、DIAG_NOTIFY 诊断通知从未工作。
 - `llmdoc/memory/reflections/aiabypass-v1.0.0-release.md`：aiabypass v1.0.0 发布反思（2026-10-26）——**判定没绕过、只接住后果的收尾**；三次假象（增量构建缺 `__DATA` 段导致构造函数都没跑、诊断工具查表函数在快照前一律返回 NULL 造成"零 hook 命中 0 条"、hook 装上但没被调用与没装上长得一样）；两种"数据对、假设错"的还原实验；核心教训=时间窗比手段重要（三种不同原理的手段全部无效且无效方式一致时该怀疑时间窗，用相对构造函数的时间戳确认）、负面结论要带数字才有复用价值。
+- `llmdoc/memory/reflections/whbypass-first-round.md`：whbypass 首轮排查反思（2026-10-27）——四类假象（grep 计数口径不一致得出"改 SDK 内部触发自检"的错误结论、每 250ms 重设异常端口造出"每 6.1 秒一次跳飞"的假律、把 KSCrash 捕获异常当成检测 SDK 冻结、先试停放页而不是先想毒地址怎么生成）；两条有效做法（先做单变量对照再谈机制、用最小破坏性补丁确认元凶再读混淆代码）。
 - `llmdoc/memory/reflections/lianjiabypass-release-and-ci-hardening.md`：lianjiabypass 发布与 CI/CD 加固反思——发布版本混入诊断脚手架的清理教训、macOS CI 缺私有 framework stub 是 simtouch 从未发布成功的根因、两种修复路径（objc_getClass 运行时解耦 vs SYSROOT 强制指定 SDK）、CI 矩阵 fail-fast 掩盖独立结果、Logos %orig 跨平台展开差异、发版验证需直接核对 gh-pages。
