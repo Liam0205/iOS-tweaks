@@ -3,7 +3,7 @@
 ## 目的
 
 本文档汇总汇丰香港 App 已查明的检测组件、退出机制排查结论与当前进度。
-**状态：排查中，没有可用版本。**
+**状态：排查中，没有可用版本。死因已确认为主动 `exit(1)`，但退出路径未定位。**
 
 ## 目标与背景
 
@@ -89,54 +89,119 @@ jailbroken_cta_stop_close jailbroken_cta_advised_continue
 挂着探针时同样在 900ms 左右消失；`uiopen --bundle` 与点图标表现一致。
 **挂不挂 tweak 一致**，说明注入本身不是致死原因。界面上从未看到拦截页。
 
-## 退出机制：尚未定位
+## 退出机制：已确认是主动 `exit(1)`（2026-10-27 Round 1）
 
-已经排除的路径（每一条都是实测零命中）：
+上一轮的"尚未定位"是因为缺一把外部尺子。这一轮用 `kqueue` 从进程外拿到确定答案。
+
+### 死因：正常退出，退出码 1
+
+自写的 `tools/procwatch` 用 `EVFILT_PROC | NOTE_EXIT | NOTE_EXITSTATUS` 观察目标 pid：
+
+```
+fflags=0x84000000 退出状态 0x100  结束方式：正常退出，退出码 1
+```
+
+`0x100` = `WIFEXITED` 且 `WEXITSTATUS == 1`。不是被杀、不是崩溃、不是 Jetsam。
+这解释了之前对不上的全部现象：无崩溃报告、无信号、无 Jetsam、`atexit` 不触发
+（退出过程没走完 dyld 的析构）。
+
+> **`NOTE_EXITSTATUS` 不能省。** 只带 `NOTE_EXIT` 时 `data` 恒为 0，
+> 第一版就因此误判成"退出码 0"。
+
+### 钩子确实有效，"零命中"结论成立
+
+0.0.17 用一个只挂 `exit` 的探针把这件事钉死：
+
+```
+exit 前   4 条指令：d503237f a9be4ff4 a9017bfd 910043fd   ← 真实代码，不是跳板
+挂钩后    4 条指令：58000050 d61f0200 ...                  ← ElleKit 的 ldr x16,#8; br x16
+>>> my_exit 被调用，code=9
+```
+
+但条目仍然是**零命中**。所以 App 没有走 `exit`/`_exit`/`abort`/`kill`/`raise`/
+`pthread_kill` 这些**符号**。
+
+### App 自己的镜像里没有退出类内联 `svc`
+
+进程内扫了全部 932 个已加载镜像的代码段，按 4 字节编码找 `svc #0x80` / `svc #0x81`，
+共 527 处：
+
+| 镜像 | 命中数 |
+|---|---|
+| `libsystem_kernel.dylib` | 998 |
+| `TMXProfiling` / `TMXBehavioSec` / `TMXProfilingConnections` | 24 / 20 / 4 |
+| `libellekit.dylib` | 4 |
+| `PAFaceDetectSDK` | 2 |
+| `IOKit` | 2 |
+
+**主二进制 `HongKong` 与 `hsbchkmobilebankingx` 中一处都没有**（后者 9 MB 整文件按字节
+找也只有 1 处，落在非代码区）。
+
+### 仍未能解释的矛盾
+
+`exit(1)` 已确认，但所有 libc 退出符号的钩子都没命中。剩下三条可能：
+
+1. 退出发生在构造函数之前——线程在那之前就被劫持或改写了；
+2. 走 `__DATA,__interpose` 或其他间接绑定，绕开了 `dlsym` 返回的地址；
+3. `hsbchkmobilebankingx` 里有自己的 libSystem 调用封装。该框架 9 MB，只链
+   libSystem.B / Foundation / CoreFoundation，值得优先看。
+
+旁证：构造函数返回后约 70ms，探针的心跳线程与主线程 tick 会**同时**停止；
+把主线程在构造函数里按 3 秒（0.0.19）时，心跳能一直跑到 120 拍。
+压住我们的东西在主线程上、排在构造函数之后。
+
+### 关于 `exit` 钩子有效性的历史误判
+
+两处误判叠在一起，导致上一轮怀疑钩子失效：
+
+- 观察到的 `58000050 d61f0200` 被当成"hook 前的原始状态"，实际那是**已挂上钩子之后**的地址；
+- `kill`、`vm_protect` 的 `dlsym` 地址首字是 `d4200020`（`brk #1`，"不可用"桩），
+  ElleKit 挂钩**静默失败**，被误读成"钩子被目标还原"。
+
+### 排除清单（Round 0 + Round 1）
 
 | 手段 | 结果 |
 |---|---|
-| hook `exit`/`_Exit`/`_exit`/`abort`/`kill`/`pthread_kill`/`raise` | 零命中 |
-| hook `syscall(2)`（观察 SYS_exit / SYS_kill） | 零命中 |
-| `atexit` 回调 | 没触发，说明不是正常退出流程 |
-| 1～31 号信号处理器 | 没收到任何信号 |
-| 磁盘文件静态扫描内联 `svc` | 主二进制与 9 个重点框架都没有 exit 类 svc |
-| 崩溃报告 / Jetsam 记录 | 都没有 |
+| `kqueue` 外部观察退出状态 | **正常退出，退出码 1** |
+| hook 全部 libc 终止原语 | 零命中（已证钩子有效） |
+| hook `syscall(2)` | 零命中 |
+| `atexit` 回调 | 不触发 |
+| 1～31 号信号处理器 | 无信号 |
+| Mach 异常端口 | 零消息 |
+| `signal`/`sigaction`/`task_set_exception_ports` 接管者记录 | 只有 `hsbchkmobilebankingx` 的 CPU 计数器探测（`CNTPCT_EL0`/`CNTVCT_EL0`），非检测 |
+| `mprotect`/`vm_protect` 覆盖到目标页的调用 | 无命中 |
+| 全镜像内联 `svc` 扫描 | App 自身镜像零命中 |
+| 崩溃报告 / Jetsam | 无（19:46–19:49 那三份是自己探针卡住主线程触发的 `0x8BADF00D`） |
 
-**这些零命中是可信的**：探针里对 `getpid` 做了一次自检 hook，调用一次命中一次，
-证明 `MSHookFunction` 在这个进程里工作正常。没有自检的话，
-"hook 没装上"和"hook 装上了但没人调用"看起来完全一样。
+### 可继续的方向
 
-### 为什么静态扫描 svc 不成立
-
-主二进制的 `__TEXT` 在磁盘上是**加密的**（`LC_ENCRYPTION_INFO_64` 的 `cryptid=1`）。
-对着文件扫出的 svc 只能是噪声，必须在进程里扫已解密的内存。但进程注入后到消失之间
-只剩不到 900ms，运行时扫描没能跑完（0.0.4 版用 `memchr` 加速后仍然不够）。
-
-框架的情况不同：9 个重点框架的 `cryptid` 都是 0，可正常静态扫描，结果是零。
-
-## 可继续的方向
-
-1. 把运行时扫描拆成按镜像分片，优先只扫主二进制最大的可执行段，争取在 900ms 内完成；
-2. 用更早的注入时机（`DYLD_INSERT_LIBRARIES` 或更低的 constructor 优先级）挤出时间；
-3. hook `task_terminate` 一类的内核接口，看是不是外部（SpringBoard / runningboardd）
-   把进程收走的——`killall` 与 Jetsam 都不留痕，这条还没排除；
-4. 检查 `MobileSecurity` 里 `_abort` 的调用点。它不是检测器，但它是少数导入了终止
-   原语的框架之一。
+1. 在构造函数**之前**介入（内核层或越狱侧 hook），验证"时间窗"假设；
+2. 静态分析 `hsbchkmobilebankingx`，定位它自己的进程退出封装；
+3. 检查 `UIApplication` 的 `_terminateWithStatus:` 一类私有路径，
+   那是另一种"看起来像 exit(1)"的退出。
 
 ## 排查方法（可复用）
 
-这一轮虽然没有定位到根因，但确立了三件可复用的事：
-
-- **探针必须有自检。** 对任意无害函数（比如 `getpid`）先装一次 hook 再自己调一次，
-  命中才算 hook 机制可用。否则"零命中"这个结论没有意义。
-- **日志必须带时间戳。** 目标是启动不到一秒就死的进程时，没有相对时间戳的日志
-  无法区分"某一步慢"和"某一步之后进程没了"。
-- **磁盘上的加密段不能静态扫。** 先读 `LC_ENCRYPTION_INFO_64` 的 `cryptid`，
-  为 0 才扫文件，为 1 只能在运行时扫内存。
+- **探针必须有自检。** 但自检要选对层次：hook `getpid` 自调能证明"机制可用"，
+  却证明不了"这个特定地址挂上了"。对每个要 hook 的地址回读首字是否变成
+  `58000050 d61f0200`，才是个体级别的确认。
+- **判断死因优先用进程外手段。** `kqueue` + `NOTE_EXITSTATUS` 一次就能区分
+  "自己退"和"被杀"，比在进程内挂十几个终止原语更省事。
+- **日志必须带时间戳。**
+- **磁盘上的加密段不能静态扫**（先读 `cryptid`）；但要扫所有镜像时，
+  在构造函数里扫内存反而最快——那时镜像都已映射且已解密。
+- **hook 的"零命中"要配一张排除表。** 写成"哪个手段、零命中、是否已验证钩子有效"，
+  后续才判断得出结论是否还成立。
 
 ## 环境限制
 
-设备上的 `frida-server` 能启动，但 `frida.spawn` 对所有 App 都返回
-`mach task is gone`，**包括能正常运行的汇丰中国**。也就是说这台设备上的 frida
-只能 attach、不能 spawn，"启动前布好 hook"这条路用不了。attaching 到已经起来的
-进程也来不及——进程在 900ms 内就没了。
+- 设备上的 `frida-server` 能启动，但 `frida.spawn` 对所有 App 都返回
+  `mach task is gone`（包括能正常运行的汇丰中国），只能 attach、不能 spawn。
+- `task_for_pid` 返回 `kr=5`，从外部读不到内存和线程快照，外部观测只有退出状态这类信号。
+
+## 设备操作注意事项
+
+`hsbchkbypass/verify.sh` 会临时把其它 tweak 的 plist 改名 `.plist.off` 做隔离。
+改名当次不生效，但**下一次 SpringBoard 重启会让所有 `.off` 一起生效**，
+整台设备的 tweak 全部失效。2026-10-27 因此误伤过一次（65 个 tweak 同时失灵）。
+脚本现已改为记录清单并在退出时自动恢复；手动跑这类脚本前，先确认它能还原。

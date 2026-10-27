@@ -16,7 +16,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 | `page.0x01.aiabypass` | 友邦友享 | `com.aia.china.YoubangHealthRelease` | 6.9.33 | 已发布 1.0.0（判定未绕过，处决被接住） |
 | `page.0x01.whbypass` | 国家网络身份认证 | `cn.cyberIdentity.certification` | 1.2.38 | 已发布 1.0.0 |
 | `page.0x01.hsbcchinabypass` | 汇丰中国 | `cn.com.hsbc.hsbcchina` | 汇丰中国 3.75.0 | 已发布 1.0.1（判定未绕过，后果可控） |
-| `page.0x01.hsbchkbypass` | 汇丰香港 | `hk.com.hsbc.hsbchkmobilebanking` | 汇丰香港 3.69.12 | 排查中，未发布 |
+| `page.0x01.hsbchkbypass` | 汇丰香港 | `hk.com.hsbc.hsbchkmobilebanking` | 汇丰香港 3.69.12 | 排查中，未发布（死因已确认：主动 `exit(1)`） |
 
 mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conflicts`/`Replaces` 字段实现无缝升级。icbcbypass 是全新包。汇丰两个包原名合一的 `page.0x01.hsbcbypass`，2026-10-27 因两者技术栈完全不同而拆分，`hsbcchinabypass` 用 `Conflicts`/`Replaces` 接替旧包。
 
