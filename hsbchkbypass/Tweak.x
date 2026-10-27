@@ -50,7 +50,7 @@
 #define DO_TAKEOVER 1   // 接管网关（0 = 完全不干预，只留着当对照）
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
-#define DO_DISKCHECK 1  // 逐镜像比对内存与磁盘
+#define DO_DISKCHECK 0  // 逐镜像比对内存与磁盘（实验用，平时关掉）
 
 #define ZERO_PAGE 0x4000
 static char g_zero_page[ZERO_PAGE] __attribute__((aligned(ZERO_PAGE)));
@@ -2127,7 +2127,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.145 启动（全部镜像与磁盘比对，带路径）=====\n");
+    say("===== 0.0.146 启动（安静观察：只记录网关与判定时刻）=====\n");
 
     try_takeover();
     {
