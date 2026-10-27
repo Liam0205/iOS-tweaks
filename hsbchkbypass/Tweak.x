@@ -159,6 +159,7 @@ static volatile int  g_probe_len;
 static volatile int  g_probe_done;
 
 static int safe_read(uint64_t addr, void *dst, size_t n);
+static void *heartbeat(void *arg);
 
 static volatile uint64_t g_last_fp;
 
@@ -574,6 +575,12 @@ static void *poller(void *arg) {
     (void)arg;
     for (int i = 0; i < 30000; i++) {
         try_takeover();
+    {
+        // 观测线程必须最早起来：构造函数的其余部分（枚举镜像等）要花几十毫秒，
+        // 而盾的判定就发生在那几十毫秒里。
+        pthread_t th;
+        pthread_create(&th, NULL, heartbeat, NULL);
+    }
     // 代码级改动全部关闭：实测把报警项改成恒返回 0 之后，退出点从检查表
     // 换到初始化路径（+0x43a190），并且两次运行里有一次是 SIGSEGV。
     // 说明判定不止一处，单点改代码只会换一条路，还可能把自己打崩。
@@ -895,6 +902,34 @@ static void probe_loader_array(uint64_t self) {
 // 盾的判定是这么做的：把一串"检查项"放在容器里，逐个调 vtable+0x10，任一非零就退出。
 // 这里把容器拿出来，把每项的函数地址列出来——离线一看就知道是哪一项在报警。
 static volatile int g_checks_dumped;
+
+// 主动把报警那一项调一次，前后打时刻标记。它在这段时间里发的系统调用
+// 就是它的全部输入——比静态读虚拟机快得多。
+static volatile int g_called;
+
+static volatile int g_diag;
+
+static void call_verdict(void) {
+    if (g_called || !g_base) return;
+    uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
+    if (obj < 0x100000000ULL || obj > 0x800000000ULL) return;
+    uint64_t begin = *(volatile uint64_t *)(obj + 0x10);
+    uint64_t end   = *(volatile uint64_t *)(obj + 0x18);
+    if (!g_diag) { g_diag = 1; say_hex("诊断 obj=", obj); say_hex("  begin=", begin); say_hex("  end=", end); }
+    if (begin < 0x100000000ULL || end <= begin || (end - begin) / 8 > 64) return;
+    uint64_t elem = ((const uint64_t *)(uintptr_t)begin)[1];
+    if (elem < 0x100000000ULL) return;
+    uint64_t vt = *(const uint64_t *)(uintptr_t)elem;
+    if (vt < 0x100000000ULL) return;
+    uint64_t verdict = *(const uint64_t *)(uintptr_t)(vt + 0x10);
+    if (verdict < g_base || verdict > g_base + 0x8c0000) return;
+
+    g_called = 1;
+    say_hex("VERDICT 开始 ms=", up_ms() - g_t0);
+    int r = ((int (*)(void *))(uintptr_t)verdict)((void *)(uintptr_t)elem);
+    say_hex("VERDICT 结果=", (unsigned long long)(int64_t)r);
+    say_hex("VERDICT 结束 ms=", up_ms() - g_t0);
+}
 
 // 检查项放在单例的向量里（对象 +0x10 起点 / +0x18 终点）。盾的循环按这对指针遍历，
 // 把终点写成起点，遍历就一项都不跑，判定自然落到"无威胁"。
@@ -1364,7 +1399,7 @@ static void *heartbeat(void *arg) {
         o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
         o_ch(&o, '\n');
         emit(buf, (size_t)(o.p - buf));
-        usleep(20 * 1000);
+        usleep(i < 400 ? 1000 : 20 * 1000);
     }
     return NULL;
 }
@@ -1377,7 +1412,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.100 启动（只观察：不做任何干预）=====\n");
+    say("===== 0.0.106 启动（只观察）=====\n");
 
     try_takeover();
     {
@@ -1448,7 +1483,7 @@ __attribute__((constructor)) static void ctor(void) {
     calibrate_pct();
     say_hex("每分钟计数=", g_pct_per_ms);
     int rc1 = pthread_create(&b, NULL, drainer, NULL);
-    int rc2 = pthread_create(&c, NULL, heartbeat, NULL);
+    int rc2 = 0;
     say_hex("排空线程 rc=", (unsigned long long)(int64_t)rc1);
     say_hex("心跳线程 rc=", (unsigned long long)(int64_t)rc2);
 }
