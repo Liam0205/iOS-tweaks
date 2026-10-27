@@ -7,7 +7,7 @@
 bundle 路径 `/var/containers/Bundle/Application/080BB1A5-.../HongKong.app`，
 数据容器 `/var/mobile/Containers/Data/Application/A2267FB5-8887-41EE-A5B7-BE6748265D29`。
 
-**状态：排查中，没有可用版本。**
+**状态：排查中，没有可用版本。死因已确认为 `exit(1)`，但用户态的拦截手段已全部用尽。**
 
 ## 为什么从 hsbcchina 里拆出来
 
@@ -175,6 +175,88 @@ not a trampoline
 **hook 本身是有效的**：探针里对 `getpid` 做了一次自检 hook，调用一次命中一次，
 所以"退出函数没被调用"这个结论成立，不是 hook 失效造成的假阴性。
 
+## Round 2（2026-10-27）：用户态拦截这条路走到尽头
+
+这一轮把"退出到底能不能拦住"问到了底。结论是**拦不住**，而且有完整证据链。
+
+### 先纠一个前提：pid 一直是对的
+
+之前"心跳 50ms 就停"是别的 tweak 被禁用状态下的假象。把 pid 与时间轴对齐后：
+
+```
+我们注入的进程 pid=19142
+procwatch 观察同一个 pid → 退出时刻 uptime ...670，退出码 1
+最后一拍心跳             → uptime ...659（相对 386ms）
+```
+
+也就是说进程活到约 400ms，退出发生在最后一拍心跳之后 11ms，两者是同一个进程。
+
+### 退出码 1 是真的（做了对照）
+
+| 情形 | procwatch 读数 |
+|------|----------------|
+| `exit 7` | `0x700` → 退出码 7 |
+| `kill -9` | `0x9` → 信号 9 |
+| `kill -TERM` | `0xf` → 信号 15 |
+| App 退出 | `0x100` → 正常退出，退出码 1 |
+
+`NOTE_EXITSTATUS` 不能省：只带 `NOTE_EXIT` 时读数恒为 0，会被误读成"退出码 0"。
+
+### 不注入我们的 tweak 也一样
+
+移走全部 `HSBCHKBypass*` 后重新启动，仍然读 `0x100`，约 580ms 结束。
+所以触发条件是**越狱环境本身**（ElleKit / systemhook 对每个进程都注入），不是本探针。
+
+### 钩子在退出时刻仍然有效
+
+0.0.36 在启动 386ms 时由我们自己的线程调用 `exit(99)`：
+
+```
+[386ms] === 主动调用 exit(99) ===
+[386ms] !! my_exit 被调用 code=99
+procwatch: 退出状态 0x6300 → 退出码 99
+```
+
+同一时刻、同一进程，我们的 `exit` 钩子命中并被 procwatch 读到。
+所以"App 的 exit(1) 没走 libc `exit`"是可信的否定结论，不是钩子失效。
+
+### 逐条堵，逐条无效
+
+| 手段 | 结果 |
+|------|------|
+| `exit`/`_exit`/`abort`/`raise`/`pthread_kill`/`task_terminate` 符号入口（MSHookFunction，首字确认 `58000050`） | 零命中 |
+| fishhook 重绑所有镜像的 `__got`/`__la_symbol_ptr` | 实测改到 **0 个槽**——App 的镜像里根本没有退出类槽 |
+| `syscall` / `__syscall` | 零命中 |
+| 把非镜像可执行内存里 `movz x16,#1; svc` 的退出桩改成 `ret`（含持续重扫） | 桩确实改掉，App 照退 |
+| Mach 异常端口 | 零消息 |
+| `atexit` | 不触发（说明不是 `exit()` 路径） |
+| 同步采样全部线程（每 10ms） | 退出前 6ms 三个线程都不在退出路径上 |
+| 广泛 hook `stat`/`open`/`fopen`/`_dyld_get_image_name` 隐藏越狱痕迹 | 直接把 App 变成 SIGSEGV（正是 lianjiabypass 记录过的坑），已回退 |
+
+### 静态侧的关键事实
+
+- 主二进制 `HongKong` 的 23394 个导入里**没有** `exit`/`_exit`/`abort`/`kill`/`syscall`/`dlopen`/`dlsym` 任何一个。
+- `hsbchkmobilebankingx`（9 MB）只导入 `_abort`，也不导入 `exit`/`_exit`。
+- 它的符号名已被剥空（字符串表只有 24 字节），只能从绑定信息取导入名。
+- 退出前主线程在 `hsbchkmobilebankingx` 的**哈希循环**里（`mul` + `ror` 反复滚动，
+  栈帧约 0xc00 字节），相邻还串联着 `hsbchkmobilebankingx+0x33…`/`+0x65bfa8` 等
+  VM 地址——这是一个虚拟机式的内存完整性校验。
+- 该框架自带的 libc 兼容层导入 `_kevent`/`_kqueue`/`_pause`/`_tcgetattr`/`_chdir`/`_getcwd`
+  之类，看起来像在跑自己的运行时。
+
+### 推论
+
+退出既不走符号、不走 GOT、不走我们能改写的系统调用桩，而 `atexit` 不触发又排除了
+`exit()`。剩下的可能只有两类：
+
+1. **退出发生在我们的观测窗口之外**：某个更早的时刻已经决定并排好，最后由 dyld
+   或内核路径收尾（例：`UIApplication` 的私有终止路径、或 `_terminateWithStatus:`）。
+2. **退出由进程外的实体完成**，内核把状态报成"正常退出 1"。
+
+再往下走，用户态的手段已经用尽。要继续只有两条路：反向分析
+`hsbchkmobilebankingx` 那个虚拟机（离线工作，不碰设备），或者在越狱本体层面处理
+（roothide 一类只在进程外隐藏注入的做法）。后者与「不动越狱本体」的约束冲突。
+
 ## 已布设但没跑通的工具
 
 - `verify.sh`：部署探针、关掉其它 tweak、冷启动若干次、回捞日志。已经跑通。
@@ -186,28 +268,25 @@ not a trampoline
 
 | 版本 | 内容 | 结果 |
 |------|------|------|
-| 0.0.1 | 退出函数 hook + 镜像/类清单 + 内联 svc 扫描 | 扫描太慢把启动拖死；类清单因抢 ObjC 运行时锁卡住 |
-| 0.0.2 | 加 Swift 布尔方法 hook（`dlsym` 全部找不到）+ 心跳 | 心跳每 200ms 一次，进程在第一个心跳后消失 |
-| 0.0.3 | 心跳改成 20ms 一次，加 atexit 与全信号处理器 | 只写出「心跳 0」，没有任何信号或 atexit 记录 |
-| 0.0.4 | 内联 svc 扫描挪到独立线程，用 `memchr` 加速 | 扫描没跑完进程就没了 |
-| 0.0.5 | 加 hook 自检（hook `getpid` 自调）与 `syscall(2)` hook | 自检通过，退出路径仍然零命中 |
-| 0.0.6–0.0.12 | 改成按 `LC_SYMTAB` 解析 Swift mangled 名，hook IOSSecuritySuite 的 7 个 `amI*` 入口 | 7 个入口全部挂上（如 `amIJailbrokenSbyFZ @ 0x121afb16c`），App 行为不变 |
-| 0.0.13 | 加"按住主线程"模式，把主二进制 `__TEXT` dump 到 Documents | 成功 dump 201,752,576 字节；进程随后被 `0x8BADF00D` 启动看门狗收走 |
-| 0.0.14 | 改 stub 字面量接管 libc（绕开 ElleKit） | 字面量改写分支一次都没匹配上 |
-| 0.0.15 | 信号处理器只记一行 | 收到 2,369,935 个 SIGUSR1，构造函数被淹没 |
-| 0.0.16 | hook 去重（`__exit`/`_exit` 别名） | 构造函数能跑完，但心跳仍只到第 0 拍 |
-| 0.0.17 | **只挂 `exit` 并自检** | **确认钩子有效**：`MSHookFunction` 改写了首字，`my_exit` 被调用 |
-| 0.0.18 | 终止原语 + Mach 异常端口 | 异常端口零消息；心跳停在 50ms 内 |
-| 0.0.19 | 主线程在构造函数里按 3 秒 | **心跳与主线程 tick 都能跑到 120 拍**，说明压制者排在构造函数之后 |
-| 0.0.20 | 记录 `signal`/`sigaction`/`task_set_exception_ports` 的接管者 | 只有 `hsbchkmobilebankingx` 的 CPU 计数器探测，非检测 |
-| 0.0.21 | 监控钩子是否被还原 + `syscall` | `kill`/`vm_protect` 是 `brk #1` 桩，"还原"是误读 |
-| 0.0.22 | 记录 `mprotect`/`vm_protect` 覆盖到目标页的调用 | 无命中 |
-| 0.0.23 | 进程内扫全部镜像的 `svc` | 932 个镜像、527 处命中，App 自身镜像为 0 |
-| 0.0.24 | `atexit` + pid 对齐 | `atexit` 不触发 |
-
-`dlsym(RTLD_DEFAULT, ...)` 找不到那些 Swift 符号，是因为它们没有被导出到动态符号表。
-要 hook 得先按 `LC_SYMTAB` 把符号表映射到内存里（`__LINKEDIT.vmaddr + slide + (symoff - fileoff)`），
-再按 `n_value + slide` 算运行时地址。0.0.6 之后一直用这个办法。
+| 0.0.1–0.0.5 | 终止原语 hook、镜像/类清单、内联 svc 扫描、hook 自检 | 扫描太慢把启动拖死；类清单抢 ObjC 运行时锁卡住 |
+| 0.0.6–0.0.12 | 按 `LC_SYMTAB` 解析 Swift mangled 名，hook IOSSecuritySuite 的 7 个 `amI*` | 7 个入口全部挂上，App 行为不变 |
+| 0.0.13 | 按住主线程，dump 主二进制 `__TEXT` | 成功 dump 201,752,576 字节 |
+| 0.0.14–0.0.16 | 改 stub 字面量、信号处理器瘦身、hook 去重 | 构造函数能跑完 |
+| 0.0.17 | 只挂 `exit` 并自检 | **确认钩子有效**：首字被改写，`my_exit` 被调用 |
+| 0.0.18–0.0.22 | Mach 异常端口、按主线程 3 秒、接管记录、钩子还原监控 | 异常端口零消息；压住我们的东西排在构造函数之后 |
+| 0.0.23 | 进程内扫 932 个镜像的 `svc` | 527 处命中，App 自身镜像为 0 |
+| 0.0.24–0.0.25 | `atexit`、pid 对齐 | 同 pid 活到约 400ms 才退出 |
+| 0.0.26 | 新镜像回调 | 构造函数之后没有新的 App 镜像加载 |
+| 0.0.27 | fishhook 重绑退出类符号 | rc=0 |
+| 0.0.28 | 主线程 PC/LR 采样 | 退出前停在 `hsbchkmobilebankingx` 的哈希循环里 |
+| 0.0.29 | `syscall` / `__syscall` | 零命中 |
+| 0.0.30 | 统计 fishhook 实际改到的槽 | **0 个**——App 镜像没有退出类槽 |
+| 0.0.31–0.0.32 | 扫非镜像可执行内存 | 发现 syscall 桩表 |
+| 0.0.33 | 把 `movz x16,#1; svc` 改成 `ret` | 桩改掉，App 照退 |
+| 0.0.34 | 全线程采样 | 退出前 6ms 无线程在退出路径 |
+| 0.0.35 | 广泛 hook 文件接口隐藏越狱痕迹 | App 变 SIGSEGV，已回退 |
+| 0.0.36 | **在进程内调 `exit(99)` 验证钩子** | 钩子命中，procwatch 读到 99 → 钩子有效 |
+| 0.0.37–0.0.38 | 持续重扫退出桩并导出全部 `svc` 站点 | 只有 7 个非镜像可执行区域，退出桩一个 |
 
 ## 进程外工具
 
