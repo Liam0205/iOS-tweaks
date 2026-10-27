@@ -1,4 +1,4 @@
-# HSBCBypass 更新日志
+# HSBCChinaBypass 更新日志
 
 ## 1.0.0
 
@@ -25,7 +25,7 @@
   两条来自 `statfs("/usr/lib")` 返回的 `bindfs`。前两类只要还注入就消不掉。
 - **发布版不再留日志**：日志开关改为编译期判断，`make package` 走 debug 构建带日志，
   `make package FINALPACKAGE=1` 走 release 构建，所有日志调用被编译掉，不会在 App 容器里创建
-  `hsbcbypass.log`。需要排查时把 `Tweak.x` 里的 `HSBC_DUMP_THREATS` 改成 1，可以在 App 起来后
+  `hsbcchinabypass.log`。需要排查时把 `Tweak.x` 里的 `HSBC_DUMP_THREATS` 改成 1，可以在 App 起来后
   把 ZDefend 的 11 条威胁连证据一起打印出来。
 
 ## 0.0.1 – 0.0.2

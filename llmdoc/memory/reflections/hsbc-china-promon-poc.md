@@ -104,7 +104,7 @@
      GOT rebind）会全部失效；此时唯一可行的用户态拦截点是目标自己的封装函数入口，
      需要先靠静态分析定位该入口的地址。这应作为"确认检测逻辑位于哪一层"之后新增的
      判别分支。
-3. **仅留在本反思 + `hsbcbypass/analysis.md`**：`systemhook.dylib` 是本次触发退出的
+3. **仅留在本反思 + `hsbcchinabypass/analysis.md`**：`systemhook.dylib` 是本次触发退出的
    具体元凶、"3s→17s"的干预效果曲线、方案U 的具体 hook 地址（`0x40c698` 等）——这些是
    当前版本的具体实验结果，PoC 尚未达成净启动，属于进行中的项目经验，不具备立即跨项目
    复用的价值，留在 analysis.md 即可；待方案稳定或有第二个 Promon SHIELD 目标验证后再

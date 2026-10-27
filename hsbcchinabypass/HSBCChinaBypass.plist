@@ -1,0 +1,7 @@
+{
+    Filter = {
+        Bundles = (
+            "cn.com.hsbc.hsbcchina"
+        );
+    };
+}

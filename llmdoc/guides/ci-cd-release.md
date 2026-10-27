@@ -103,4 +103,4 @@ NSMutableDictionary *env = [orig mutableCopy];
 8. 确认 `build.yml` 矩阵仍设置 `strategy.fail-fast: false`，避免单个 tweak 失败掩盖其余任务结果
 9. 发版后直接 curl gh-pages 的 Packages 索引和真实 deb URL 验证，不要只看 tag/CI 状态（注意 CDN 缓存可能短暂显示旧版本，见上文）
 10. 批量发多个 tweak 时，tag **逐个单独推**（一条 push 一个 ref），并逐个 `gh run rerun` 被 concurrency 取消的兄弟 run（见"批量发多个 tweak"一节）
-11. 只给绕过**成功**的 tweak 发版；未成功的（如 hsbcbypass）不加"验证可用"信息、不递增版本、不打 tag
+11. 只给绕过**成功**的 tweak 发版；未成功的（如 hsbchkbypass 当前状态）不加"验证可用"信息、不递增版本、不打 tag

@@ -1,10 +1,10 @@
 #!/bin/bash
-# 部署 HSBCBypass.dylib 到设备 rootless MobileSubstrate, 启动 China, 观测探针日志
+# 部署 HSBCChinaBypass.dylib 到设备 rootless MobileSubstrate, 启动 China, 观测探针日志
 # 用法: ./deploytweak.sh [观察秒] [restore]
 #   restore: 把 hsbcchinax 恢复为 pristine(去掉任何 binary patch)
 set -u
-PROJ=/home/liam/iOS-dev/iOS-tweaks/hsbcbypass
-DYLIB=$PROJ/.theos/obj/debug/HSBCBypass.dylib
+PROJ=/home/safe/iOS-tweaks/hsbcchinabypass
+DYLIB=$PROJ/.theos/obj/debug/HSBCChinaBypass.dylib
 PRISTINE=$PROJ/app-binary/hsbcchinax
 SSH="ssh -p 2215 -o StrictHostKeyChecking=no -o ConnectTimeout=6 mobile@localhost"
 SECS="${1:-25}"
@@ -16,7 +16,7 @@ WORK=/tmp/hsbcchinax.patched
 [ -f "$DYLIB" ] || { echo "缺少 $DYLIB, 先 make"; exit 1; }
 
 echo "=== 1. 推送 dylib(+plist) 到设备 ==="
-scp -P 2215 -o StrictHostKeyChecking=no "$DYLIB" mobile@localhost:/tmp/HSBCBypass.dylib >/dev/null || { echo scp失败; exit 1; }
+scp -P 2215 -o StrictHostKeyChecking=no "$DYLIB" mobile@localhost:/tmp/HSBCChinaBypass.dylib >/dev/null || { echo scp失败; exit 1; }
 if [ "$MODE" = "restore" ]; then
   scp -P 2215 -o StrictHostKeyChecking=no "$PRISTINE" mobile@localhost:/tmp/hsbcchinax.pristine >/dev/null || { echo scp失败; exit 1; }
 elif [ "$MODE" = "nopstore" ]; then
@@ -38,14 +38,14 @@ $SSH "SECS=$SECS MODE='$MODE' bash -s" <<'DEV'
 set -u
 DL=/var/jb/Library/MobileSubstrate/DynamicLibraries
 # 设备原生 ldid 签 dylib(sha256-only)
-/var/jb/usr/bin/ldid -S /tmp/HSBCBypass.dylib
-sudo -n cp /tmp/HSBCBypass.dylib "$DL/HSBCBypass.dylib"
-sudo -n chown root:wheel "$DL/HSBCBypass.dylib"
+/var/jb/usr/bin/ldid -S /tmp/HSBCChinaBypass.dylib
+sudo -n cp /tmp/HSBCChinaBypass.dylib "$DL/HSBCChinaBypass.dylib"
+sudo -n chown root:wheel "$DL/HSBCChinaBypass.dylib"
 # 写 plist(注入 China / HongKong)
-sudo -n bash -c "cat > '$DL/HSBCBypass.plist'" <<'PLIST'
+sudo -n bash -c "cat > '$DL/HSBCChinaBypass.plist'" <<'PLIST'
 { Filter = { Bundles = ( "cn.com.hsbc.hsbcchina", "hk.com.hsbc.hsbchkmobilebanking" ); }; }
 PLIST
-echo "  dylib 已部署: $(ls -l "$DL/HSBCBypass.dylib" | awk '{print $5}')B"
+echo "  dylib 已部署: $(ls -l "$DL/HSBCChinaBypass.dylib" | awk '{print $5}')B"
 
 # 可选: 部署 pristine 或 nop-store patch 的 app 二进制
 FW=$(sudo -n bash -c 'ls -d /var/containers/Bundle/Application/*/China.app/Frameworks/hsbcchinax.framework/hsbcchinax 2>/dev/null | head -1')

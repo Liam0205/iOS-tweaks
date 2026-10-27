@@ -3,7 +3,7 @@
 # 用法: ./patchtest.sh <file_offset_hex> <new_bytes_hex(小端, 如 00008052)> [观察秒]
 # 从 pristine app-binary/hsbcchinax 起始, 每次干净 patch (不累积)
 set -u
-PROJ=/home/liam/iOS-dev/iOS-tweaks/hsbcbypass
+PROJ=/home/safe/iOS-tweaks/hsbcchinabypass
 PRISTINE=$PROJ/app-binary/hsbcchinax
 WORK=/tmp/hsbcchinax.patched
 SSH="ssh -p 2215 -o StrictHostKeyChecking=no -o ConnectTimeout=6 mobile@localhost"

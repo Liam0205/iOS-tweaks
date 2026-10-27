@@ -28,9 +28,9 @@
 
 ## 与其它 bypass 的关键差异
 
-| 维度 | BMWBypass | abcbypass（农行） | hsbcbypass（汇丰） |
+| 维度 | BMWBypass | abcbypass（农行） | hsbcchinabypass（汇丰中国） |
 |------|-----------|-------------------|--------------------|
-| 检测 SDK | 开源 IOSSecuritySuite | mPaaS（闭源） | Promon SHIELD |
+| 检测 SDK | 开源 IOSSecuritySuite | mPaaS（闭源） | ZDefend（Zimperium，3.75.0 起；此前是 Promon SHIELD） |
 | 内存完整性自检 | 无 | 有（inline-hook 触发崩溃） | 有 |
 | 安全对抗手段 | inline-hook 导出符号 | 只能 ObjC swizzle | 私有 svc 网关，符号级 hook 全失效 |
 | 退出机制 | Dart 层弹窗（进程不自杀） | native exit | 延迟退出 |

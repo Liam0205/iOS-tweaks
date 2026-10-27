@@ -1,4 +1,4 @@
-// HSBCBypass 0.0.2：让汇丰中国 3.75.0 在 rootless 越狱设备上可用。
+// HSBCChinaBypass 1.0.0：让汇丰中国 3.75.0 在 rootless 越狱设备上可用。
 //
 // 目标：cn.com.hsbc.hsbcchina 3.75.0（build 129890），可执行文件 China.app/China。
 // 环境：iPhone 13 Pro / iOS 15.4.1 / Dopamine + ElleKit（rootless）。
@@ -305,11 +305,11 @@ __attribute__((constructor)) static void probe_init(void) {
 #if HSBC_LOG_ENABLED
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
     if (caches) {
-        NSString *lp = [caches stringByAppendingPathComponent:@"hsbcbypass.log"];
+        NSString *lp = [caches stringByAppendingPathComponent:@"hsbcchinabypass.log"];
         g_fd = open([lp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
     }
 #endif
-    wf("===== HSBCBypass 启动 pid=%d 日志=%s =====\n", getpid(), g_fd >= 0 ? "开" : "关");
+    wf("===== HSBCChinaBypass 启动 pid=%d 日志=%s =====\n", getpid(), g_fd >= 0 ? "开" : "关");
 
     snap_images();
     patch_zd_killentry();

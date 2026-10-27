@@ -1,4 +1,9 @@
-# hsbcbypass 分析记录
+# hsbcchinabypass 分析记录
+
+> 2026-10-27 起本项目由 `hsbcbypass` 改名为 `hsbcchinabypass`，包名同步改为
+> `page.0x01.hsbcchinabypass`。原因：1.0.0 的手段只对汇丰中国的 ZDefend 有效，
+> 汇丰香港是完全不同的技术栈，留在同一个包里名不副实。本文中出现在改名之前的
+> 历史记录仍写 `hsbcbypass`，那是当时的实际名字。汇丰香港的治疗见 `hsbchkbypass/`。
 
 ## 目标
 
@@ -21,7 +26,7 @@
   - Team ID: `VWDSW3WE4N`（汇丰中国），签名与 entitlements 正常。
   - **⚠️ 汇丰香港有 2 个扩展进程，存活检测必须排除 `.appex`/PlugIns**（test 脚本已处理，
     参考 abcbypass 把扩展误当主 App 的教训）。
-  - 测试工具：`hsbcbypass/tmp/hsbctest.sh`（精确匹配主 App 路径、排除 appex、崩溃判定）。
+  - 测试工具：`hsbcchinabypass/tmp/hsbctest.sh`（精确匹配主 App 路径、排除 appex、崩溃判定）。
 
 ## ⚠️ 关键历史情报（来自 llmdoc/memory/reflections/hsbc-methodology-lesson.md）
 
@@ -119,7 +124,7 @@ RASPFramework 揭示的检测→响应模型（strings）：
 - mobile 用户**无权限**改 `/var/jb/Library/MobileSubstrate/DynamicLibraries/`（`mv` 被拒）。
 - **Choicy 里汇丰中国和汇丰香港均已设 `tweakInjectionDisabled=true`**——当前完全禁止任何
   tweak 注入这两个 App（推测上一轮排查时手动设的）。这既意味着裸跑环境更干净，也意味着
-  **将来 hsbcbypass 要能注入，必须先在 Choicy 放开或加白名单**。
+  **将来本项目要能注入，必须先在 Choicy 放开或加白名单**。
 
 ## Round 0 结论（2026-08-21，探针版实测）
 

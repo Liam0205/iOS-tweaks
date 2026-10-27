@@ -1,17 +1,23 @@
 #!/bin/bash
-# 部署并验证 HSBCBypass。
+# 部署并验证 HSBCChinaBypass。
 # 用法: ./verify.sh [冷启动次数] [每次观察秒数]
 #
 # 设备上有两处缓存要注意（都是本轮实测踩到的）：
 #   1. /var/jb/usr/lib/TweakInject 下的 dylib 改内容不换名字，dyld 会报
 #      CODESIGNING 并把进程杀掉。所以每次换一个新的文件名。
 #   2. TweakInject 里其它 tweak（Choicy、Crane 等）的 plist 也会注入汇丰，
-#      它们自己可能触发 ZDefend 的注入检测。这里只保留 HSBCBypass。
+#      它们自己可能触发 ZDefend 的注入检测。这里只保留 HSBCChinaBypass。
 set -u
 HOST="mobile@localhost"
 PORT="${PORT:-22215}"
 PROJ="$(cd "$(dirname "$0")" && pwd)"
-DYLIB="$PROJ/.theos/obj/debug/HSBCBypass.dylib"
+# 签名后的 dylib 在 obj 根目录；obj/arm64 下的是重签之前的那份，别用错了。
+# 两种构建布局都兼容一下：debug 构建在 obj/debug，release 构建在 obj 根目录。
+if [ -f "$PROJ/.theos/obj/debug/HSBCChinaBypass.dylib" ]; then
+  DYLIB="$PROJ/.theos/obj/debug/HSBCChinaBypass.dylib"
+else
+  DYLIB="$PROJ/.theos/obj/HSBCChinaBypass.dylib"
+fi
 RUNS="${1:-3}"
 SECS="${2:-40}"
 CONT=$(ssh -o BatchMode=yes -p "$PORT" "$HOST" \
@@ -25,9 +31,9 @@ CONT="${CONT%/}"
 
 [ -f "$DYLIB" ] || { echo "缺少 $DYLIB，先 make"; exit 1; }
 
-NAME="HSBCBypass$(date +%H%M%S)"
+NAME="HSBCChinaBypass$(date +%H%M%S)"
 scp -P "$PORT" -o BatchMode=yes -q "$DYLIB" "$HOST:/var/tmp/$NAME.dylib" || exit 1
-scp -P "$PORT" -o BatchMode=yes -q "$PROJ/HSBCBypass.plist" "$HOST:/var/tmp/$NAME.plist" || exit 1
+scp -P "$PORT" -o BatchMode=yes -q "$PROJ/HSBCChinaBypass.plist" "$HOST:/var/tmp/$NAME.plist" || exit 1
 
 ssh -o BatchMode=yes -p "$PORT" "$HOST" "
 D=/var/jb/usr/lib/TweakInject
@@ -55,6 +61,6 @@ for n in $(seq 1 "$RUNS"); do
 done
 
 if [ -n "$CONT" ]; then
-  scp -P "$PORT" -o BatchMode=yes -q "$HOST:$CONT/Library/Caches/hsbcbypass.log" /var/tmp/hsbc/final.log 2>/dev/null \
+  scp -P "$PORT" -o BatchMode=yes -q "$HOST:$CONT/Library/Caches/hsbcchinabypass.log" /var/tmp/hsbc/final.log 2>/dev/null \
     && echo "日志: /var/tmp/hsbc/final.log" || echo "没有日志（release 构建本来就不写）"
 fi
