@@ -1,19 +1,16 @@
-// HSBCHKBypass 0.0.37：持续扫描"非镜像的可执行内存"，把退出桩改成 ret。
+// HSBCHKBypass 0.0.40：退出到底是谁发起的——按线程做二分。
 //
-// 依据：
-//   - 0.0.36 在启动 386ms 时由自己调用 exit(99)，钩子命中、procwatch 读到 99，
-//     证明退出时刻 libc 的 exit 钩子仍然有效；App 的 exit(1) 确实没经过它；
-//   - 0.0.33 在构造函数里一次性扫描非镜像可执行内存，找到并把两个 "movz x16,#1; svc"
-//     改成了 ret，App 依然退出；
-//   - 说明那块带桩的内存很可能是启动中期才分配出来的（哈希虚拟机创建自己的跳板页）。
+// 到这一版为止，退出在所有用户态入口上都拦不住（符号、GOT、syscall、内联 svc 桩、
+// 异常端口都试过；atexit 也不触发）。那就换个问法：
+//   在退出前把"非主线程"全部挂起，看进程是否还能退出。
+//   - 若不再退出 → 退出是某个后台线程发起的，下一步只需缩小到那一个；
+//   - 若照退   → 退出来自主线程或进程外，方向要另找。
 //
-// 这一版把扫描放进循环里，每 20ms 一次，专门盯新出现的区域。
+// 挂起用 thread_suspend，只挂 system 之外的普通线程，主线程与自身保持运行。
 
 #import <Foundation/Foundation.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
 #import <mach/mach.h>
-#import <mach/vm_region.h>
+#import <mach/thread_act.h>
 #import <pthread.h>
 #import <unistd.h>
 #import <fcntl.h>
@@ -21,11 +18,14 @@
 #import <string.h>
 #import <stdlib.h>
 #import <dlfcn.h>
+#import <signal.h>
 
 #import <substrate.h>
 
 static int g_fd = -1;
 static uint64_t g_start;
+static mach_port_t g_self_thread;
+static mach_port_t g_main_thread;
 
 static uint64_t now_ms(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ULL;
@@ -34,7 +34,7 @@ static uint64_t now_ms(void) {
 static void wf(const char *fmt, ...) {
     if (g_fd < 0) return;
     char buf[512];
-    int off = snprintf(buf, sizeof(buf), "[%llums] ", now_ms() - g_start);
+    int off = snprintf(buf, sizeof(buf), "[%5llums] ", now_ms() - g_start);
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf + off, sizeof(buf) - (size_t)off, fmt, ap);
@@ -43,95 +43,45 @@ static void wf(const char *fmt, ...) {
     write(g_fd, buf, (size_t)(off + n));
 }
 
-static uintptr_t g_txt_lo[1500], g_txt_hi[1500];
-static int g_txt_n;
+static void *g_o_exit;
 
-static void snapshot_text_ranges(void) {
-    uint32_t n = _dyld_image_count();
-    g_txt_n = 0;
-    for (uint32_t i = 0; i < n && g_txt_n < 1500; i++) {
-        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!h || h->magic != MH_MAGIC_64) continue;
-        const uint8_t *cmds = (const uint8_t *)h + sizeof(struct mach_header_64);
-        for (uint32_t c = 0; c < h->ncmds; c++) {
-            const struct load_command *lc = (const struct load_command *)cmds;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if (strcmp(seg->segname, "__TEXT") == 0) {
-                    g_txt_lo[g_txt_n] = (uintptr_t)h;
-                    g_txt_hi[g_txt_n] = (uintptr_t)h + (uintptr_t)seg->vmsize;
-                    g_txt_n++;
-                    break;
-                }
-            }
-            cmds += lc->cmdsize;
-        }
-    }
+static void my_exit(int code) {
+    wf("!! exit(%d) 被调用\n", code);
+    ((void(*)(int))g_o_exit)(code);
 }
 
-static int in_image_text(uintptr_t a) {
-    for (int i = 0; i < g_txt_n; i++) if (a >= g_txt_lo[i] && a < g_txt_hi[i]) return 1;
-    return 0;
-}
+static int g_suspended;
 
-static int g_patched;
-
-static void patch_exit_stubs(int tick) {
-    vm_address_t addr = 0;
-    int scanned = 0;
-    while (1) {
-        vm_size_t size = 0;
-        vm_region_basic_info_data_64_t bi;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t obj = MACH_PORT_NULL;
-        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
-                                        (vm_region_info_t)&bi, &cnt, &obj);
-        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-        if (kr != KERN_SUCCESS) break;
-        if ((bi.protection & VM_PROT_EXECUTE) && size >= 8 && !in_image_text(addr)) {
-            scanned++;
-            const unsigned char *p = (const unsigned char *)addr;
-            const unsigned char *end = p + size;
-            while (p + 8 <= end) {
-                const unsigned char *q = memchr(p, 0x01, (size_t)(end - p - 7));
-                if (!q || q + 4 > end) break;
-                if (!(q[1] == 0x10 && q[2] == 0x00 && q[3] == 0xd4)) { p = q + 1; continue; }
-                uint32_t prev; memcpy(&prev, q - 4, 4);
-                if (tick == 0) {
-                    uint32_t c1, c2, c3;
-                    memcpy(&c1, q - 4, 4); memcpy(&c2, q - 8, 4); memcpy(&c3, q - 12, 4);
-                    wf("  svc @ %p 前：%08x %08x %08x\n", q, c3, c2, c1);
-                }
-                // movz x16, #imm  (0xD2800000 | imm<<5 | 16)
-                if ((prev & 0xFF800000u) == 0xD2800000u && (prev & 0x1F) == 16) {
-                    uint32_t imm = (prev >> 5) & 0xFFFF;
-                    if (imm == 1) {
-                        long ps = sysconf(_SC_PAGESIZE);
-                        uintptr_t page = (uintptr_t)q & ~(uintptr_t)(ps - 1);
-                        if (vm_protect(mach_task_self(), page, (vm_size_t)ps, 0,
-                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
-                            uint32_t ret_insn = 0xD65F03C0u;
-                            memcpy((void *)q, &ret_insn, 4);
-                            vm_protect(mach_task_self(), page, (vm_size_t)ps, 0,
-                                       VM_PROT_READ | VM_PROT_EXECUTE);
-                            g_patched++;
-                            wf("!! 第 %d 拍发现并改写了退出桩 @ %p（累计 %d）\n", tick, q, g_patched);
-                        }
-                    }
-                }
-                p = q + 4;
-            }
+static void suspend_other_threads(void) {
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) return;
+    wf("  枚举到 %u 个线程\n", n);
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        thread_t t = list[i];
+        if (t != g_main_thread && t != g_self_thread) {
+            kern_return_t kr = thread_suspend(t);
+            if (kr == KERN_SUCCESS) g_suspended++;
+            wf("  挂起线程 %u → kr=%d\n", t, kr);
+        } else {
+            wf("  保持线程 %u 运行\n", t);
         }
-        addr += size;
+        mach_port_deallocate(mach_task_self(), t);
     }
-    if (tick == 0) wf("第 0 拍：扫 %d 个非镜像可执行区域，已改写 %d 个桩\n", tick, scanned, g_patched);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(thread_t));
+    wf("  共挂起 %d 个\n", g_suspended);
 }
 
 static void *worker(void *arg) {
     (void)arg;
     for (int i = 0; i < 400; i++) {
-        patch_exit_stubs(i);
-        usleep(15 * 1000);
+        uint64_t el = now_ms() - g_start;
+        if (!g_suspended && el > 330) {
+            wf("=== 到达 %llums，开始挂起非主线程 ===\n", el);
+            suspend_other_threads();
+        }
+        if (i % 5 == 0) wf("心跳 相对=%llums\n", el);
+        usleep(20 * 1000);
     }
     return NULL;
 }
@@ -143,10 +93,15 @@ __attribute__((constructor)) static void ctor(void) {
     NSString *lp = [caches stringByAppendingPathComponent:@"hsbchkbypass.log"];
     g_fd = open([lp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_fd < 0) return;
-    wf("===== 0.0.38 启动 pid=%d =====\n", getpid());
-    snapshot_text_ranges();
-    wf("镜像 __TEXT 范围 %d 个\n", g_txt_n);
+    wf("===== 0.0.40 启动 pid=%d =====\n", getpid());
+
+    void *p = dlsym(RTLD_DEFAULT, "exit");
+    MSHookFunction(p, (void *)my_exit, &g_o_exit);
+    wf("exit=%p 首字=%08x\n", p, *(const volatile uint32_t *)p);
+
+    g_main_thread = pthread_mach_thread_np(pthread_self());
     pthread_t th;
     pthread_create(&th, NULL, worker, NULL);
-    wf("构造函数结束\n");
+    g_self_thread = pthread_mach_thread_np(th);
+    wf("主线程 %u 自身线程 %u\n", g_main_thread, g_self_thread);
 }
