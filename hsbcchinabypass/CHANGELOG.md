@@ -1,5 +1,19 @@
 # HSBCChinaBypass 更新日志
 
+## 1.0.1
+
+改包名，功能与 1.0.0 完全一致。
+
+1.0.0 叫 `page.0x01.hsbcbypass`，filter 同时包含汇丰中国和汇丰香港两个 bundle id。
+实测名称与覆盖面不符：这套手段只对汇丰中国的 ZDefend 生效，汇丰香港 3.69.12 是另一套
+技术栈，补丁在那儿不起任何作用，那条 filter 唯一的效果是多留一条注入痕迹。
+
+- 包名改为 `page.0x01.hsbcchinabypass`，tweak 名与安装后的 dylib 改为 `HSBCChinaBypass`。
+- filter 只保留 `cn.com.hsbc.hsbcchina`。
+- 通过 `Conflicts` / `Replaces: page.0x01.hsbcbypass` 接替旧包，安装时由包管理器自行替换。
+- 日志文件改名为 `hsbcchinabypass.log`（仅 debug 构建会写）。
+- 汇丰香港另立 `hsbchkbypass` 项目，目前仍在排查，没有可用版本。
+
 ## 1.0.0
 
 首个发布版。目标 App 汇丰中国（`cn.com.hsbc.hsbcchina`）3.75.0（build 129890），在 rootless 越狱
