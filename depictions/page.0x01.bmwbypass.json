@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\u7ed5\u8fc7 My BMW\uff08de.bmw.connected.mobile20.cn\uff09\u7684\u8d8a\u72f1\u68c0\u6d4b\u5f39\u7a97\uff0c\u4f7f\u5176\u5728\u8d8a\u72f1\u8bbe\u5907\u4e0a\u6b63\u5e38\u8fd0\u884c\u3002\u68c0\u6d4b SDK \u4e3a IOSSecuritySuite\uff0chook \u5176\u8d8a\u72f1/\u9006\u5411\u68c0\u6d4b\u5165\u53e3\u3002\u5728 My BMW 6.8.2 \u7248\u672c\u9a8c\u8bc1\u53ef\u7528\uff0c\u9002\u7528\u4e8e rootless \u8d8a\u72f1\uff08Dopamine \u7b49\uff09\u3002"}],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\n## 0.0.2\n\n- \u8865\u5145\u9a8c\u8bc1\u4fe1\u606f\uff1a\u5728 My BMW 6.8.2 \u7248\u672c\u9a8c\u8bc1\u53ef\u7528\n\n## 0.0.1\n\n- \u7ed5\u8fc7 My BMW\uff08`de.bmw.connected.mobile20.cn`\uff09\u7684\u8d8a\u72f1\u68c0\u6d4b\u5f39\u7a97\uff08\u300cApp\u8bbf\u95ee\u53d7\u9650 / \u68c0\u6d4b\u5230\u53ef\u80fd\u5b58\u5728\u8d8a\u72f1\u884c\u4e3a\u300d\uff09\n- \u68c0\u6d4b SDK = \u6807\u51c6\u5f00\u6e90 IOSSecuritySuite\uff1b\u5f39\u7a97\u7531 Flutter/Dart \u5c42\u7684 attestation pre-check \u89e6\u53d1\uff0c\u68c0\u6d4b\u7ed3\u679c\u6765\u81ea\u4e3b binary \u8c03\u7528\u7684 ISS \u5165\u53e3\n- \u8fd0\u884c\u65f6\u63a2\u9488\u786e\u8ba4 BMW \u542f\u52a8\u53ea\u8c03\u7528 `amIJailbroken()` \u4e0e `amIReverseEngineered()`\uff0c\u540e\u8005\u547d\u4e2d\u6ce8\u5165\u5e93\u662f\u5f39\u7a97\u6839\u56e0\uff08\u4ec5\u7ed5 amIJailbroken \u4ecd\u5f39\uff09\n- \u65b9\u6848\uff1ainline-hook\uff08MSHookFunction\uff09ISS \u5168\u90e8 8 \u4e2a\u300c`() -> Bool`\u300d\u9876\u5c42\u68c0\u6d4b\u5165\u53e3\u6052\u8fd4\u56de false\uff08\u542b amIJailbroken/amIReverseEngineered/amIProxied/amIDebugged/amIRunInEmulator/amIInLockdownMode/isParentPidUnexpected/hasWatchpoint\uff09\n- ISS \u65e0\u5185\u5b58\u5b8c\u6574\u6027\u81ea\u68c0\uff0cinline-hook \u5b89\u5168\uff1b\u9760 Swift mangled \u7b26\u53f7\u5b9a\u4f4d\uff0c\u8de8 App \u5c0f\u7248\u672c/\u673a\u578b/\u7cfb\u7edf\u901a\u7528\n- \u9a8c\u8bc1\u73af\u5883\uff1aiPhone 14 Pro Max / iOS 16.3.x / rootless\uff08Dopamine + ElleKit\uff09\uff1bSimTouch \u622a\u56fe\u786e\u8ba4\u8fdb\u5165 App \u4e3b\u9875\u4e0e\u767b\u5f55\u9875\u65e0\u5f39\u7a97\n- \u8bca\u65ad\u65e5\u5fd7\u7531\u7f16\u8bd1\u5f00\u5173 `BMW_DEBUG_LOG` \u63a7\u5236\uff0c\u53d1\u5e03\u7248\u9ed8\u8ba4\u5173\u95ed"}],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}

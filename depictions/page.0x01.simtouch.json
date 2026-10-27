@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "Remote touch simulation and screenshot capture for jailbroken iOS"}],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "## 0.1.0\\n\\nRelease 0.1.0"}],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}
