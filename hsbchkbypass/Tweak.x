@@ -47,9 +47,10 @@
 // 两个干预开关。0.0.130 之前把"让盾对注入库的读取失败"留在了代码里，
 // 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
 // 现在分开关，一次只上一个。
-#define DO_TAKEOVER 0   // 接管网关（0 = 完全不干预，只留着当对照）
+#define DO_TAKEOVER 1   // 接管网关（0 = 完全不干预，只留着当对照）
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
+#define DO_DISKCHECK 1  // 逐镜像比对内存与磁盘
 
 #define ZERO_PAGE 0x4000
 static char g_zero_page[ZERO_PAGE] __attribute__((aligned(ZERO_PAGE)));
@@ -151,6 +152,12 @@ static volatile int g_total;
 static uint64_t g_inj_lo[MAX_INJ];
 static uint64_t g_inj_hi[MAX_INJ];
 static volatile int g_inj_n;
+
+// 构造函数里抄下来的镜像基址表（升序）。哈希阶段 x1 每跨进一张镜像就是一个基址，
+// 用它来回答"盾到底哈希了哪几张"。
+static uint64_t g_img_tab[1200];
+static int g_img_tab_n;
+static uint64_t g_last_hash_base;
 static volatile uint64_t g_decoys[MAX_INJ];  // 每个注入库对应的系统库替身
 static volatile int g_decoys_n;
 static volatile int g_redirects;
@@ -689,6 +696,160 @@ static void *poller(void *arg) {
 }
 
 // 把当前进程加载的全部镜像打一遍，用来把盾读的地址对上具体是哪个库。
+static void fill_img_tab(void) {
+    uint32_t n = _dyld_image_count();
+    g_img_tab_n = 0;
+    for (uint32_t i = 0; i < n && g_img_tab_n < 1200; i++) {
+        uint64_t b = (uint64_t)(uintptr_t)_dyld_get_image_header(i);
+        if (b) g_img_tab[g_img_tab_n++] = b;
+    }
+    for (int i = 1; i < g_img_tab_n; i++) {          // 插入排序，n 不到 1000
+        uint64_t v = g_img_tab[i];
+        int j = i - 1;
+        while (j >= 0 && g_img_tab[j] > v) { g_img_tab[j + 1] = g_img_tab[j]; j--; }
+        g_img_tab[j + 1] = v;
+    }
+    say_hex("镜像表条数=", g_img_tab_n);
+}
+
+// 把盾镜像的 __TEXT 与磁盘文件逐页比对。
+// 盾在 44-60ms 间对自己的代码页做 xxHash 并比对期望值，那说明它有一份自检；
+// 只要有一段字节和文件对不上，就是它眼里的"被改过"。
+static void compare_self_with_disk(void) {
+    if (!g_base) return;
+    uint32_t n = _dyld_image_count();
+    const char *path = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        if ((uint64_t)(uintptr_t)_dyld_get_image_header(i) == (uint64_t)g_base) {
+            path = _dyld_get_image_name(i);
+            break;
+        }
+    }
+    if (!path) { say("找不到盾的路径\n"); return; }
+    say("自查文件="); say(path); say("\n");
+
+    const uint8_t *hdr = (const uint8_t *)(uintptr_t)g_base;
+    uint32_t ncmds = *(const uint32_t *)(hdr + 16);
+    uint64_t vmaddr = 0, vmsize = 0, fileoff = 0;
+    const uint8_t *c = hdr + 32;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = *(const uint32_t *)c;
+        uint32_t sz  = *(const uint32_t *)(c + 4);
+        if (cmd == 0x19) {                       // LC_SEGMENT_64
+            if (!strncmp((const char *)(c + 8), "__TEXT", 16)) {
+                vmaddr  = *(const uint64_t *)(c + 24);
+                vmsize  = *(const uint64_t *)(c + 32);
+                fileoff = *(const uint64_t *)(c + 40);
+                break;
+            }
+        }
+        if (!sz) break;
+        c += sz;
+    }
+    if (!vmsize) { say("没找到 __TEXT\n"); return; }
+    say_hex("__TEXT vmaddr=", vmaddr);
+    say_hex("__TEXT vmsize=", vmsize);
+    say_hex("__TEXT fileoff=", fileoff);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { say("打不开盾文件\n"); return; }
+    static uint8_t fb[0x4000];
+    int diffs = 0;
+    uint64_t pages = (vmsize + 0x3fff) / 0x4000;
+    for (uint64_t k = 0; k < pages; k++) {
+        uint64_t off = k * 0x4000;
+        size_t want = (size_t)((vmsize - off) < 0x4000 ? (vmsize - off) : 0x4000);
+        ssize_t got = pread(fd, fb, want, (off_t)(fileoff + off));
+        if (got <= 0) { say_hex("pread 失败 off=", off); break; }
+        const uint8_t *mem = (const uint8_t *)(uintptr_t)(g_base + off);
+        if (!memcmp(mem, fb, (size_t)got)) continue;
+        diffs++;
+        if (diffs <= 24) {
+            uint64_t first = 0;
+            while (first < (uint64_t)got && mem[first] == fb[first]) first++;
+            say_hex("页不同 相对盾=+0x", off);
+            say_hex("  首个差异字节=+0x", first + off);
+            char buf[96];
+            out_t o = { buf, buf + sizeof(buf) - 1 };
+            o_s(&o, "  内存=");
+            for (int j = 0; j < 8; j++) { o_h(&o, mem[first + j]); o_ch(&o, ' '); }
+            o_s(&o, " 文件=");
+            for (int j = 0; j < 8; j++) { o_h(&o, fb[first + j]); o_ch(&o, ' '); }
+            o_ch(&o, '\n');
+            emit_ts(buf, (size_t)(o.p - buf));
+        }
+    }
+    close(fd);
+    say_hex("自查：不同的页数=", diffs);
+}
+
+// 逐镜像把 __TEXT 与磁盘文件比对，只比能打开的（缓存内的镜像没有独立文件，跳过）。
+// 跑在独立线程上：判定发生在 52ms 左右，进程可能中途就没了，已经写出去的行还在。
+static void *disk_check(void *arg) {
+    (void)arg;
+    static uint8_t fb[0x4000];
+    uint32_t n = _dyld_image_count();
+    int done = 0, skipped = 0, opened = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *path = _dyld_get_image_name(i);
+        uint64_t base = (uint64_t)(uintptr_t)_dyld_get_image_header(i);
+        if (!path || !base) continue;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { skipped++; continue; }
+        opened++;
+        const uint8_t *hdr = (const uint8_t *)(uintptr_t)base;
+        if (*(const uint32_t *)hdr != 0xfeedfacf) { close(fd); continue; }
+        uint32_t ncmds = *(const uint32_t *)(hdr + 16);
+        uint64_t vmsize = 0, fileoff = 0;
+        const uint8_t *c = hdr + 32;
+        for (uint32_t k = 0; k < ncmds; k++) {
+            uint32_t cmd = *(const uint32_t *)c;
+            uint32_t sz  = *(const uint32_t *)(c + 4);
+            if (cmd == 0x19 && !strncmp((const char *)(c + 8), "__TEXT", 16)) {
+                vmsize  = *(const uint64_t *)(c + 32);
+                fileoff = *(const uint64_t *)(c + 40);
+                break;
+            }
+            if (!sz) break;
+            c += sz;
+        }
+        if (!vmsize) { close(fd); continue; }
+        uint64_t pages = (vmsize + 0x3fff) / 0x4000;
+        int bad = 0;
+        for (uint64_t k = 0; k < pages; k++) {
+            uint64_t off = k * 0x4000;
+            size_t want = (size_t)((vmsize - off) < 0x4000 ? (vmsize - off) : 0x4000);
+            ssize_t got = pread(fd, fb, want, (off_t)(fileoff + off));
+            if (got <= 0) break;
+            const uint8_t *mem = (const uint8_t *)(uintptr_t)(base + off);
+            if (memcmp(mem, fb, (size_t)got)) {
+                bad++;
+                if (bad <= 3) {
+                    uint64_t first = 0;
+                    while (first < (uint64_t)got && mem[first] == fb[first]) first++;
+                    {
+                        char lb[600];
+                        out_t lo = { lb, lb + sizeof(lb) - 1 };
+                        o_s(&lo, "!! 内存与磁盘不同 ");
+                        const char *pp = path;
+                        for (int q = 0; pp[q] && q < 300; q++) o_ch(&lo, pp[q]);
+                        o_s(&lo, " 差异字节=+0x"); o_h(&lo, off + first);
+                        o_ch(&lo, '\n');
+                        emit_ts(lb, (size_t)(lo.p - lb));
+                    }
+                }
+            }
+        }
+        if (bad) { done++; say_hex("   该镜像不同页数=", bad); }
+        if (opened % 50 == 0) say_hex("已比对镜像数=", opened);
+        close(fd);
+    }
+    say_hex("全镜像自查完成：能打开=", opened);
+    say_hex("  不同镜像数=", done);
+    say_hex("  无文件跳过=", skipped);
+    return NULL;
+}
+
 static void dump_images(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
@@ -1846,6 +2007,16 @@ static void dump_probe(void) {
 
 // 在指定时刻把所有线程的 PC/LR 拍下来。3098ms 那次运行里 App 活了三秒才死，
 // 但不知道主线程那三秒在等什么。这里直接看它卡在哪个地址。
+static int is_image_base(uint64_t a) {
+    int lo = 0, hi = g_img_tab_n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (g_img_tab[mid] == a) return 1;
+        if (g_img_tab[mid] < a) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
 static void dump_threads(int tag_ms) {
     thread_act_array_t list = NULL;
     mach_msg_type_number_t cnt = 0;
@@ -1878,6 +2049,20 @@ static void dump_threads(int tag_ms) {
                     o_s(&o, nm[k]);
                     o_h(&o, rv[k]);
                 }
+                if (is_image_base(rv[1]) && rv[1] != g_last_hash_base) {
+                    g_last_hash_base = rv[1];
+                    int inj = 0;
+                    for (int j = 0; j < g_inj_n; j++)
+                        if (rv[1] >= g_inj_lo[j] && rv[1] < g_inj_hi[j]) inj = 1;
+                    o_s(&o, inj ? " 哈希注入库=" : " 哈希镜像="); o_h(&o, rv[1]);
+                }
+                for (int k = 0; k < 9; k++) {
+                    for (int j = 0; j < g_inj_n; j++) {
+                        if (rv[k] >= g_inj_lo[j] && rv[k] < g_inj_hi[j]) {
+                            o_s(&o, " 落在注入库"); o_d(&o, j); o_s(&o, "的x"); o_d(&o, k);
+                        }
+                    }
+                }
             }
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
@@ -1890,8 +2075,13 @@ static void dump_threads(int tag_ms) {
 
 static void *heartbeat(void *arg) {
     (void)arg;
-    static const int g_snap_at[] = { 40, 43, 46, 49, 52, 55, 58, 61, 64, 1000 };
-#define SNAP_N ((int)(sizeof(g_snap_at)/sizeof(g_snap_at[0])))
+    // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
+    static int g_snap_at[200];
+    static int g_snap_n;
+    if (!g_snap_n) {
+        for (int t = 360; t <= 620; t += 2) g_snap_at[g_snap_n++] = t;
+        g_snap_at[g_snap_n++] = 10000;
+    }
     int g_snap_i = 0;
     uint64_t last_hb = 0;
     for (;;) {
@@ -1901,7 +2091,7 @@ static void *heartbeat(void *arg) {
 #endif
         uint64_t el = rec_ms(read_pct());
         if (el > 12000) break;
-        if (g_snap_i < SNAP_N && el >= g_snap_at[g_snap_i]) {
+        if (g_snap_i < g_snap_n && (int)(el * 10) >= g_snap_at[g_snap_i]) {
             dump_threads(g_snap_at[g_snap_i]);
             g_snap_i++;
         }
@@ -1937,7 +2127,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.140 启动（对照：完全不接管网关）=====\n");
+    say("===== 0.0.145 启动（全部镜像与磁盘比对，带路径）=====\n");
 
     try_takeover();
     {
@@ -1949,6 +2139,9 @@ __attribute__((constructor)) static void ctor(void) {
             pthread_create(&hb, NULL, heartbeat, NULL);
         }
     }
+    fill_img_tab();
+    compare_self_with_disk();
+    if (DO_DISKCHECK) { pthread_t dt; pthread_create(&dt, NULL, disk_check, NULL); }
     dump_images();
     if (0) {
         uintptr_t cb = find_cache_base();
