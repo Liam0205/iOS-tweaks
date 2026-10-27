@@ -1,6 +1,6 @@
 Package: page.0x01.hsbcbypass
 Name: HSBCBypass-汇丰反检测-rootless
-Version: 0.0.2
+Version: 1.0.0
 Architecture: iphoneos-arm64
 Description: 绕过汇丰中国 / 汇丰香港的越狱环境检测，使其在越狱设备上正常运行。适用于 rootless 越狱（Dopamine 等）。
 Maintainer: Liam
