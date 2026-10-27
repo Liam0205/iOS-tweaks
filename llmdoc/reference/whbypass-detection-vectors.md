@@ -33,13 +33,44 @@ application:didFinishLaunching
 
 ## 闪退机制
 
-启动 320～440ms 有 4 个 GCD 工作线程被 `br` 送到 `0xb5a01000`。
+启动 320～440ms 有 GCD 工作线程被 `br` 送到 `0xb5a0X000`（`0xb5a00000`～`0xb5a16000`）。
 
-- 该地址落在 `__PAGEZERO`（`0`～`0x100000000`，3.05 GB），四级页表无条目。
+- 该区间落在 `__PAGEZERO`（`0`～`0x100000000`，3.05 GB），四级页表无条目。
 - `vm_allocate(VM_FLAGS_FIXED)` → `KERN_NO_SPACE`（1）；`mmap(MAP_FIXED)` → `MAP_FAILED`。
-- 二进制里搜不到这个常量：64 位、32 位、16 位三种形式均为 0 次。
-- 崩溃报告特征：`EXC_BAD_ACCESS / SIGSEGV`，`pc = far = 0xb5a01000`，`lr = 0`，`sp = 0`，
+- 二进制里搜不到这个常量：64 位、32 位、16 位三种形式均为 0 次——它由 `mov`+`movk`
+  拼出的两个立即数相加得到（`0x92ab7998 + 0x22f4f668 = 0xb5a07000`）。
+- 崩溃报告特征：`EXC_BAD_ACCESS / SIGSEGV`，`pc = far = 毒地址`，`lr = 1`，`sp = 1`，
   `com.apple.root.default-qos` 线程。
+
+### 6 个"炸弹 block"
+
+主程序里有 6 个函数，函数体是「把 `sp`、`lr` 改成上下文里的值，再 `br` 到毒地址」：
+
+| 函数入口 | 跳向 |
+|---|---|
+| `WHClient+0x148470` | `0xb5a07000` |
+| `WHClient+0x1484d0` | `0xb5a10000` |
+| `WHClient+0x149db8` | `0xb5a0b000` |
+| `WHClient+0x14a1b0` | `0xb5a11000` |
+| `WHClient+0x14a4cc` | `0xb5a0d000` |
+| `WHClient+0x14a7dc` | `0xb5a15000` |
+
+全二进制没有一条 `bl` 指向它们，只有 6 处 `adrp`+`add` 把地址写进 block 的 `invoke`
+字段：`+0x144334`、`+0x144638`、`+0x1455f0`、`+0x149d14`、`+0x14a428`、`+0x14a738`。
+这些位置都在 `0x13f000`～`0x145000` 那段混淆状态机里。
+
+调用路径：
+
+```
+工作线程执行 block（invoke = WHClient+0x13f140）
+  → 状态机 dispatch_async(全局队列, block{invoke = 0x148470})
+  → libdispatch 的 _dispatch_call_block_and_release（dylib+0x1e68）blr 该 invoke
+  → 炸弹函数改 sp/lr 后 br 到毒地址
+```
+
+同一个状态机还把 `+0x1406b0`（反调试守卫）当 block 反复投递，间隔约 6.2 秒。
+
+**修法**：6 个入口的第一条指令改成 `ret`（`0xD65F03C0`），启动期异常归零。
 
 ## 反调试守卫
 
