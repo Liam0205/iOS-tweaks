@@ -60,6 +60,7 @@
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
 #define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
 #define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
+#define DO_EXITFN   0   // [0x848d70] 是减法基准值不是函数指针，按函数指针改写会立刻崩
 #define DO_DN_PARK  1   // 1=让那条线程原地停住 2=正常返回给调用方
 #define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
@@ -1137,6 +1138,50 @@ static void flush_ring(void) {
     }
 }
 
+// ---------------------------------------------------------------- 退出函数本身
+//
+// 0x40e7e4(原因码, 细节) 是盾上报并退出进程的那个函数。它最后一步是
+//   40e810: adrp x8, 0x848000 ; ldr x21, [x8, #0xd70]
+//   40e838: sub  x8, x21, x8   ; x8 是另一处恒为 0 的槽，所以目标就是 [0x848d70]
+//   40e83c: blr  x8
+// 全二进制里只有 5 处读这个槽，全在退出/上报这一簇里。
+//
+// 所以它是一个纯粹的"函数指针 + 数据"，改法和网关槽一样，不碰任何代码。
+// 而且它比在系统调用处拦截好在：这是一次正常的函数调用，替身正常返回之后，
+// 调用方会接着走 0x40e848 那条上报路径，而不是带着半截状态往下跑。
+#define EXITFN_SLOT_OFF 0x848d70ULL
+
+static volatile uint64_t g_exitfn_hits;
+static int g_exitfn_done;
+
+__attribute__((noinline, no_stack_protector)) void exitfn_stub(void) {
+    g_exitfn_hits = g_exitfn_hits + 1;
+}
+
+static void install_exitfn(void) {
+    if (!g_base) return;
+    volatile uint64_t *slot = (volatile uint64_t *)(g_base + EXITFN_SLOT_OFF);
+    uint64_t cur = *slot;
+    if (!cur) return;
+    uint64_t want = (uint64_t)(uintptr_t)&exitfn_stub;
+    if (g_exitfn_done) {
+        if (cur != want) *slot = want;
+        return;
+    }
+    g_exitfn_done = 1;
+    say_hex("退出函数槽 原值=", cur);
+    Dl_info de = {0};
+    if (dladdr((void *)(uintptr_t)cur, &de) && de.dli_fname) {
+        say("  "); say(de.dli_fname);
+        say_hex(" +", (unsigned long long)(cur - (uint64_t)(uintptr_t)de.dli_fbase));
+        if (de.dli_sname) { say("  "); say(de.dli_sname); }
+        say("\n");
+    }
+    *slot = want;
+    say_hex("           换成=", want);
+    say_hex("           回读=", *slot);
+}
+
 static void *poller(void *arg) {
     (void)arg;
     // 前 500 轮热跑（构造函数阶段必须尽快接管网关，盾 40 多毫秒就开始判定），
@@ -1146,6 +1191,9 @@ static void *poller(void *arg) {
         if (i > 500) usleep(1000);
         try_takeover();
         install_dienext();
+#if DO_EXITFN
+        install_exitfn();
+#endif
     probe_install_handlers();
     // 心跳线程只在构造函数开头创建一次。0.0.131 之前这里是每轮循环各建一个，
     // 一次启动里会有成百上千个线程同时改写检查项、同时写日志，结果既没法归因，
@@ -2996,6 +3044,7 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 改成返回="); o_d(&o, (long long)g_dn_fixed);
             o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
             o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
+            o_s(&o, " 退出函数="); o_d(&o, (long long)g_exitfn_hits);
             o_s(&o, " 内存MB="); o_d(&o, (long long)(footprint_kb() / 1024));
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
