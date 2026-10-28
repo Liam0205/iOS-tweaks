@@ -5039,6 +5039,8 @@ static void dump_got(void) {
 #define DO_FD_LOG 1
 // 0.0.269：记录 0x713720 里那次 4 字节 read 的参数与结果。
 #define DO_READ_LOG 1
+// 0.0.270：记录 0x713720 自己的状态跳转。
+#define DO_VM2_LOG 1
 #define OFF_GATE713720 0x713720ULL
 #define OFF_VM_CSEL 0x712e10ULL
 uint64_t g_ch_cb, g_ch_ct, g_ch_vt;
@@ -5389,6 +5391,71 @@ static int install_read_probe(void) {
     return 1;
 }
 
+// 0.0.270：0x713720 自己也是状态机，入口在 0x71378c：
+//   71378c: mov x8, x9
+//   713790: cmp w9, w24
+//   713794: b.le 0x7137e0
+// 给它装上分派桩，看它卡在哪个状态——那 800 毫秒究竟花在什么上面。
+uint64_t g_vm2_le, g_vm2_gt;
+static volatile uint64_t g_vm2_n;
+#define VM2_CAP 20000
+
+__attribute__((noinline, used)) void vm2_state_log(uint32_t st) {
+    uint64_t n = g_vm2_n;
+    if (n >= VM2_CAP) return;
+    g_vm2_n = n + 1;
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x564D325300000001ULL, (uint64_t)st, n, up_ms() - g_t0, 0,
+                      (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void vm2_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x9,  x10, [sp, #0x10]\n"
+        "stp x0,  x1,  [sp, #0x20]\n"
+        "mov x0, x9\n"
+        "bl _vm2_state_log\n"
+        "ldp x0,  x1,  [sp, #0x20]\n"
+        "ldp x9,  x10, [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "mov x8, x9\n"
+        "cmp w9, w24\n"
+        "b.le 1f\n"
+        "adrp x16, _g_vm2_gt@PAGE\n"
+        "ldr x16, [x16, _g_vm2_gt@PAGEOFF]\n"
+        "br x16\n"
+        "1:\n"
+        "adrp x16, _g_vm2_le@PAGE\n"
+        "ldr x16, [x16, _g_vm2_le@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_vm2_probe(void) {
+    if (!g_base) return 0;
+    g_vm2_gt = g_base + 0x713798ULL;
+    g_vm2_le = g_base + 0x7137e0ULL;
+    uintptr_t addr = g_base + 0x71378cULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("713 分派桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&vm2_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("713 分派桩：已装到 ", addr);
+    return 1;
+}
+
 static int install_vm_desc_probe(void) {
     if (!g_base) return 0;
     g_vm_join = g_base + 0x7133e0ULL;
@@ -5665,7 +5732,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.269 启动（记录判定里那次 4 字节读）=====\n");
+    say("===== 0.0.270 启动（记录 0x713720 的状态跳转）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -5690,6 +5757,9 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_READ_LOG
     install_read_probe();
+#endif
+#if DO_VM2_LOG
+    install_vm2_probe();
 #endif
 #if DO_GATE_RET_ZERO
     patch_word(g_base + OFF_GATE713720,     0x52800000U);   // mov w0, #0
