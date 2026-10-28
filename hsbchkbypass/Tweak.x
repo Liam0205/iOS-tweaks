@@ -5037,6 +5037,8 @@ static void dump_got(void) {
 #define DO_OPEN_PATH_LOG 1
 // 0.0.267：记录 0x713720 里那次 open 的返回值。
 #define DO_FD_LOG 1
+// 0.0.269：记录 0x713720 里那次 4 字节 read 的参数与结果。
+#define DO_READ_LOG 1
 #define OFF_GATE713720 0x713720ULL
 #define OFF_VM_CSEL 0x712e10ULL
 uint64_t g_ch_cb, g_ch_ct, g_ch_vt;
@@ -5311,6 +5313,79 @@ static int install_fd_probe(void) {
     mach_vm_protect(mach_task_self(), page, 0x4000, 0,
                     VM_PROT_READ | VM_PROT_EXECUTE);
     say_hex("fd桩：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.269：0x713720 里唯一一次 read 在 0x713904：
+//   mov x0, x20     ; fd
+//   ldr x1, [sp]    ; 缓冲区
+//   mov w2, #0x4    ; 长度 4
+//   bl  read
+//   cmp x0, #0x4    ; 必须刚好读到 4 字节
+// 在它前面插桩，把 fd / 缓冲区 / 长度、以及读回来的字节都记下来。
+uint64_t g_read_target, g_read_resume;
+static volatile uint64_t g_read_n;
+
+__attribute__((noinline, used)) void rd_log(uint64_t fd, uint64_t buf, uint64_t len) {
+    g_read_n++;
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x5245414400000001ULL, fd, buf, len, g_read_n, (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((noinline, used)) void rd_ret_log(uint64_t ret, uint64_t buf) {
+    if (g_gwfd < 0) return;
+    uint32_t head = 0;
+    safe_read(buf, &head, 4);
+    uint64_t r[6] = { 0x5245414400000002ULL, ret, (uint64_t)head, buf, g_read_n,
+                      (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void rd_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x50\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "str x2,       [sp, #0x20]\n"
+        "bl _rd_log\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldr x2,       [sp, #0x20]\n"
+        "adrp x16, _g_read_target@PAGE\n"
+        "ldr x16, [x16, _g_read_target@PAGEOFF]\n"
+        "blr x16\n"
+        "str x0, [sp, #0x28]\n"
+        "mov x9, x0\n"
+        "ldr x1, [sp, #0x18]\n"
+        "mov x0, x9\n"
+        "bl _rd_ret_log\n"
+        "ldr x0, [sp, #0x28]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x50\n"
+        "adrp x16, _g_read_resume@PAGE\n"
+        "ldr x16, [x16, _g_read_resume@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_read_probe(void) {
+    if (!g_base) return 0;
+    g_read_target = g_base + 0x4365d4ULL;   // read 的裸系统调用封装
+    g_read_resume = g_base + 0x713908ULL;   // cmp x0, #0x4
+    uintptr_t addr = g_base + 0x713904ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("读桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&rd_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("读桩：已装到 ", addr);
     return 1;
 }
 
@@ -5590,7 +5665,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.268 启动（关掉跳过安全检查）=====\n");
+    say("===== 0.0.269 启动（记录判定里那次 4 字节读）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -5612,6 +5687,9 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_FD_LOG
     install_fd_probe();
+#endif
+#if DO_READ_LOG
+    install_read_probe();
 #endif
 #if DO_GATE_RET_ZERO
     patch_word(g_base + OFF_GATE713720,     0x52800000U);   // mov w0, #0
