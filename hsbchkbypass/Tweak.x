@@ -5024,7 +5024,7 @@ static void dump_got(void) {
 //   5d8894  bl 0x6adf2c    ← 取一个对象
 //   5d88d0  blr x8         ← 虚表调用，疑似真正的检查
 // 这一版在三个点插桩，一次看清谁被调用、调到了哪里。
-#define DO_CHAIN_LOG 1
+#define DO_CHAIN_LOG 0
 // 0.0.261：离线摊平之后发现，"0x713720 返回 0"会让虚拟机当场结束，
 // 返回非零才一路走到原因码 5。把那次 csel 抹掉，等于固定走成功出口。
 #define DO_VM_FORCE_OK 0
@@ -5041,6 +5041,8 @@ static void dump_got(void) {
 #define DO_READ_LOG 1
 // 0.0.270：记录 0x713720 自己的状态跳转。
 #define DO_VM2_LOG 1
+// 0.0.271：在 0x713720 的关键位置放"到此一游"，确定它停在哪一步。
+#define DO_MARKS 1
 #define OFF_GATE713720 0x713720ULL
 #define OFF_VM_CSEL 0x712e10ULL
 uint64_t g_ch_cb, g_ch_ct, g_ch_vt;
@@ -5164,20 +5166,24 @@ __attribute__((naked)) static void gate713720_stub(void) {
         "ldp x0,  x1,  [sp, #0x10]\n"
         "ldp x29, x30, [sp, #0x00]\n"
         "add sp, sp, #0x40\n"
+        // 0.0.272：原来的写法跳到 0x712e00 / 0x712e08，可那两处已经被
+        // 本桩自己的字面量覆盖成了垃圾。改成完整重放这一段再到 0x712e18。
         "cmp w0, #0x0\n"
+        "mov w8, #0xf1e\n"
+        "movk w8, #0x748, lsl #16\n"
+        "mov w9, #0xec1b\n"
+        "movk w9, #0x564f, lsl #16\n"
+        "csel w8, w9, w8, ne\n"
         "adrp x16, _g_g713720_eq@PAGE\n"
         "ldr x16, [x16, _g_g713720_eq@PAGEOFF]\n"
-        "adrp x17, _g_g713720_gt@PAGE\n"
-        "ldr x17, [x17, _g_g713720_gt@PAGEOFF]\n"
-        "csel x16, x17, x16, ne\n"
         "br x16\n"
     );
 }
 
 static int install_gate713720_probe(void) {
     if (!g_base) return 0;
-    g_g713720_eq = g_base + 0x712e00ULL;   // w0 == 0：成功分支
-    g_g713720_gt = g_base + 0x712e08ULL;   // w0 != 0：失败分支
+    g_g713720_eq = g_base + 0x712e18ULL;   // 重放完 csel 之后的续行
+    g_g713720_gt = 0;
     uintptr_t addr = g_base + 0x712dfcULL;
     uintptr_t page = addr & ~(uintptr_t)0xfff;
     kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
@@ -5396,7 +5402,7 @@ static int install_read_probe(void) {
 //   713790: cmp w9, w24
 //   713794: b.le 0x7137e0
 // 给它装上分派桩，看它卡在哪个状态——那 800 毫秒究竟花在什么上面。
-uint64_t g_vm2_le, g_vm2_gt;
+uint64_t g_vm2_le, g_vm2_gt, g_vm2_gle;
 static volatile uint64_t g_vm2_n;
 #define VM2_CAP 20000
 
@@ -5422,14 +5428,22 @@ __attribute__((naked)) static void vm2_stub(void) {
         "ldp x9,  x10, [sp, #0x10]\n"
         "ldp x29, x30, [sp, #0x00]\n"
         "add sp, sp, #0x40\n"
+        // 0.0.272：原来跳到 0x713798，而那里已被本桩的字面量覆盖。
+        // 改成把两级比较都重放一遍，落到三个没被覆盖的入口之一。
         "mov x8, x9\n"
         "cmp w9, w24\n"
         "b.le 1f\n"
-        "adrp x16, _g_vm2_gt@PAGE\n"
+        "cmp w8, w21\n"
+        "b.le 2f\n"
+        "adrp x16, _g_vm2_gt@PAGE\n"          // 0x7137a0
         "ldr x16, [x16, _g_vm2_gt@PAGEOFF]\n"
         "br x16\n"
+        "2:\n"
+        "adrp x16, _g_vm2_gle@PAGE\n"         // 0x713824
+        "ldr x16, [x16, _g_vm2_gle@PAGEOFF]\n"
+        "br x16\n"
         "1:\n"
-        "adrp x16, _g_vm2_le@PAGE\n"
+        "adrp x16, _g_vm2_le@PAGE\n"          // 0x7137e0
         "ldr x16, [x16, _g_vm2_le@PAGEOFF]\n"
         "br x16\n"
     );
@@ -5437,8 +5451,9 @@ __attribute__((naked)) static void vm2_stub(void) {
 
 static int install_vm2_probe(void) {
     if (!g_base) return 0;
-    g_vm2_gt = g_base + 0x713798ULL;
-    g_vm2_le = g_base + 0x7137e0ULL;
+    g_vm2_gt  = g_base + 0x7137a0ULL;
+    g_vm2_gle = g_base + 0x713824ULL;
+    g_vm2_le  = g_base + 0x7137e0ULL;
     uintptr_t addr = g_base + 0x71378cULL;
     uintptr_t page = addr & ~(uintptr_t)0xfff;
     kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
@@ -5453,6 +5468,72 @@ static int install_vm2_probe(void) {
     mach_vm_protect(mach_task_self(), page, 0x4000, 0,
                     VM_PROT_READ | VM_PROT_EXECUTE);
     say_hex("713 分派桩：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.271：0x713720 卡住之后到底停在哪一条。
+//
+// 已知：分派器只记到 0x33b7d4bb（t=72ms），块 0x713888 做了
+//   713888 add x8, sp, #0x8
+//   71388c bl 0x2f5fbc       ; 拼路径
+//   713890 add x0, sp, #0x8
+//   713894 bl 0x94580        ; 取字符串
+//   713898 mov w1, #0
+//   71389c bl 0x774df4       ; open
+//   7138a0 mov x20, x0
+//   7138a4 mov w8, #0xf4ad   ; 进入状态比较环 0x7138ac
+// 之后本该 b 0x71378c 回到分派器。在几个关键位置各放一个"到此一游"，
+// 就能确定它停在哪一步。
+static void mark(uint32_t tag, uint64_t extra) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4D41524B00000000ULL | (tag & 0xff), extra,
+                      up_ms() - g_t0, 0, 0, (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+__attribute__((noinline, used)) void mark_a(void) { mark(1, 0); }   // 0x713888 之前
+__attribute__((noinline, used)) void mark_b(void) { mark(2, 0); }   // 0x7138a0 之后
+__attribute__((noinline, used)) void mark_c(void) { mark(3, 0); }   // 进 0x7138ac 环
+
+__attribute__((naked)) static void mark_a_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x30\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x8,  x9,  [sp, #0x10]\n"
+        "bl _mark_a\n"
+        "ldp x8,  x9,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x30\n"
+        "add x8, sp, #0x8\n"
+        "adrp x16, _g_mk_next@PAGE\n"
+        "ldr x16, [x16, _g_mk_next@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+__attribute__((naked)) static void mark_c_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x30\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x8,  x9,  [sp, #0x10]\n"
+        "bl _mark_c\n"
+        "ldp x8,  x9,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x30\n"
+        "mov w8, #0xf4ad\n"
+        "movk w8, #0x31bb, lsl #16\n"
+        "adrp x16, _g_mk_loop@PAGE\n"
+        "ldr x16, [x16, _g_mk_loop@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+uint64_t g_mk_next, g_mk_loop;
+
+static int install_marks(void) {
+    if (!g_base) return 0;
+    g_mk_next = g_base + 0x71388cULL;   // bl 0x2f5fbc
+    g_mk_loop = g_base + 0x7138acULL;   // 状态比较环
+    patch_entry_stub(g_base + 0x713888ULL, (void *)&mark_a_stub);
+    patch_entry_stub(g_base + 0x7138a4ULL, (void *)&mark_c_stub);
+    say("记录点：已装（0x713888 / 0x7138a4）\n");
     return 1;
 }
 
@@ -5732,7 +5813,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.270 启动（记录 0x713720 的状态跳转）=====\n");
+    say("===== 0.0.272 启动（修正桩覆盖自身跳转目标的问题）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -5760,6 +5841,9 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_VM2_LOG
     install_vm2_probe();
+#endif
+#if DO_MARKS
+    install_marks();
 #endif
 #if DO_GATE_RET_ZERO
     patch_word(g_base + OFF_GATE713720,     0x52800000U);   // mov w0, #0
