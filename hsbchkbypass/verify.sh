@@ -17,16 +17,22 @@ HOST="mobile@localhost"
 PORT="${PORT:-22215}"
 PROJ="$(cd "$(dirname "$0")" && pwd)"
 # 签名后的 dylib 在 obj 根目录；obj/<arch> 下的是重签之前的那份，别用错了。
-if [ -f "$PROJ/.theos/obj/debug/HSBCHKBypass.dylib" ]; then
-  DYLIB="$PROJ/.theos/obj/debug/HSBCHKBypass.dylib"
+# debug 和 release 两份会同时存在，而 "make" 只更新 debug、"make package" 只更新 release。
+# 这里取较新的那份，并把它的大小和修改时间打出来——0.0.170 那次就是部署到了几小时前的
+# debug 构建，日志抬头还写着上一版，白跑了一轮实验。
+D_DEBUG="$PROJ/.theos/obj/debug/HSBCHKBypass.dylib"
+D_REL="$PROJ/.theos/obj/HSBCHKBypass.dylib"
+if [ -f "$D_DEBUG" ] && { [ ! -f "$D_REL" ] || [ "$D_DEBUG" -nt "$D_REL" ]; }; then
+  DYLIB="$D_DEBUG"
 else
-  DYLIB="$PROJ/.theos/obj/HSBCHKBypass.dylib"
+  DYLIB="$D_REL"
 fi
 RUNS="${1:-3}"
 SECS="${2:-30}"
 CONT="${CONT:-/var/mobile/Containers/Data/Application/A2267FB5-8887-41EE-A5B7-BE6748265D29}"
 
 [ -f "$DYLIB" ] || { echo "缺少 $DYLIB，先 make"; exit 1; }
+echo "使用构建: $DYLIB ($(stat -c %s "$DYLIB") 字节, $(stat -c %y "$DYLIB" | cut -d. -f1))"
 
 # 恢复被本脚本改名为 .off 的 plist。部署失败、观察中断、Ctrl-C 都要走到这里。
 restore_plists() {
@@ -91,6 +97,8 @@ for i in \$(seq 1 300); do
   if [ -n "\$P" ]; then
     PW=\$P
     /var/jb/usr/local/bin/procwatch "\$P" 8 > /var/mobile/hkout/pw_$n.txt 2>&1 &
+    # 冷启动过程中截图：判断"界面到底有没有起来"只能看屏幕。
+    ( sleep 2; simtouch screenshot /var/mobile/hkout/shot_$n.jpg >/dev/null 2>&1 ) &
     break
   fi
 done

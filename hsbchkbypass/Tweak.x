@@ -53,8 +53,9 @@
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
-#define DO_BLKEXIT  0   // 不把 exit 发出去，让调用返回 0
-#define DO_CTRLEXIT 1   // 700ms 时自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
+#define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
+#define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
+#define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
@@ -218,6 +219,7 @@ static void disguise_paths(void) {
 }
 
 static uint64_t g_img_tab[1200];
+static const char *g_img_names[1200];   // 与 g_img_tab 一一对应（排序时一起搬）
 static int g_img_tab_n;
 static uint64_t g_last_hash_base;
 
@@ -337,10 +339,13 @@ static volatile int64_t g_fake_rw;
 static uint64_t g_flag_last;
 static int g_ctrl_done;
 static volatile uint64_t g_ret_override;   // 非零时用它替换系统调用的返回值
+volatile uint64_t g_skip_ret;      // 跳过系统调用之后返回到了哪个地址
 static volatile int g_blk_mmap;
 static volatile int64_t g_mmap_blocked;   // 拦截生效了 N 次
 static uint64_t g_mmap_len;
-static volatile int g_skip_svc;    // 置位时这次系统调用不发出去，直接返回 0
+// 网关的汇编用 64 位 LDR/STR 访问它，所以这里必须是 8 字节且对齐的。
+// 0.0.170 调整代码布局后它落到 0x1100c，链接期才发现这个隐患。
+static volatile uint64_t g_block_nr;   // 非零时，编号等于它的系统调用不发出去、直接返回 0
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
 // 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
 static uint64_t g_late_base, g_late_hi;
@@ -605,8 +610,28 @@ static void emergency_line(const rec_t *r) {
 // 而 392 次 mach 4801 的回复正是"它枚举到了哪些内存区域"的唯一证据。
 void gw_after(uint64_t nr, uint64_t a0, uint64_t ret);
 
+// 把内存里的一段字节按十六进制打出来。只读，不改任何东西。
+static void dump_mem(const char *label, uint64_t addr, int n) {
+    static const char hx[] = "0123456789abcdef";
+    char buf[768];
+    out_t o = { buf, buf + sizeof(buf) - 1 };
+    o_s(&o, label); o_h(&o, addr); o_s(&o, ": ");
+    const volatile unsigned char *m = (const volatile unsigned char *)(uintptr_t)addr;
+    for (int i = 0; i < n; i++) {
+        unsigned char b = m[i];
+        o_ch(&o, hx[b >> 4]); o_ch(&o, hx[b & 15]); o_ch(&o, ' ');
+    }
+    o_ch(&o, '\n');
+    emit_ts(buf, (size_t)(o.p - buf));
+}
+
 void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t caller) {
-    ring_push(nr, a0, a1, a2, a3, caller);
+    // 盾每秒要过 6-7 万次系统调用。全部都记的话，日志几秒就涨到 25MB，
+    // 探针自己成了负载：写日志抢 CPU、抢 IO，App 的启动被拖慢，存活时间也跟着飘。
+    // 所以按 1/200 采样，但 exit（1）、以及负数编号（mach trap）里的关键项照常记。
+    static uint32_t g_n;
+    int keep = (nr == 1) || (((++g_n) % 200) == 0);
+    if (keep) ring_push(nr, a0, a1, a2, a3, caller);
 
     // 盾把整份共享缓存（约 1.42GB）只读映射进进程，很可能是拿磁盘原件和内存活副本比对。
     // 这次实验让它失败，看判定是否变化。只通过网关改返回值，不碰任何代码或数据。
@@ -615,7 +640,24 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     // 第 1 号是 exit。拦截系统调用 ≠ 拦截函数：这里只是不把它发出去、让调用返回 0，
     // 调用方会以为处理完了继续跑。Round 4 做过这件事，但当时的存活测量被
     // "系统重新拉起"污染过，所以现在用绑定 pid 的测量重做一次。
-    if (nr == 1) g_skip_svc = 1;
+    //
+    // 注意：这个开关在 0.0.169 之前只是声明、代码里压根没引用，等于一直都在拦。
+    // 那几轮所谓的"零干预基线"其实带着这个干预，结论要按"拦了 exit"重读。
+#if DO_DIENEXT
+    if (nr == 1 && g_base) {
+        // 就在此刻看：退出函数末尾那几个字节，内存里和磁盘上是不是同一份。
+        static int said_exit_mem;
+        if (!said_exit_mem) {
+            said_exit_mem = 1;
+            dump_mem("退出时 函数尾", g_base + 0x5d8470, 48);
+            dump_mem("退出时 下一站槽", g_base + 0x84c098, 8);
+            dump_mem("退出时 跳板", g_base + 0x774770, 12);
+        }
+    }
+#endif
+#if DO_BLKEXIT
+    if (nr == 1) g_block_nr = 1;
+#endif
 
     // 盾把每个已加载镜像的头读出来看。落在注入库上的那些读，改指到一个真正的系统
     // dylib 上，相对偏移保持不变：它读到的就是一份结构完全正常的库头。
@@ -729,7 +771,7 @@ __attribute__((naked)) static void gw_entry(void) {
         "stp x12, x13, [sp, #0x70]\n"
         "stp x14, x15, [sp, #0x80]\n"
         "str x16,      [sp, #0x90]\n"
-        "ldr x9, [sp, #0x00]\n"        // 进入时的 x29
+        "ldr x9, [sp, #0x00]\n"
         "adrp x10, _g_last_fp@PAGE\n"
         "str x9, [x10, _g_last_fp@PAGEOFF]\n"
         "mov x0, x16\n"                // nr
@@ -739,7 +781,12 @@ __attribute__((naked)) static void gw_entry(void) {
         "ldr x4, [sp, #0x28]\n"
         "ldr x5, [sp, #0x08]\n"        // caller
         "bl _gw_record\n"
-        // 恢复全部入口寄存器，然后真正发系统调用
+        // 还原进入时的全部寄存器，然后决定这次调用要不要发出去。
+        //
+        // 0.0.170 之前这里是一个"一次性消耗"的标志：gw_record 把它置 1，
+        // 这里读一次就清零。可盾会从两条线程几乎同时调用 exit，于是 A 线程置位、
+        // B 线程（恰好是一个无关的 open）把名额领走——那个 open 返回了 0（stdin），
+        // 而 A 线程的 exit 反而真发了出去。现在改成只比系统调用编号，不消耗任何状态。
         "ldr x16, [sp, #0x90]\n"
         "ldp x14, x15, [sp, #0x80]\n"
         "ldp x12, x13, [sp, #0x70]\n"
@@ -749,25 +796,24 @@ __attribute__((naked)) static void gw_entry(void) {
         "ldp x4,  x5,  [sp, #0x30]\n"
         "ldp x2,  x3,  [sp, #0x20]\n"
         "ldp x0,  x1,  [sp, #0x10]\n"
-        "adrp x9, _g_skip_svc@PAGE\n"
-        "ldr x9, [x9, _g_skip_svc@PAGEOFF]\n"
-        "cbz x9, 2f\n"
-        "mov x10, #0\n"
-        "adrp x11, _g_skip_svc@PAGE\n"
-        "str x10, [x11, _g_skip_svc@PAGEOFF]\n"
+        "adrp x17, _g_block_nr@PAGE\n"
+        "ldr x17, [x17, _g_block_nr@PAGEOFF]\n"
+        "cbz x17, 2f\n"
+        "cmp x17, x16\n"
+        "b.ne 2f\n"
+        "adrp x17, _g_skip_ret@PAGE\n"
+        "str x30, [x17, _g_skip_ret@PAGEOFF]\n"
         "ldp x29, x30, [sp], #0x100\n"
         "mov x0, #0\n"
         "ret\n"
         "2:\n"
         "svc #0x80\n"
-        // 返回值先落回帧里，别被下面那次 bl 冲掉
+        // 达尔文系统调用只改 x0/x1，其余寄存器按约定不变。所以这里只把 x0/x1 落回帧里，
+        // 剩下的 x2..x15 全部按进入时的原值还原——0.0.170 之前 x9..x15 是被
+        // 后面那几次 adrp 覆盖掉之后再没还原的，等于每次系统调用都在破坏盾的寄存器。
         "stp x0, x1, [sp, #0x98]\n"
-        "stp x2, x3, [sp, #0xa8]\n"
-        "stp x4, x5, [sp, #0xb8]\n"
-        "stp x6, x7, [sp, #0xc8]\n"
-        "str x8,     [sp, #0xd8]\n"
         "ldr x0, [sp, #0x90]\n"        // nr
-        "ldr x1, [sp, #0x10]\n"        // msgbuf
+        "ldr x1, [sp, #0x10]\n"        // a0
         "ldr x2, [sp, #0x98]\n"        // 返回值
         "bl _gw_after\n"
         "adrp x9, _g_ret_override@PAGE\n"
@@ -778,11 +824,14 @@ __attribute__((naked)) static void gw_entry(void) {
         "adrp x11, _g_ret_override@PAGE\n"
         "str x10, [x11, _g_ret_override@PAGEOFF]\n"
         "1:\n"
-        "ldr x8,     [sp, #0xd8]\n"
-        "ldp x6, x7, [sp, #0xc8]\n"
-        "ldp x4, x5, [sp, #0xb8]\n"
-        "ldp x2, x3, [sp, #0xa8]\n"
         "ldp x0, x1, [sp, #0x98]\n"
+        "ldp x14, x15, [sp, #0x80]\n"
+        "ldp x12, x13, [sp, #0x70]\n"
+        "ldp x10, x11, [sp, #0x60]\n"
+        "ldp x8,  x9,  [sp, #0x50]\n"
+        "ldp x6,  x7,  [sp, #0x40]\n"
+        "ldp x4,  x5,  [sp, #0x30]\n"
+        "ldp x2,  x3,  [sp, #0x20]\n"
         "ldp x29, x30, [sp], #0x100\n"
         "ret\n"
     );
@@ -857,6 +906,155 @@ static void try_takeover(void) {
     say_hex("          新值=", want);
 }
 
+#if DO_DIENEXT
+// 盾的退出函数（+0x5d842c）并不以退出系统调用收尾：它发完 exit 之后还有一步
+//   +0x5d8488  mov w0, #1
+//   +0x5d848c  bl  0x774770      → adrp x16,0x84c000; ldr x16,[x16,#0x98]; br x16
+// 编译器把整个函数按"不返回"来排布，所以 0x5d8490 紧接着就是下一个函数的序言，
+// 这里一旦真返回，执行流会直接冲进隔壁函数的函数体，栈还在本函数那一层上。
+// 也就是说：在系统调用处拦下只会让调用方带着错误状态继续，最后崩在后面。
+//
+// 换个位置——不拦系统调用，而是把"下一站"换成一段按栈帧正常收尾的替身。
+// 退出函数入口是 sub sp,sp,#0x20 与 stp x29,x30,[sp,#0x10]，
+// 所以此刻 [sp,#0x10] 里就是调用者的 x29 和 x30；把它们取回来、把 sp 抬回去再 ret，
+// 就等于这个退出函数正常返回给了调用者。
+#define DIENEXT_SLOT_OFF 0x84c098ULL
+
+static int g_dn_done;
+volatile uint64_t g_dn_hits;      // 替身被调用了几次（盾走到退出函数末尾的次数）
+
+// 单独一个函数，用一条 BL 从替身调进来。BL 是页内相对跳转，
+// 不依赖 adrp/add 那套重定位——0.0.170 最初那版用 adrp 读写计数器，
+// 结果"命中=0"分不清是"替身没被调用"还是"计数器地址算错了"。
+__attribute__((noinline, no_stack_protector)) void dn_hit(void) {
+    g_dn_hits = g_dn_hits + 1;
+    // 进程可能在下一毫秒就没了，心跳来不及读这个计数。所以进来就当场写一行。
+    // 这里只做整数判断和我们自己的定点格式化 + 裸 write，不碰 libc。
+    static const char msg[] = "替身被执行了\n";
+    emit_ts(msg, sizeof(msg) - 1);
+}
+
+// 临时探针：只要有人跳到这个槽上，就记一次数然后原地停住。
+// 停住是为了让"命中了没有"这件事在心跳里一眼可读——如果它真的被调到，
+// 这条线程会卡在这里，而心跳线程照常写日志，计数会一直涨到 1 以上。
+__attribute__((noinline, no_stack_protector)) void dn_probe(void) {
+    g_dn_hits = g_dn_hits + 1;
+    for (;;) __asm__ volatile("yield");
+}
+
+static int g_dn_reassert;
+static uint64_t g_dn_want;
+static int g_dn_ro_said;
+uint64_t g_dn_orig_val;   // 被我们顶掉的那个值：盾原本要跳去的目标
+uint64_t g_dn_fix_ret;    // 退出函数里那条 bl 之后的下一条指令地址
+
+// 这个槽有 30 处代码在用（退出函数只是其中一处），所以替身必须按调用者分流：
+// 只有从退出函数那条 bl 过来的，才按它的栈帧正常收尾；其余的必须原样跳回盾自己的目标，
+// 否则会按错误的栈帧弹栈，直接崩掉——这正是之前"活几秒就 SIGSEGV"的原因。
+__attribute__((naked, noinline)) static void dienext_shim(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x20\n"
+        "stp x0, x1, [sp, #0x00]\n"
+        "stp x2, x3, [sp, #0x10]\n"
+        "adrp x9,  _g_dn_fix_ret@PAGE\n"
+        "ldr  x9,  [x9, _g_dn_fix_ret@PAGEOFF]\n"
+        "cmp  x30, x9\n"
+        "b.ne 9f\n"
+        // —— 退出函数那条路径：取回调用者的 x29/x30，抬回 sp 再 ret ——
+        "ldp x2, x3, [sp, #0x10]\n"
+        "ldp x0, x1, [sp, #0x00]\n"
+        "add sp, sp, #0x20\n"
+        "ldr x9, [sp]\n"              // 触发计数（下面只用一条 store 代替）
+        "adrp x9,  _g_dn_hits@PAGE\n"
+        "add  x9,  x9, _g_dn_hits@PAGEOFF\n"
+        "ldr  x10, [x9]\n"
+        "add  x10, x10, #1\n"
+        "str  x10, [x9]\n"
+        "ldp x29, x30, [sp, #0x10]\n"
+        "add sp, sp, #0x20\n"
+        "ret\n"
+        // —— 其它 30 处调用者：原样交给盾自己原本要跳去的目标 ——
+        "9:\n"
+        "ldp x2, x3, [sp, #0x10]\n"
+        "ldp x0, x1, [sp, #0x00]\n"
+        "add sp, sp, #0x20\n"
+        "adrp x9,  _g_dn_orig_val@PAGE\n"
+        "ldr  x9,  [x9, _g_dn_orig_val@PAGEOFF]\n"
+        "br   x9\n"
+    );
+}
+
+static void install_dienext(void) {
+    if (!g_base) return;
+    volatile uint64_t *slot = (volatile uint64_t *)(g_base + DIENEXT_SLOT_OFF);
+    uint64_t cur = *slot;
+    if (!cur) {
+        // dyld 还没把这里填上。只记一次，之后每轮继续看。
+        static int said_zero;
+        if (!said_zero) { said_zero = 1; say("下一站槽此刻还是 0，继续等\n"); }
+        return;
+    }
+    if (g_dn_done) {
+        // 槽被盾改回去就再写一次。改回去的次数本身也是信息：说明盾在盯这个位置。
+        if (cur != g_dn_want) {
+            if (g_dn_reassert < 20) {
+                // 记下每一次变化和时间：如果盾在每次使用前都自己重写这个槽，
+                // 那我们的写入就总是被夹在两次使用之间，替身自然不会被执行。
+                char lb[96];
+                out_t o = { lb, lb + sizeof(lb) - 1 };
+                o_s(&o, "下一站被盾改写，第"); o_u(&o, (unsigned long long)(g_dn_reassert + 1));
+                o_s(&o, "次，新值="); o_h(&o, cur);
+                o_s(&o, " 时刻="); o_d(&o, (long long)rec_ms(read_pct()));
+                o_s(&o, "ms\n");
+                emit_ts(lb, (size_t)(o.p - lb));
+            }
+            if (g_dn_reassert == 0) {
+                // 首次看到盾自己把这里改掉：把它改成的值记下来，这才知道退出函数
+                // 末尾真正要跳去的函数是谁。磁盘上那 8 个字节是没被 dyld 处理过的
+                // 编码值（0x738e…），直接读它看不出任何东西。
+                say_hex("盾自己把下一站改成了=", cur);
+                Dl_info d2 = {0};
+                if (dladdr((void *)(uintptr_t)cur, &d2) && d2.dli_fname) {
+                    say("  "); say(d2.dli_fname);
+                    say_hex(" +", (unsigned long long)(cur - (uint64_t)(uintptr_t)d2.dli_fbase));
+                    if (d2.dli_sname) { say("  "); say(d2.dli_sname); }
+                    say("\n");
+                }
+            }
+            g_dn_reassert++;
+            g_dn_orig_val = cur;      // 盾当前放的值，别的调用者要原样跳回去
+            *slot = g_dn_want;
+            uint64_t back = *slot;
+            if (back != g_dn_want && !g_dn_ro_said) {
+                g_dn_ro_said = 1;
+                say_hex("写不进去：读回=", back);
+                say_hex("            想写=", g_dn_want);
+            }
+            if (g_dn_reassert <= 3)
+                say_hex("下一站被改回去了，重写次数=", (unsigned long long)g_dn_reassert);
+        }
+        return;
+    }
+    g_dn_done = 1;
+    g_dn_orig_val = cur;
+    g_dn_fix_ret = (uint64_t)g_base + 0x5d8490;   // bl 0x774770 之后的下一条
+    say_hex("退出函数的下一站 原值=", cur);
+    Dl_info di = {0};
+    if (dladdr((void *)(uintptr_t)cur, &di) && di.dli_fname) {
+        say("  "); say(di.dli_fname);
+        say_hex(" +", (unsigned long long)(cur - (uint64_t)(uintptr_t)di.dli_fbase));
+        if (di.dli_sname) { say("  "); say(di.dli_sname); }
+        say("\n");
+    }
+    uint64_t want = (uint64_t)(uintptr_t)&dienext_shim;
+    g_dn_want = want;
+    *slot = want;
+    say_hex("             换成=", want);
+    say_hex("             计数器地址=", (unsigned long long)(uintptr_t)&g_dn_hits);
+    say("  （取回调用者的 x29/x30、抬回 sp 再 ret，等于正常返回）\n");
+}
+#endif
+
 // 把环形缓冲里剩下的记录全部写出去。只在即将退出时调用。
 static void flush_ring(void) {
     for (int guard = 0; guard < RING; guard++) {
@@ -869,8 +1067,13 @@ static void flush_ring(void) {
 
 static void *poller(void *arg) {
     (void)arg;
+    // 前 500 轮热跑（构造函数阶段必须尽快接管网关，盾 40 多毫秒就开始判定），
+    // 之后每轮睡 1ms。0.0.169 之前这里是有次数没有时长的死循环，几毫秒就跑完了，
+    // 结果"槽还没被 dyld 填好"这类情况根本等不到，后面的复查也全都不会发生。
     for (int i = 0; i < 30000; i++) {
+        if (i > 500) usleep(1000);
         try_takeover();
+        install_dienext();
     probe_install_handlers();
     // 心跳线程只在构造函数开头创建一次。0.0.131 之前这里是每轮循环各建一个，
     // 一次启动里会有成百上千个线程同时改写检查项、同时写日志，结果既没法归因，
@@ -929,13 +1132,19 @@ static void fill_img_tab(void) {
     g_img_tab_n = 0;
     for (uint32_t i = 0; i < n && g_img_tab_n < 1200; i++) {
         uint64_t b = (uint64_t)(uintptr_t)_dyld_get_image_header(i);
-        if (b) g_img_tab[g_img_tab_n++] = b;
+        if (b) { g_img_names[g_img_tab_n] = _dyld_get_image_name(i); g_img_tab[g_img_tab_n++] = b; }
     }
     for (int i = 1; i < g_img_tab_n; i++) {          // 插入排序，n 不到 1000
         uint64_t v = g_img_tab[i];
+        const char *nv = g_img_names[i];
         int j = i - 1;
-        while (j >= 0 && g_img_tab[j] > v) { g_img_tab[j + 1] = g_img_tab[j]; j--; }
+        while (j >= 0 && g_img_tab[j] > v) {
+            g_img_tab[j + 1] = g_img_tab[j];
+            g_img_names[j + 1] = g_img_names[j];
+            j--;
+        }
         g_img_tab[j + 1] = v;
+        g_img_names[j + 1] = nv;
     }
     say_hex("镜像表条数=", g_img_tab_n);
 }
@@ -2347,6 +2556,17 @@ static void dump_threads(int tag_ms) {
             o_s(&o, " lr=");
             if (lr >= g_base && lr < g_base + 0x8a0000) { o_s(&o, "+0x"); o_h(&o, lr - g_base); }
             else { o_h(&o, lr); }
+            if (!in_shield) {
+                // 不在盾里时最有用的是"这是哪个库里的哪一段"。dladdr 在这个进程里
+                // 不可靠（注入器接管过 dlsym），所以改用自己维护的镜像表。
+                int ii = img_index_of(pc);
+                if (ii >= 0) {
+                    o_s(&o, " img"); o_d(&o, ii);
+                    o_s(&o, "+"); o_h(&o, pc - g_img_tab[ii]);
+                    const char *nm = (ii < g_img_tab_n) ? g_img_names[ii] : NULL;
+                    if (nm) { const char *bn = strrchr(nm, '/'); o_s(&o, "  "); o_s(&o, bn ? bn + 1 : nm); }
+                }
+            }
             if (in_shield) {
                 // 落在盾里时把参数寄存器也带上：判定函数正在处理哪段内存，只能这样看。
                 static const char *nm[9] = {" x0="," x1="," x2="," x3="," x4="," x5="," x6="," x7="," x8="};
@@ -2379,24 +2599,37 @@ static void dump_threads(int tag_ms) {
                   (vm_size_t)(cnt * sizeof(thread_t)));
 }
 
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
     static int g_snap_at[200];
     static int g_snap_n;
     if (!g_snap_n) {
-        if (DO_QUIET) {
-            g_snap_at[g_snap_n++] = 10000;
-        } else {
-            for (int t = 360; t <= 620; t += 2) g_snap_at[g_snap_n++] = t;
-            g_snap_at[g_snap_n++] = 10000;
-        }
+        // 现在要回答的问题变了：不再是"判定前后盾在干什么"，而是"界面为什么起不来"。
+        // 所以快照点挪到几秒后，并且中间留出时间让主线程真正卡住。
+        // 注意单位是 0.1 毫秒：下面比较时用的是 el*10。
+        g_snap_at[g_snap_n++] = 20000;   // 2 秒
+        g_snap_at[g_snap_n++] = 60000;   // 6 秒
+        g_snap_at[g_snap_n++] = 100000;  // 10 秒
     }
     int g_snap_i = 0;
     uint64_t last_hb = 0;
     for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
         uint64_t el = rec_ms(read_pct());
+#if DO_DIENEXT
+        // 盾在运行期会改写自己的代码（App 里带着 __ostekake 段）。所以"磁盘上
+        // 0x5d848c 是 bl 0x774770"不能直接当成运行期事实：先把那一刻的字节打出来比。
+        {
+            static int said_mem;
+            if (!said_mem && g_base && el >= 60) {
+                said_mem = 1;
+                dump_mem("内存 退出函数尾", g_base + 0x5d8470, 48);
+                dump_mem("内存 下一站槽", g_base + 0x84c098, 8);
+            }
+        }
+#endif
 #if DO_CTRLEXIT
         if (!g_ctrl_done && el >= 700) {
             g_ctrl_done = 1;
@@ -2470,6 +2703,8 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
             o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
             o_s(&o, " 拦下映射="); o_d(&o, g_mmap_blocked);
+            o_s(&o, " 下一站命中="); o_d(&o, (long long)g_dn_hits);
+            o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
         }
@@ -2492,7 +2727,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.169 启动（对照：自己发裸 exit(7) 验证这条系统调用）=====\n");
+    say("===== 0.0.170 启动（让退出函数的下一站正常返回）=====\n");
 
     try_takeover();
     {
