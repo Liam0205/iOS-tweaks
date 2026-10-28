@@ -213,18 +213,49 @@ static void emit_ts(const char *s, size_t n);
 // 把它整个换成 ret，如果进程仍然退出，那 exit 就不是盾发的。
 #define DO_EXITFN_RET 0
 #define DO_EXITPROBE 1
+#define OFF_GATE_NULL 0x40e804ULL
+#define WORD_B_REPORT_FROM_NULL 0x14000011U   // → 0x40e848
+#define OFF_GATE_EMPTY 0x40e80cULL
+#define WORD_B_REPORT_FROM_EMPTY 0x1400000fU  // → 0x40e848
 #define DO_REPORT_PROBE 1
 // 0.0.214：5d8758 这个函数的形状是
 //   5d87a0  bl  0x712668        ; 判定，结果在 w0
 //   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
 //   5d87d4  blr x8              ; 否则调退出
 // 把 tbnz 换成无条件跳往"正常返回"，这一次判定就等于永远通过。
-#define DO_VERDICT_OK 1
+#define DO_VERDICT_OK 0
+// 0.0.224：Round 4 当场读出过检查表：3 项里第 1 项报警，判定函数是 0x6f3d54，返回 1。
+// 现在能改代码了，直接把这一项改成恒返回 0——这是让判定真正通过，不是拦退出。
+#define DO_CHECKITEM_OK 0
+// 0.0.226：除了那条被旁路的 xxHash，盾还有一张 SHA-256 完整性表，
+// 校验函数是 0x5e7aa4（返回值位 0 被调用方直接当布尔用）。
+// 先假设"返回 0 = 通过"，把它固定成 0，看 590ms 那次击杀是否消失。
+#define DO_INTEGRITY_OK 0
+// 0.0.227：先验证故障处理函数本身可用——构造函数里主动发一次 SIGILL。
+// 如果这一条记录都没出现，说明问题在处理函数或写文件，而不是信号被盾挡掉。
+#define DO_FAULTTEST 0
+#define DO_SIGHOOK 1
+#define DO_CHECKTAB_LOG 0
+#define OFF_INTEGRITY 0x5e7aa4ULL
+#define OFF_CHECK_ITEM1 0x6f3d54ULL
+#define WORDS_ITEM_OK_0  0x52800000U   // mov w0, #0
+#define WORDS_ITEM_OK_1  0xd65f03c0U   // ret
 #define DO_FAULTPROBE 1
+// 0.0.222：先回答一个基础问题——如果盾根本没初始化起来，App 能不能用？
+// 第五节记录过"置空 71 个 __mod_init_func 无效，盾走 ObjC +load"。
+// 现在改了代码不会被自检发现，可以第一次直接把 +load 改成 ret。
+//   0x228f74 = PRMShieldEventManager 的 +load
+#define DO_SHIELD_NOLOAD 0
+// 0.0.223：盾会通过自己的网关装信号处理器（sigaction = 46），把我们的换掉。
+// 在网关里把 46 号整体挡掉之后，它永远装不上，我们的故障处理函数就一直有效。
+// libc 的 sigaction 走 libSystem，不经这个网关，所以不会误伤我们自己。
+#define DO_BLOCK_SIGACTION 0
+#define OFF_MGR_LOAD 0x228f74ULL
+#define WORD_RET 0xd65f03c0U
 #define OFF_VERDICT_TBNZ 0x5d87a4ULL
 #define WORD_B_RETURN    0x1400000fU   // b 0x5d87e0
 // 闸门里那条"无说明就走退出"的分支，单独开关，避免多变量同时在场。
-#define DO_GATE_PATCH 1
+#define DO_GATE_PATCH 0
 // 0.0.210：退出是从 0x43e0f8 那条 `blr x8` 发起的（探针实测），而它后面
 // 紧跟的就是这个函数正常的收尾（add sp / ret）。把这条换成 nop，等于让这一步
 // "当作已经做完、正常返回"——比让退出函数返回干净得多。
@@ -261,6 +292,8 @@ static void *busy_probe(void *arg);
 static int install_exit_probe(void);
 static int install_report_probe(void);
 static void arm_fault_probe(void);
+static void install_sighooks(void);
+static int install_checktab_log(void);
 
 
 static int patch_word(uintptr_t addr, uint32_t word) {
@@ -287,10 +320,22 @@ static void install_hash_bypass(void) {
     patch_word(g_base + OFF_FAIL_EXIT_BL, WORD_NOP);
 #endif
 #if DO_GATE_PATCH
-    patch_word(g_base + OFF_GATE_EXIT, WORD_B_TO_REPORT);
+    patch_word(g_base + OFF_GATE_NULL, WORD_B_REPORT_FROM_NULL);
+    patch_word(g_base + OFF_GATE_EMPTY, WORD_B_REPORT_FROM_EMPTY);
 #endif
 #if DO_VERDICT_OK
     patch_word(g_base + OFF_VERDICT_TBNZ, WORD_B_RETURN);
+#endif
+#if DO_SHIELD_NOLOAD
+    patch_word(g_base + OFF_MGR_LOAD, WORD_RET);
+#endif
+#if DO_CHECKITEM_OK
+    patch_word(g_base + OFF_CHECK_ITEM1, WORDS_ITEM_OK_0);
+    patch_word(g_base + OFF_CHECK_ITEM1 + 4, WORDS_ITEM_OK_1);
+#endif
+#if DO_INTEGRITY_OK
+    patch_word(g_base + OFF_INTEGRITY, WORDS_ITEM_OK_0);
+    patch_word(g_base + OFF_INTEGRITY + 4, WORDS_ITEM_OK_1);
 #endif
 #if DO_EXITFN_RET
     patch_word(g_base + OFF_EXITFN, WORD_NOP_RET);
@@ -522,6 +567,7 @@ static volatile int64_t g_mmap_blocked;   // 拦截生效了 N 次
 static uint64_t g_mmap_len;
 // 网关的汇编用 64 位 LDR/STR 访问它，所以这里必须是 8 字节且对齐的。
 // 0.0.170 调整代码布局后它落到 0x1100c，链接期才发现这个隐患。
+static __attribute__((used)) volatile uint64_t g_sigact_blocked;
 static __attribute__((used)) volatile uint64_t g_block_nr;   // 非零时，编号等于它的系统调用不发出去、直接返回 0
 __attribute__((used)) volatile uint64_t g_block_nr2;  // 同上，第二个要拦的编号（kill=37）
 volatile uint64_t g_kill_seen;  // 网关看到 kill 的次数
@@ -964,7 +1010,7 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
         uint32_t c = ++dn;
         // 关心的编号照常记；其余按计数抽样，用来证明"这段时间里网关一直在被人们调用"。
         int want = (nr == 1) || (nr == 5) || (nr == 33) || (nr == 197) ||
-                   (nr == 202) || (nr == 294) || (nr > 1000);
+                   (nr == 202) || (nr == 294) || (nr == 46) || (nr > 1000);
         if (want) gw_direct(1, nr, a0, a1, a2);
         else if ((c % 500) == 0) gw_direct(9, nr, c, 0, 0);
     }
@@ -1007,6 +1053,10 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 #endif
 #if DO_BLKEXIT
     if (nr == 1) g_block_nr = 1;
+#if DO_BLOCK_SIGACTION
+    // a0 = 信号编号。一律挡掉：盾装不上任何处理器，也就收不到任何信号。
+    if (nr == 46) { g_block_nr = 46; g_sigact_blocked++; }
+#endif
     // 进程最后是被 SIGKILL 收走的，而且没有崩溃报告。Promon 这类盾常用
     // kill(getpid(), SIGKILL) 直接抹掉进程，SIGKILL 又抓不到，所以从网关这里看。
     if (nr == 37) { g_block_nr2 = 37; g_kill_seen++; }
@@ -2449,6 +2499,11 @@ static void probe_handler(int sig) {
         g_crashed = 1;
         siglongjmp(g_jmp, 1);
     }
+    // 0.0.233：盾的收尾动作是"自己发一个信号，伪装成崩溃"。
+    // 既然处理函数这次留住了，就干脆不重新抛：记一笔然后正常返回，
+    // 让它那一步变成空动作。只吞前若干次，避免真的出错时无限循环。
+    static volatile int swallowed;
+    if (swallowed < 200) { swallowed++; return; }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -4353,10 +4408,11 @@ __attribute__((naked)) static void exit_stub(void) {
         "str x30,     [sp, #0x58]\n"
         "mov x0, sp\n"
         "bl _exit_probe_log\n"
-        "mov x0, #1\n"
-        "mov x16, #1\n"
-        "svc #0x80\n"
-        "brk #1\n"
+        // 0.0.225：诊断用——记录之后原地停住，而不是真的退出。
+        // 这样"谁想杀进程"会被钉在这里，我们能把这次的完整调用链拿到手。
+        "1:\n"
+        "wfe\n"
+        "b 1b\n"
     );
 }
 
@@ -4514,6 +4570,24 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
             }
             r[5] = (uint64_t)g_base;
             raw_write(fd, r, sizeof(r));
+            // 顺着帧链往上走，把"谁发起了这个信号"一并记下来。
+            if (uc && uc->uc_mcontext) {
+                uint64_t fp = (uint64_t)uc->uc_mcontext->__ss.__fp;
+                for (int i = 0; i < 10 && fp; i++) {
+                    uint64_t nfp = 0, lr = 0;
+                    if (!safe_read(fp, &nfp, 8)) break;
+                    if (!safe_read(fp + 8, &lr, 8)) break;
+                    uint64_t q[6];
+                    q[0] = 0x4641554c00000003ULL;   // 回溯记录
+                    q[1] = (uint64_t)(i + 1);
+                    q[2] = lr;
+                    q[3] = nfp;
+                    q[4] = 0; q[5] = (uint64_t)g_base;
+                    raw_write(fd, q, sizeof(q));
+                    if (nfp <= fp) break;
+                    fp = nfp;
+                }
+            }
             if (fd != g_gwfd) raw_close((int)fd);
         }
     }
@@ -4544,6 +4618,120 @@ static void arm_fault_probe(void) {
     for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
         sigaction(sigs[i], &sa, NULL);
     }
+}
+
+// 0.0.229：盾安装信号处理器用的是 libSystem 的 sigaction / signal / sigprocmask
+// （导入表里都有），走 GOT，不经它自己的网关。所以在 libc 这一层拦：
+// 只有当调用者落在盾自己的地址范围里时，才把这次调用吞掉并返回成功。
+// 这样盾以为自己装上了处理器，实际上装的还是我们的；它也屏蔽不了任何信号。
+// 我们自己的调用来自本库，不在盾的范围里，照常通过。
+#define DO_SIGHOOK 1
+static int (*g_orig_sigaction)(int, const struct sigaction *, struct sigaction *);
+static void (*g_orig_signal)(int, void (*)(int));
+static int (*g_orig_sigprocmask)(int, const sigset_t *, sigset_t *);
+static volatile uint64_t g_sighook_blocked;
+
+static int sh_caller_is_shield(void *ra) {
+    uintptr_t a = (uintptr_t)ra;
+    return g_base && a >= g_base && a < g_base + 0x8c0000;
+}
+
+static int my_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    if (sh_caller_is_shield(__builtin_return_address(0))) { g_sighook_blocked++; return 0; }
+    return g_orig_sigaction(sig, act, oact);
+}
+static void my_signal(int sig, void (*h)(int)) {
+    if (sh_caller_is_shield(__builtin_return_address(0))) { g_sighook_blocked++; return; }
+    g_orig_signal(sig, h);
+}
+static int my_sigprocmask(int how, const sigset_t *set, sigset_t *oset) {
+    if (sh_caller_is_shield(__builtin_return_address(0))) { g_sighook_blocked++; return 0; }
+    return g_orig_sigprocmask(how, set, oset);
+}
+
+static void install_sighooks(void) {
+    MSHookFunction((void *)sigaction, (void *)my_sigaction, (void **)&g_orig_sigaction);
+    MSHookFunction((void *)signal,    (void *)my_signal,    (void **)&g_orig_signal);
+    MSHookFunction((void *)sigprocmask,(void *)my_sigprocmask,(void **)&g_orig_sigprocmask);
+    say("信号钩子：已装（sigaction / signal / sigprocmask）\n");
+}
+
+// 0.0.231：把检查表在运行期原样打出来。
+//
+// 0x5d8ed0 是没有被混淆的干净代码：
+//   5d8ef0  bl 0x5d91d0            ; 把单例 +0x10 处的向量复制到 sp+0x8
+//   5d8ef4  ldp x8, x9, [sp,#0x8]  ; x8 = 起点, x9 = 终点
+//   5d8f04  ldr x0, [x8, x20, lsl #3]   ; 第 x20 项
+//   5d8f0c  ldr x8, [x8, #0x10]         ; 判定函数
+//   5d8f10  blr x8
+//   5d8f14  cbnz w0, 报警
+// 所以在 0x5d8ef4 处插桩，就能拿到项数、每一项的虚表和判定函数地址。
+// 桩把被覆盖的三条指令原样重放（ldp / cmp / mov x20,#0），再按比较结果跳回去。
+void *g_ct_log;
+uint64_t g_ct_next, g_ct_done;
+static volatile uint64_t g_ct_runs;
+
+__attribute__((used)) static void checktab_log(uint64_t *v) {
+    uint64_t begin = v[1], end = v[2];
+    uint64_t n = (begin && end > begin && end - begin < 0x10000) ? ((end - begin) >> 3) : 0;
+    uint64_t h[6];
+    h[0] = 0x4354414200000001ULL;   // 魔数 "CTAB"
+    h[1] = begin; h[2] = end; h[3] = n; h[4] = ++g_ct_runs; h[5] = (uint64_t)g_base;
+    if (g_gwfd >= 0) raw_write(g_gwfd, h, sizeof(h));
+    for (uint64_t i = 0; i < n && i < 8; i++) {
+        uint64_t item = 0, vt = 0, j10 = 0, j18 = 0;
+        if (!safe_read(begin + i * 8, &item, 8) || !item) continue;
+        if (!safe_read(item, &vt, 8) || !vt) continue;
+        safe_read(vt + 0x10, &j10, 8);
+        safe_read(vt + 0x18, &j18, 8);
+        uint64_t r[6];
+        r[0] = 0x4354414200000002ULL;   // 一项
+        r[1] = i; r[2] = item; r[3] = j10; r[4] = j18; r[5] = (uint64_t)g_base;
+        if (g_gwfd >= 0) raw_write(g_gwfd, r, sizeof(r));
+    }
+}
+
+__attribute__((naked)) static void checktab_stub(void) {
+    __asm__ volatile(
+        "stp x29, x30, [sp, #-0x10]!\n"
+        "add x0, sp, #0x10\n"
+        "adrp x16, _g_ct_log@PAGE\n"
+        "ldr x16, [x16, _g_ct_log@PAGEOFF]\n"
+        "blr x16\n"
+        "ldp x29, x30, [sp], #0x10\n"
+        "ldp x8, x9, [sp, #0x8]\n"
+        "cmp x9, x8\n"
+        "adrp x17, _g_ct_done@PAGE\n"
+        "ldr x17, [x17, _g_ct_done@PAGEOFF]\n"
+        "b.eq 2f\n"
+        "mov x20, #0x0\n"
+        "adrp x17, _g_ct_next@PAGE\n"
+        "ldr x17, [x17, _g_ct_next@PAGEOFF]\n"
+        "2:\n"
+        "br x17\n"
+    );
+}
+
+static int install_checktab_log(void) {
+    if (!g_base) return 0;
+    g_ct_log = (void *)&checktab_log;
+    g_ct_next = g_base + 0x5d8f04ULL;
+    g_ct_done = g_base + 0x5d8f2cULL;
+    uintptr_t addr = g_base + 0x5d8ef4ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("检查表桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;                        // ldr x16, #8
+    w[1] = 0xd61f0200;                        // br  x16
+    *lit = (uint64_t)(uintptr_t)&checktab_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("检查表桩：已装到 ", addr);
+    return 1;
 }
 
 static void *ver(void *arg) {
@@ -4587,7 +4775,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.220 启动（上报时把故障处理装回来）=====\n");
+    say("===== 0.0.234 启动（只留退出钉住，理清击杀路径）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -4596,9 +4784,23 @@ __attribute__((constructor)) static void ctor(void) {
 #if DO_SIGSAMPLE
     arm_sig_sample();
 #endif
+#if DO_SIGHOOK
+    install_sighooks();
+#endif
+#if DO_CHECKTAB_LOG
+    install_checktab_log();
+#endif
 #if DO_FAULTPROBE
     arm_fault_probe();
     { if (g_gwfd >= 0) { uint64_t r[6] = { 0x4641554c00000002ULL, 0, 0, 0, 0, (uint64_t)g_base }; raw_write(g_gwfd, r, sizeof(r)); } }
+#if DO_FAULTTEST
+    {
+        uint64_t r[6] = { 0x5445535400000001ULL, 0, 0, 0, 0, (uint64_t)g_base };
+        if (g_gwfd >= 0) raw_write(g_gwfd, r, sizeof(r));
+        raise(SIGILL);
+        if (g_gwfd >= 0) { r[0] = 0x5445535400000002ULL; raw_write(g_gwfd, r, sizeof(r)); }
+    }
+#endif
 #endif
 #if DO_BUSYPROBE
     { pthread_t bt; pthread_create(&bt, NULL, busy_probe, NULL); }
