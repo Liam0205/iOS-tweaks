@@ -53,6 +53,8 @@
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
+#define DO_BLKIMMAP 1   // 让"映射整份共享缓存"这次调用失败
+#define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
 #define DO_SENTINEL 0   // 哨兵：会被 dyld 自己的校验搞崩，只留作记录
 #define DO_DISKCHECK 0  // 逐镜像比对内存与磁盘（实验用，平时关掉）
@@ -331,6 +333,8 @@ static uint64_t rec_ms(uint64_t ts) {
 
 static volatile int64_t g_fake_rw;
 static uint64_t g_flag_last;
+static volatile uint64_t g_ret_override;   // 非零时用它替换系统调用的返回值
+static volatile int g_blk_mmap;
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
 // 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
 static uint64_t g_late_base, g_late_hi;
@@ -369,6 +373,11 @@ static void emit_rec(const rec_t *r, uint64_t now) {
         o_s(&o, "] 长度="); o_u(&o, r->a1);
         o_s(&o, " 值0="); o_h(&o, r->pay[12]);
         o_s(&o, " 值1="); o_h(&o, r->pay[13]);
+    } else if ((r->nr >> 32) == 0x70000000ULL) {
+        o_s(&o, "回复 id="); o_u(&o, r->nr & 0xffffffffULL);
+        o_s(&o, " kr="); o_h(&o, r->a1);
+        o_s(&o, " 字数="); o_h(&o, r->pay[1] & 0xffffffffULL);
+        for (int i = 2; i < 10; i++) { o_s(&o, " ["); o_d(&o, i); o_s(&o, "]="); o_h(&o, r->pay[i]); }
     } else if (nr == 116) {
         o_s(&o, "syslog a0="); o_h(&o, r->a0);
         o_s(&o, " a1="); o_h(&o, r->a1);
@@ -585,8 +594,16 @@ static void emergency_line(const rec_t *r) {
 
 
 // 由 gw_entry 调用，6 个参数：x0..x5（x5 是返回地址）。
+// 调用返回之后再看一眼回复。0.0.160 之前只记录请求，回复里有什么从来没见过——
+// 而 392 次 mach 4801 的回复正是"它枚举到了哪些内存区域"的唯一证据。
+void gw_after(uint64_t nr, uint64_t a0, uint64_t ret);
+
 void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t caller) {
     ring_push(nr, a0, a1, a2, a3, caller);
+
+    // 盾把整份共享缓存（约 1.42GB）只读映射进进程，很可能是拿磁盘原件和内存活副本比对。
+    // 这次实验让它失败，看判定是否变化。只通过网关改返回值，不碰任何代码或数据。
+    if (DO_BLKIMMAP && nr == 197 && a1 > 0x10000000ULL) g_blk_mmap = 1;
 
     // 盾把每个已加载镜像的头读出来看。落在注入库上的那些读，改指到一个真正的系统
     // dylib 上，相对偏移保持不变：它读到的就是一份结构完全正常的库头。
@@ -652,12 +669,41 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     }
 }
 
+void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
+    if (g_blk_mmap) {
+        g_blk_mmap = 0;
+        g_ret_override = (uint64_t)-1;         // EPERM
+        return;
+    }
+    if (nr != (uint64_t)-31 || a0 < 0x1000) return;
+    volatile uint32_t *m = (volatile uint32_t *)(uintptr_t)a0;
+    uint32_t id = m[5];
+    // MIG 约定：回复的 msgh_id = 请求号 + 100，所以这里按区间收，不按具体号。
+    if (!((id >= 4800 && id < 5000) || (id >= 3400 && id < 3600))) return;
+
+    unsigned h = g_head;
+    unsigned n = (h + 1) % RING;
+    if (n == g_tail) return;
+    rec_t *r = &g_ring[h];
+    r->nr = (0x70000000ULL << 32) | id;              // 用这个前缀区分"回复"和"请求"
+    r->a0 = a0; r->a1 = ret; r->a2 = 0; r->a3 = 0;
+    r->caller = 0; r->tid = raw_tid(); r->pad = 0;
+    r->ts = read_pct(); r->fp = 0;
+    const volatile uint64_t *src = (const volatile uint64_t *)(uintptr_t)a0;
+    for (int i = 0; i < PAY; i++) r->pay[i] = src[i];
+    __atomic_store_n(&g_head, n, __ATOMIC_RELEASE);
+    g_total++;
+}
+
 __attribute__((naked)) static void gw_entry(void) {
     // 原网关只有 svc + ret，除了 x0/x1 什么都不改。所以这里必须把 x0..x15 全部原样
     // 保存再恢复——中间那次 bl 会按 AAPCS64 把 x0..x18 全当调用者保存寄存器用，
     // 只备份 x0..x7 会让盾里内联在循环中的计数器悄悄变值。
+    //
+    // 0.0.161 起还要在调用**之后**看回复，所以帧从 0xa0 扩到 0x100，
+    // 并且 svc 放在帧还活着的时候执行，返回的 x0..x8 先存回帧里再调 gw_after。
     __asm__ volatile(
-        "sub sp, sp, #0xa0\n"
+        "sub sp, sp, #0x100\n"
         "stp x29, x30, [sp, #0x00]\n"
         "stp x0,  x1,  [sp, #0x10]\n"
         "stp x2,  x3,  [sp, #0x20]\n"
@@ -668,16 +714,17 @@ __attribute__((naked)) static void gw_entry(void) {
         "stp x12, x13, [sp, #0x70]\n"
         "stp x14, x15, [sp, #0x80]\n"
         "str x16,      [sp, #0x90]\n"
-        "ldr x9, [sp, #0x00]\n"  // 进入时的 x29
+        "ldr x9, [sp, #0x00]\n"        // 进入时的 x29
         "adrp x10, _g_last_fp@PAGE\n"
         "str x9, [x10, _g_last_fp@PAGEOFF]\n"
-        "mov x0, x16\n"          // nr
-        "ldr x1, [sp, #0x10]\n"  // a0
-        "ldr x2, [sp, #0x18]\n"  // a1
-        "ldr x3, [sp, #0x20]\n"  // a2
-        "ldr x4, [sp, #0x28]\n"  // a3
-        "ldr x5, [sp, #0x08]\n"  // caller = 进入时的 x30（stp x29,x30 里的第二个字）
+        "mov x0, x16\n"                // nr
+        "ldr x1, [sp, #0x10]\n"        // a0
+        "ldr x2, [sp, #0x18]\n"
+        "ldr x3, [sp, #0x20]\n"
+        "ldr x4, [sp, #0x28]\n"
+        "ldr x5, [sp, #0x08]\n"        // caller
         "bl _gw_record\n"
+        // 恢复全部入口寄存器，然后真正发系统调用
         "ldr x16, [sp, #0x90]\n"
         "ldp x14, x15, [sp, #0x80]\n"
         "ldp x12, x13, [sp, #0x70]\n"
@@ -687,8 +734,31 @@ __attribute__((naked)) static void gw_entry(void) {
         "ldp x4,  x5,  [sp, #0x30]\n"
         "ldp x2,  x3,  [sp, #0x20]\n"
         "ldp x0,  x1,  [sp, #0x10]\n"
-        "ldp x29, x30, [sp], #0xa0\n"
         "svc #0x80\n"
+        // 返回值先落回帧里，别被下面那次 bl 冲掉
+        "stp x0, x1, [sp, #0x98]\n"
+        "stp x2, x3, [sp, #0xa8]\n"
+        "stp x4, x5, [sp, #0xb8]\n"
+        "stp x6, x7, [sp, #0xc8]\n"
+        "str x8,     [sp, #0xd8]\n"
+        "ldr x0, [sp, #0x90]\n"        // nr
+        "ldr x1, [sp, #0x10]\n"        // msgbuf
+        "ldr x2, [sp, #0x98]\n"        // 返回值
+        "bl _gw_after\n"
+        "adrp x9, _g_ret_override@PAGE\n"
+        "ldr x9, [x9, _g_ret_override@PAGEOFF]\n"
+        "cbz x9, 1f\n"
+        "str x9, [sp, #0x98]\n"        // 用覆盖值替换 x0
+        "mov x10, #0\n"
+        "adrp x11, _g_ret_override@PAGE\n"
+        "str x10, [x11, _g_ret_override@PAGEOFF]\n"
+        "1:\n"
+        "ldr x8,     [sp, #0xd8]\n"
+        "ldp x6, x7, [sp, #0xc8]\n"
+        "ldp x4, x5, [sp, #0xb8]\n"
+        "ldp x2, x3, [sp, #0xa8]\n"
+        "ldp x0, x1, [sp, #0x98]\n"
+        "ldp x29, x30, [sp], #0x100\n"
         "ret\n"
     );
 }
@@ -1031,6 +1101,35 @@ static void plant_sentinel(uintptr_t cache_base) {
     say_hex("  回读=", back);
 }
 
+
+// 系统注入器 systemhook.dylib 会 hook 文件类 libc 函数。盾如果检查函数序言
+// 有没有被改成跳板，那"只要有注入就退出"就解释得通了。
+// 这里把常见符号的首字读出来：0x58000050 = ldr x16,#8; br x16（ElleKit 的跳板）。
+static void check_hooks(void) {
+    static const char *syms[] = {
+        "open", "openat", "stat", "lstat", "fstat", "access", "getattrlist",
+        "readlink", "realpath", "opendir", "getenv", "sysctl", "syscall",
+        "kill", "ptrace", "fork", "posix_spawn", "dlopen", "dlsym",
+        "objc_getClass", "class_getMethodImplementation", "method_getImplementation",
+        "task_get_special_port", "mach_msg", "exit", "_exit", "abort",
+        "getpid", "getppid", "uname", "sysctlby name", NULL
+    };
+    int hooked = 0, missing = 0, total = 0;
+    for (int i = 0; syms[i]; i++) {
+        void *p = dlsym(RTLD_DEFAULT, syms[i]);
+        if (!p) { missing++; continue; }
+        total++;
+        uint32_t w0 = *(const volatile uint32_t *)p;
+        if (w0 == 0x58000050u || w0 == 0x58000051u || w0 == 0x58000090u) {
+            hooked++;
+            say("!! 被改成跳板: "); say(syms[i]);
+            say_hex("  首字=", w0);
+        }
+    }
+    say_hex("钩子自检：查到符号=", total);
+    say_hex("  跳板形态=", hooked);
+    say_hex("  找不到=", missing);
+}
 
 static void dump_images(void) {
     uint32_t n = _dyld_image_count();
@@ -2358,7 +2457,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.160 启动（退出前同步冲环形缓冲）=====\n");
+    say("===== 0.0.165 启动（让共享缓存的整体映射失败）=====\n");
 
     try_takeover();
     {
@@ -2371,6 +2470,7 @@ __attribute__((constructor)) static void ctor(void) {
         }
     }
     fill_img_tab();
+    if (DO_HOOKCHK) check_hooks();
     compare_self_with_disk();
     if (DO_DISKCHECK) { pthread_t dt; pthread_create(&dt, NULL, disk_check, NULL); }
     dump_images();
