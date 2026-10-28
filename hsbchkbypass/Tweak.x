@@ -55,6 +55,7 @@
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
 #define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
+#define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
 #define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
@@ -346,6 +347,9 @@ static uint64_t g_mmap_len;
 // 网关的汇编用 64 位 LDR/STR 访问它，所以这里必须是 8 字节且对齐的。
 // 0.0.170 调整代码布局后它落到 0x1100c，链接期才发现这个隐患。
 static volatile uint64_t g_block_nr;   // 非零时，编号等于它的系统调用不发出去、直接返回 0
+volatile uint64_t g_block_nr2;  // 同上，第二个要拦的编号（kill=37）
+volatile uint64_t g_kill_seen;  // 网关看到 kill 的次数
+volatile uint64_t g_kill_blocked;
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
 // 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
 static uint64_t g_late_base, g_late_hi;
@@ -630,7 +634,9 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     // 探针自己成了负载：写日志抢 CPU、抢 IO，App 的启动被拖慢，存活时间也跟着飘。
     // 所以按 1/200 采样，但 exit（1）、以及负数编号（mach trap）里的关键项照常记。
     static uint32_t g_n;
-    int keep = (nr == 1) || (((++g_n) % 200) == 0);
+    // 文件类调用照常记：盾启动时只 open 了包内那几份资源，数量很少，
+    // 但"缺了哪一份、返回什么"正是要看的。
+    int keep = (nr == 1) || (nr == 5) || (nr == 33) || (((++g_n) % 200) == 0);
     if (keep) ring_push(nr, a0, a1, a2, a3, caller);
 
     // 盾把整份共享缓存（约 1.42GB）只读映射进进程，很可能是拿磁盘原件和内存活副本比对。
@@ -657,6 +663,9 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 #endif
 #if DO_BLKEXIT
     if (nr == 1) g_block_nr = 1;
+    // 进程最后是被 SIGKILL 收走的，而且没有崩溃报告。Promon 这类盾常用
+    // kill(getpid(), SIGKILL) 直接抹掉进程，SIGKILL 又抓不到，所以从网关这里看。
+    if (nr == 37) { g_block_nr2 = 37; g_kill_seen++; }
 #endif
 
     // 盾把每个已加载镜像的头读出来看。落在注入库上的那些读，改指到一个真正的系统
@@ -724,6 +733,29 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 }
 
 void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
+    // 文件类系统调用把结果当场记下来。盾在 50ms 内判定为"篡改"，
+    // 而它启动时只 open 了 App 包内那几份文件——包里少一份（jigsaw.txt）
+    // 是不是它眼里的"被拆过包"，只有看返回值才知道。
+    // 文件类系统调用只记返回值，不在这里读路径。
+    // 之前那版把 a0 当字符串读，遇到一个无效指针就把自己崩了（23-50ms 之间，
+    // 退出记录一条都没有）。路径由环形缓冲那边照抄——那条路径在参数还在调用者
+    // 栈上的时候就地拷贝，已经稳定跑了很多轮。
+#if DO_FILELOG
+    if (nr == 5 || nr == 33) {
+        static int g_open_seen;
+        if (g_open_seen < 40) {
+            g_open_seen++;
+            char buf[96];
+            out_t o = { buf, buf + sizeof(buf) - 1 };
+            o_s(&o, nr == 5 ? "打开结果 " : "检查结果 ");
+            if ((long long)ret < 0) { o_s(&o, "失败 errno="); o_d(&o, -(long long)ret); }
+            else { o_s(&o, "成功="); o_d(&o, (long long)ret); }
+            o_ch(&o, '\n');
+            emit_ts(buf, (size_t)(o.p - buf));
+        }
+        return;
+    }
+#endif
     if (g_blk_mmap) {
         g_blk_mmap = 0;
         g_ret_override = (uint64_t)-1;         // EPERM
@@ -798,9 +830,16 @@ __attribute__((naked)) static void gw_entry(void) {
         "ldp x0,  x1,  [sp, #0x10]\n"
         "adrp x17, _g_block_nr@PAGE\n"
         "ldr x17, [x17, _g_block_nr@PAGEOFF]\n"
+        "cbz x17, 3f\n"
+        "cmp x17, x16\n"
+        "b.eq 4f\n"
+        "3:\n"
+        "adrp x17, _g_block_nr2@PAGE\n"
+        "ldr x17, [x17, _g_block_nr2@PAGEOFF]\n"
         "cbz x17, 2f\n"
         "cmp x17, x16\n"
         "b.ne 2f\n"
+        "4:\n"
         "adrp x17, _g_skip_ret@PAGE\n"
         "str x30, [x17, _g_skip_ret@PAGEOFF]\n"
         "ldp x29, x30, [sp], #0x100\n"
@@ -859,8 +898,10 @@ static void emit_ts(const char *s, size_t n) {
     o_u(&o, rec_ms(read_pct()));
     o_s(&o, "ms] ");
     if (n > 900) n = 900;
-    memcpy(o.p, s, n);
-    o.p += n;
+    // 这里必须逐字节拷，不能用 memcpy：emit_ts 会被网关里的处理函数调用，
+    // 而那跑在盾的线程上，libc 可能还没就绪。0.0.170 用 memcpy 的版本
+    // 在 23ms 就崩了，正是这个原因。
+    for (size_t i = 0; i < n; i++) *o.p++ = s[i];
     emit(buf, (size_t)(o.p - buf));
 }
 
@@ -921,17 +962,14 @@ static void try_takeover(void) {
 #define DIENEXT_SLOT_OFF 0x84c098ULL
 
 static int g_dn_done;
-volatile uint64_t g_dn_hits;      // 替身被调用了几次（盾走到退出函数末尾的次数）
+volatile uint64_t g_dn_hits;      // 替身走"原样转发"的次数
+volatile uint64_t g_dn_fixed;     // 替身走"正常返回"的次数（也就是真正改到退出流程的次数）
 
 // 单独一个函数，用一条 BL 从替身调进来。BL 是页内相对跳转，
 // 不依赖 adrp/add 那套重定位——0.0.170 最初那版用 adrp 读写计数器，
 // 结果"命中=0"分不清是"替身没被调用"还是"计数器地址算错了"。
 __attribute__((noinline, no_stack_protector)) void dn_hit(void) {
     g_dn_hits = g_dn_hits + 1;
-    // 进程可能在下一毫秒就没了，心跳来不及读这个计数。所以进来就当场写一行。
-    // 这里只做整数判断和我们自己的定点格式化 + 裸 write，不碰 libc。
-    static const char msg[] = "替身被执行了\n";
-    emit_ts(msg, sizeof(msg) - 1);
 }
 
 // 临时探针：只要有人跳到这个槽上，就记一次数然后原地停住。
@@ -952,32 +990,46 @@ uint64_t g_dn_fix_ret;    // 退出函数里那条 bl 之后的下一条指令�
 // 只有从退出函数那条 bl 过来的，才按它的栈帧正常收尾；其余的必须原样跳回盾自己的目标，
 // 否则会按错误的栈帧弹栈，直接崩掉——这正是之前"活几秒就 SIGSEGV"的原因。
 __attribute__((naked, noinline)) static void dienext_shim(void) {
+    // 两条分支必须分开计数，否则分不清"替身把退出流程改成了正常返回"和
+    // "替身只是原样转发、什么也没改变"。第一版用 cmp x30 直接比，
+    // 而 arm64e 的返回地址带 PAC 签名，比较永远不成立——那一版其实一直在走转发。
     __asm__ volatile(
-        "sub sp, sp, #0x20\n"
-        "stp x0, x1, [sp, #0x00]\n"
-        "stp x2, x3, [sp, #0x10]\n"
+        "sub  sp, sp, #0x40\n"
+        "stp  x0, x1, [sp, #0x00]\n"
+        "stp  x2, x3, [sp, #0x10]\n"
+        "stp  x9, x10, [sp, #0x20]\n"
+        "str  x11, [sp, #0x30]\n"
         "adrp x9,  _g_dn_fix_ret@PAGE\n"
         "ldr  x9,  [x9, _g_dn_fix_ret@PAGEOFF]\n"
-        "cmp  x30, x9\n"
-        "b.ne 9f\n"
-        // —— 退出函数那条路径：取回调用者的 x29/x30，抬回 sp 再 ret ——
-        "ldp x2, x3, [sp, #0x10]\n"
-        "ldp x0, x1, [sp, #0x00]\n"
-        "add sp, sp, #0x20\n"
-        "ldr x9, [sp]\n"              // 触发计数（下面只用一条 store 代替）
+        "and  x10, x30, #0x0000ffffffffffff\n"
+        "and  x11, x9,  #0x0000ffffffffffff\n"
+        "eor  x11, x10, x11\n"
+        "ldp  x9, x10, [sp, #0x20]\n"
+        "cbnz x11, 9f\n"
+        // —— 退出函数那条路径：正常返回给调用者 ——
+        "ldr  x11, [sp, #0x30]\n"
+        "ldp  x2, x3, [sp, #0x10]\n"
+        "ldp  x0, x1, [sp, #0x00]\n"
+        "add  sp, sp, #0x40\n"
+        "adrp x9,  _g_dn_fixed@PAGE\n"
+        "add  x9,  x9, _g_dn_fixed@PAGEOFF\n"
+        "ldr  x10, [x9]\n"
+        "add  x10, x10, #1\n"
+        "str  x10, [x9]\n"
+        "ldp  x29, x30, [sp, #0x10]\n"
+        "add  sp, sp, #0x20\n"
+        "ret\n"
+        // —— 其余调用者：原样交给盾自己原本要去的目标 ——
+        "9:\n"
+        "ldr  x11, [sp, #0x30]\n"
+        "ldp  x2, x3, [sp, #0x10]\n"
+        "ldp  x0, x1, [sp, #0x00]\n"
+        "add  sp, sp, #0x40\n"
         "adrp x9,  _g_dn_hits@PAGE\n"
         "add  x9,  x9, _g_dn_hits@PAGEOFF\n"
         "ldr  x10, [x9]\n"
         "add  x10, x10, #1\n"
         "str  x10, [x9]\n"
-        "ldp x29, x30, [sp, #0x10]\n"
-        "add sp, sp, #0x20\n"
-        "ret\n"
-        // —— 其它 30 处调用者：原样交给盾自己原本要跳去的目标 ——
-        "9:\n"
-        "ldp x2, x3, [sp, #0x10]\n"
-        "ldp x0, x1, [sp, #0x00]\n"
-        "add sp, sp, #0x20\n"
         "adrp x9,  _g_dn_orig_val@PAGE\n"
         "ldr  x9,  [x9, _g_dn_orig_val@PAGEOFF]\n"
         "br   x9\n"
@@ -2703,8 +2755,10 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
             o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
             o_s(&o, " 拦下映射="); o_d(&o, g_mmap_blocked);
-            o_s(&o, " 下一站命中="); o_d(&o, (long long)g_dn_hits);
+            o_s(&o, " 转发="); o_d(&o, (long long)g_dn_hits);
+            o_s(&o, " 改成返回="); o_d(&o, (long long)g_dn_fixed);
             o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
+            o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
         }
