@@ -51,11 +51,16 @@
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
+#define DO_VTPATCH  1   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
+#define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
+#define DO_SETFLAG_AT 20  // 在第几毫秒写
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
 #define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
+#define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
 #define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
+#define DO_DN_PARK  1   // 1=让那条线程原地停住 2=正常返回给调用方
 #define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
@@ -260,7 +265,7 @@ static void probe_install_handlers(void);
 static void scan_subobjects(uint64_t e1, int (*vf)(void *), int r0);
 static void run_oracle_scan(void);
 
-static volatile uint64_t g_last_fp;
+__attribute__((used)) static volatile uint64_t g_last_fp;
 
 static inline uint64_t read_pct(void) {
     uint64_t v = 0;
@@ -338,6 +343,7 @@ static uint64_t rec_ms(uint64_t ts) {
 
 static volatile int64_t g_fake_rw;
 static uint64_t g_flag_last;
+static int g_setflag_done;
 static int g_ctrl_done;
 static volatile uint64_t g_ret_override;   // 非零时用它替换系统调用的返回值
 volatile uint64_t g_skip_ret;      // 跳过系统调用之后返回到了哪个地址
@@ -633,11 +639,16 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     // 盾每秒要过 6-7 万次系统调用。全部都记的话，日志几秒就涨到 25MB，
     // 探针自己成了负载：写日志抢 CPU、抢 IO，App 的启动被拖慢，存活时间也跟着飘。
     // 所以按 1/200 采样，但 exit（1）、以及负数编号（mach trap）里的关键项照常记。
+    // 只干预不记录：网关每次调用都要多一次 bl + 环形缓冲写入，盾每秒过 6-7 万次，
+    // 这份开销可能正好把 App 的启动拖过系统的启动时限。要判断"界面起不来"
+    // 是不是我们自己造成的，就把记录整体关掉再跑一次。
+#if !DO_NORECORD
     static uint32_t g_n;
     // 文件类调用照常记：盾启动时只 open 了包内那几份资源，数量很少，
     // 但"缺了哪一份、返回什么"正是要看的。
     int keep = (nr == 1) || (nr == 5) || (nr == 33) || (((++g_n) % 200) == 0);
     if (keep) ring_push(nr, a0, a1, a2, a3, caller);
+#endif
 
     // 盾把整份共享缓存（约 1.42GB）只读映射进进程，很可能是拿磁盘原件和内存活副本比对。
     // 这次实验让它失败，看判定是否变化。只通过网关改返回值，不碰任何代码或数据。
@@ -1016,9 +1027,18 @@ __attribute__((naked, noinline)) static void dienext_shim(void) {
         "ldr  x10, [x9]\n"
         "add  x10, x10, #1\n"
         "str  x10, [x9]\n"
+#if DO_DN_PARK == 1
+        // 让这条线程原地停住。盾的本意是"这条检查路径必须终止"，但它用的是
+        // 整个进程的 exit。停住单条线程是最接近它本意的做法：既不让调用方
+        // 带着"本该永远不返回"的状态继续往下跑，也不牵连整个进程。
+        "5:\n"
+        "wfe\n"
+        "b    5b\n"
+#else
         "ldp  x29, x30, [sp, #0x10]\n"
         "add  sp, sp, #0x20\n"
         "ret\n"
+#endif
         // —— 其余调用者：原样交给盾自己原本要去的目标 ——
         "9:\n"
         "ldr  x11, [sp, #0x30]\n"
@@ -1921,6 +1941,76 @@ static uint64_t g_seen_obj;              // 上一次看到的单例地址
 // 边构造边增长的标准容器：追加第三项时可能整块重分配，新缓冲区里是货真价实的
 // 对象，先前写进去的假对象根本不在那儿了。所以现在每次轮询都回读第一格，
 // 只要发现被换掉（或范围变了）就整条重写，并把每次变化连同时刻一起记下来。
+
+// ---------------------------------------------------------------- 只换判定函数
+//
+// Round 6 试过把整张检查表换成假对象，结果换来"篡改"判定（原因码 4）。
+// 那种做法改的是向量本身。这里只动每个**检查项对象自己**的虚表指针：
+// 对象是运行时在堆上 new 出来的，盾的自检哈希覆盖不到；向量、对象内容、
+// 项数全都保持原样。虚表在盾的 __DATA 里，我们只在旁边做一份拷贝再指过去。
+#define VT_SLOTS 8
+static uint64_t g_vtcopy[6][VT_SLOTS];
+static uint64_t g_vt_orig[6];
+static int g_vt_n;
+static int g_vt_patched;
+
+static void patch_verdict_vtables(void) {
+    static int diag;
+    if (!g_base) return;
+    uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
+    if (!diag && obj > 0x100000000ULL && obj < 0x800000000ULL) {
+        diag = 1;
+        say_hex("换虚表 诊断 obj=", obj);
+        {
+            say_hex("   bg=", *(volatile uint64_t *)(obj + 0x10));
+            say_hex("   en=", *(volatile uint64_t *)(obj + 0x18));
+        }
+    }
+    if (obj < 0x100000000ULL || obj > 0x800000000ULL) return;
+    uint64_t bg = *(volatile uint64_t *)(obj + 0x10);
+    uint64_t en = *(volatile uint64_t *)(obj + 0x18);
+    if (bg < 0x100000000ULL || en <= bg) return;
+    uint32_t n = (uint32_t)((en - bg) / 8);
+    if (n < 1 || n > 6) return;
+
+    int changed = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t it = *(volatile uint64_t *)(uintptr_t)(bg + (uint64_t)i * 8);
+        if (it < 0x100000000ULL || it > 0x800000000ULL) continue;
+        uint64_t vt = *(volatile uint64_t *)(uintptr_t)it;
+        // 这些虚表并不在盾自己的镜像里（实测比盾基址高出几十 MB），
+        // 所以不能按"必须落在盾里"来筛。改成尝试着安全读：读得到就认。
+        uint64_t probe[VT_SLOTS];
+        int ok = 1;
+        for (int k = 0; k < VT_SLOTS && ok; k++)
+            ok = safe_read(vt + (uint64_t)k * 8, &probe[k], 8);
+        if (!ok || vt < 0x100000000ULL) continue;
+
+        int slot = -1;
+        for (int k = 0; k < g_vt_n; k++) if (g_vt_orig[k] == vt) { slot = k; break; }
+        if (slot < 0) {
+            if (g_vt_n >= 6) continue;
+            slot = g_vt_n++;
+            g_vt_orig[slot] = vt;
+            for (int k = 0; k < VT_SLOTS; k++) g_vtcopy[slot][k] = probe[k];
+            // 偏移 0x10 那一格就是盾遍历时调用的判定函数，换成一个恒返回 0 的桩。
+            g_vtcopy[slot][2] = g_base + 0x15984;
+            say_hex("复制虚表 原=", vt);
+            say_hex("        判定原函数=", probe[2]);
+            say_hex("        改成=", g_vtcopy[slot][2]);
+        }
+        uint64_t want = (uint64_t)(uintptr_t)&g_vtcopy[slot][0];
+        if (*(volatile uint64_t *)(uintptr_t)it != want) {
+            *(volatile uint64_t *)(uintptr_t)it = want;
+            changed = 1;
+        }
+    }
+    if (changed) {
+        g_vt_patched++;
+        if (g_vt_patched <= 3) say_hex("已换判定函数，第几次=", (unsigned long long)g_vt_patched);
+    }
+}
+
 static void install_fake_checks(void) {
     if (!g_base) return;
     uint64_t obj = *(volatile uint64_t *)(g_base + 0x8509d0);
@@ -2521,6 +2611,98 @@ static void install_dlsym_hook(void) {
     say_hex("已挂 dlsym，首字=", *(const volatile uint32_t *)p);
 }
 
+// ---------------------------------------------------------------- 它问了什么
+//
+// 从导入符号清单看，盾确实导入了 getenv 和 _uname（早前的笔记写成"没有"，是错的）。
+// 这两个都是经典的越狱检测入口：DYLD_INSERT_LIBRARIES 之类的环境变量、
+// 以及 uname 里的版本/机型。先看它到底问了什么，再决定怎么答。
+static volatile int g_in_hook;
+static char *(*o_getenv)(const char *);
+static int (*o_uname)(void *);
+
+static char *my_getenv(const char *name) {
+    if (name && !g_in_hook) {
+        g_in_hook = 1;
+        char lb[160];
+        out_t o = { lb, lb + sizeof(lb) - 1 };
+        o_s(&o, "getenv(\"");
+        for (int i = 0; name[i] && i < 80; i++) o_ch(&o, name[i]);
+        o_s(&o, "\") = ");
+        char *v = o_getenv ? o_getenv(name) : NULL;
+        if (v) { for (int i = 0; v[i] && i < 60; i++) o_ch(&o, v[i]); }
+        else o_s(&o, "(空)");
+        o_ch(&o, '\n');
+        emit_ts(lb, (size_t)(o.p - lb));
+        g_in_hook = 0;
+        return v;
+    }
+    return o_getenv ? o_getenv(name) : NULL;
+}
+
+static int my_uname(void *u) {
+    int r = o_uname ? o_uname(u) : -1;
+    if (!g_in_hook && u && r == 0) {
+        g_in_hook = 1;
+        const char *p = (const char *)u;
+        char lb[220];
+        out_t o = { lb, lb + sizeof(lb) - 1 };
+        o_s(&o, "uname: 系统=");   for (int i = 0;   i < 32 && p[i];  i++) o_ch(&o, p[i]);
+        o_s(&o, " 主机=");         for (int i = 256; i < 288 && p[i];  i++) o_ch(&o, p[i]);
+        o_s(&o, " 版本=");         for (int i = 512; i < 560 && p[i];  i++) o_ch(&o, p[i]);
+        o_ch(&o, '\n');
+        emit_ts(lb, (size_t)(o.p - lb));
+        g_in_hook = 0;
+    }
+    return r;
+}
+
+static void install_env_hooks(void) {
+    void *g = dlsym(RTLD_DEFAULT, "getenv");
+    void *u = dlsym(RTLD_DEFAULT, "uname");
+    if (g) MSHookFunction(g, (void *)my_getenv, (void **)&o_getenv);
+    if (u) MSHookFunction(u, (void *)my_uname, (void **)&o_uname);
+    say_hex("已挂 getenv/uname，地址=", (unsigned long long)(uintptr_t)g);
+}
+
+// ---------------------------------------------------------------- 谁在杀进程
+//
+// 进程最后被 SIGKILL 收走，没有崩溃报告，内存只有 62MB（排除 jetsam），
+// 而盾自己网关里的 kill（37 号）一次都没出现。剩下的解释是：盾走的是 libc 的
+// kill()/raise()/abort()，那条路直接进 libsystem 的系统调用桩，不经过它的私有网关。
+// 所以这里在 libc 层面挂一层，把调用记下来。拦不拦先不管，先确认是谁。
+static int (*o_kill)(int, int);
+static int (*o_raise)(int);
+static void (*o_abort)(void);
+
+static int my_kill(int pid, int sig) {
+    char lb[96];
+    out_t o = { lb, lb + sizeof(lb) - 1 };
+    o_s(&o, "libc kill: 目标="); o_d(&o, pid);
+    o_s(&o, " 信号="); o_d(&o, sig);
+    o_s(&o, " 自己="); o_d(&o, getpid());
+    o_ch(&o, '\n');
+    emit_ts(lb, (size_t)(o.p - lb));
+    return o_kill ? o_kill(pid, sig) : -1;
+}
+static int my_raise(int sig) {
+    say_hex("libc raise: 信号=", (unsigned long long)sig);
+    return o_raise ? o_raise(sig) : -1;
+}
+static void my_abort(void) {
+    say("libc abort 被调用\n");
+    if (o_abort) o_abort();
+}
+
+static void install_kill_hooks(void) {
+    void *k = dlsym(RTLD_DEFAULT, "kill");
+    void *r = dlsym(RTLD_DEFAULT, "raise");
+    void *a = dlsym(RTLD_DEFAULT, "abort");
+    if (k) MSHookFunction(k, (void *)my_kill,  (void **)&o_kill);
+    if (r) MSHookFunction(r, (void *)my_raise, (void **)&o_raise);
+    if (a) MSHookFunction(a, (void *)my_abort, (void **)&o_abort);
+    say_hex("已挂 kill hook，地址=", (unsigned long long)(uintptr_t)k);
+}
+
 static volatile int g_drain_loops;
 
 static void *drainer(void *arg) {
@@ -2644,6 +2826,36 @@ static void dump_threads(int tag_ms) {
             }
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
+
+            // 光有 pc 只能知道"卡在哪个系统调用"，不知道是谁在调它。
+            // 非盾的线程按 x29 链往上走几层，把调用路径打出来——
+            // 界面起不来，缺的正是这一串。
+            if (!in_shield) {
+                const uint64_t *rv = (const uint64_t *)&st;
+                uint64_t fp = rv[29];
+                for (int d = 0; d < 6; d++) {
+                    if (fp < 0x100000000ULL || fp > 0x800000000000ULL || (fp & 7)) break;
+                    uint64_t nfp = *(const uint64_t *)(uintptr_t)fp;
+                    uint64_t ra  = *(const uint64_t *)(uintptr_t)(fp + 8);
+                    if (ra < 0x100000000ULL || ra > 0x800000000000ULL) break;
+                    uint64_t m = ra & 0x0000FFFFFFFFFFFFULL;
+                    char fb[192];
+                    out_t o2 = { fb, fb + sizeof(fb) - 1 };
+                    o_s(&o2, "     ^"); o_d(&o2, d + 1); o_s(&o2, " ");
+                    int jj = img_index_of(m);
+                    if (jj >= 0) {
+                        o_s(&o2, "img"); o_d(&o2, jj); o_s(&o2, "+"); o_h(&o2, m - g_img_tab[jj]);
+                        const char *nm = (jj < g_img_tab_n) ? g_img_names[jj] : NULL;
+                        if (nm) { const char *bn = strrchr(nm, '/'); o_s(&o2, "  "); o_s(&o2, bn ? bn + 1 : nm); }
+                    } else {
+                        o_h(&o2, m);
+                    }
+                    o_ch(&o2, '\n');
+                    emit_ts(fb, (size_t)(o2.p - fb));
+                    if (nfp <= fp) break;
+                    fp = nfp;
+                }
+            }
         }
         mach_port_deallocate(mach_task_self(), list[i]);
     }
@@ -2651,6 +2863,16 @@ static void dump_threads(int tag_ms) {
                   (vm_size_t)(cnt * sizeof(thread_t)));
 }
 
+
+// 进程实际占用的物理内存。盾把整份共享缓存（约 1.42GB）映射进了进程，
+// 而"启动几秒后被 SIGKILL、没有任何崩溃报告"正是被系统按内存压力收走的典型样子。
+// 把这条曲线打出来，就不用再猜。
+static uint64_t footprint_kb(void) {
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) != KERN_SUCCESS) return 0;
+    return (uint64_t)(vi.phys_footprint / 1024);
+}
 
 static void *heartbeat(void *arg) {
     (void)arg;
@@ -2661,9 +2883,8 @@ static void *heartbeat(void *arg) {
         // 现在要回答的问题变了：不再是"判定前后盾在干什么"，而是"界面为什么起不来"。
         // 所以快照点挪到几秒后，并且中间留出时间让主线程真正卡住。
         // 注意单位是 0.1 毫秒：下面比较时用的是 el*10。
-        g_snap_at[g_snap_n++] = 20000;   // 2 秒
-        g_snap_at[g_snap_n++] = 60000;   // 6 秒
-        g_snap_at[g_snap_n++] = 100000;  // 10 秒
+        g_snap_at[g_snap_n++] = 30000;   // 3 秒
+        g_snap_at[g_snap_n++] = 50000;   // 5 秒
     }
     int g_snap_i = 0;
     uint64_t last_hb = 0;
@@ -2721,9 +2942,25 @@ static void *heartbeat(void *arg) {
         }
 #endif
 #if DO_FAKE
-#if DO_FAKE
         install_fake_checks();
 #endif
+#if DO_VTPATCH
+        patch_verdict_vtables();
+#endif
+#if DO_SETFLAG
+        // 这个位置整轮恒为 0，而紧接着就是"为 0 就往下走"的分支，最后落到原因码 4。
+        // 之前只试过清零（方向反了）；如果它其实是"初始化完成"的标志，
+        // 在判定之前写成非零就应该换一条路走。
+        if (g_base && !g_setflag_done && el >= DO_SETFLAG_AT) {
+            g_setflag_done = 1;
+            volatile uint64_t *fl = (volatile uint64_t *)(g_base + 0x866fc8);
+            uint64_t old = *fl;
+            *fl = 1;
+            say_hex("已把标志 +0x866fc8 由=", old);
+            say_hex("                改为=", *fl);
+        }
+#endif
+#if DO_FAKE
         // 0x43ce74 之后紧接着读全局 +0x866fc8，非零就报告原因码 4 并退出。
         // 先看清它到底是什么值：像小整数的当标志处理，像指针的只记录不动。
         if (g_base) {
@@ -2759,6 +2996,7 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 改成返回="); o_d(&o, (long long)g_dn_fixed);
             o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
             o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
+            o_s(&o, " 内存MB="); o_d(&o, (long long)(footprint_kb() / 1024));
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
         }
@@ -2794,6 +3032,8 @@ __attribute__((constructor)) static void ctor(void) {
         }
     }
     fill_img_tab();
+    install_kill_hooks();
+    install_env_hooks();
     if (DO_HOOKCHK) check_hooks();
     compare_self_with_disk();
     if (DO_DISKCHECK) { pthread_t dt; pthread_create(&dt, NULL, disk_check, NULL); }
