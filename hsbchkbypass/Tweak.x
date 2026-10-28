@@ -52,6 +52,7 @@
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
+#define DO_REPATCH_AT 100  // 65ms 打会撞上刚结束的自检（SIGBUS/SIGILL）  // 什么时候改盾的代码（自检 44-60ms 之后、判定 70-80ms 之前）
 #define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
@@ -62,7 +63,7 @@
 #define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
 #define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
 #define DO_ENVHOOK  0   // 挂 libc 的 getenv/uname（实测会让盾提前动手）
-#define DO_EXITFN   0   // [0x848d70] 是减法基准值不是函数指针，按函数指针改写会立刻崩
+#define DO_EXITFN   0   // 1=改成替身 2=原值写回（隔离"写入方式"和"写入值"）   // 把 0x40e7e4 的退出目标换成替身（要按混淆基准编码）
 #define DO_DN_PARK  1   // 1=让那条线程原地停住 2=正常返回给调用方
 #define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
@@ -1154,34 +1155,71 @@ static void flush_ring(void) {
 #define EXITFN_SLOT_OFF 0x848d70ULL
 
 static volatile uint64_t g_exitfn_hits;
-static int g_exitfn_done;
+static uint64_t g_exitfn_obf;
+static int g_exitfn_hits_written;
 
 __attribute__((noinline, no_stack_protector)) void exitfn_stub(void) {
     g_exitfn_hits = g_exitfn_hits + 1;
+    static const char msg[] = "退出被替身接住\n";
+    emit_ts(msg, sizeof(msg) - 1);
+}
+
+
+// 往盾的数据页里写一个 64 位值。
+// [0x848d70] 所在的页是只读映射的，直接写会 SIGBUS（Round 13/15 两次都是这么崩的）。
+// 先解保护、写完再恢复成只读。VM_PROT_COPY 让内核给我们一份私有副本，
+// 不会改到磁盘上的文件。
+static int poke64(uint64_t addr, uint64_t val) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(ps - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)ps, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("解保护失败 kr=", kr); return -1; }
+    *(volatile uint64_t *)(uintptr_t)addr = val;
+    // 不要在这里把页恢复成只读：盾自己也要写这片数据，
+    // 一旦被我们设成只读，它下一次写就是 SIGBUS（Round 15 两次都死在这里）。
+    return 0;
 }
 
 static void install_exitfn(void) {
     if (!g_base) return;
     volatile uint64_t *slot = (volatile uint64_t *)(g_base + EXITFN_SLOT_OFF);
-    uint64_t cur = *slot;
-    if (!cur) return;
     uint64_t want = (uint64_t)(uintptr_t)&exitfn_stub;
-    if (g_exitfn_done) {
-        if (cur != want) *slot = want;
+
+    // 每轮都重新读一次混淆基准，不能只在开头算一次。
+    // 实测 35ms 时 [0x838138] 还是 0，真正的调用发生在 80ms 左右，
+    // 那时基准已经被初始化——按早先的 0 算出来的编码值到那时就是垃圾地址。
+    uint64_t obf = *(volatile uint64_t *)(g_base + 0x838138) & ~0xffULL;
+    if (obf != g_exitfn_obf) {
+        g_exitfn_obf = obf;
+        say_hex("混淆基准变为=", obf);
+    }
+    uint64_t cur = *slot;
+#if DO_EXITFN == 2
+    // 对照：把读到的值原样写回去。内容和盾自己放的一样，
+    // 所以如果这一步也崩，问题就在"写这个页"本身，而不是我们写进去的值。
+    static uint64_t g_probe_orig;
+    if (!g_probe_orig) g_probe_orig = cur;
+    uint64_t enc = g_probe_orig;
+    if (cur == enc) return;
+    poke64(g_base + EXITFN_SLOT_OFF, enc);
+    return;
+#else
+    uint64_t enc = want + obf;
+    if (cur == enc) return;
+    if (cur == want && obf == 0) {
+        // 磁盘上是未重定位的编码值，dyld 还没填。等它填。
         return;
     }
-    g_exitfn_done = 1;
-    say_hex("退出函数槽 原值=", cur);
-    Dl_info de = {0};
-    if (dladdr((void *)(uintptr_t)cur, &de) && de.dli_fname) {
-        say("  "); say(de.dli_fname);
-        say_hex(" +", (unsigned long long)(cur - (uint64_t)(uintptr_t)de.dli_fbase));
-        if (de.dli_sname) { say("  "); say(de.dli_sname); }
-        say("\n");
+    if (poke64(g_base + EXITFN_SLOT_OFF, enc) == 0) {
+        if (g_exitfn_hits_written < 3) {
+            g_exitfn_hits_written++;
+            say_hex("已改退出目标 编码=", enc);
+            say_hex("             基准=", obf);
+            say_hex("             原值=", cur);
+        }
     }
-    *slot = want;
-    say_hex("           换成=", want);
-    say_hex("           回读=", *slot);
+#endif
 }
 
 static void *poller(void *arg) {
@@ -2982,6 +3020,91 @@ static void dump_objc_classes(void) {
     free(cls);
 }
 
+
+// ---------------------------------------------------------------- 自检之后再改代码
+//
+// 前面所有"只改数据"的路都封死了：退出的那个槽有 5 处读取、各自混淆基准不同，
+// 改一处会把另一处带崩（Round 15 实测：原值写回能活 10 秒，写成别的值 80ms 就 SIGBUS）。
+//
+// 剩下能改的就只有代码本身。盾会对自己 __TEXT 做哈希自检，但自检发生得很早
+// （44-60ms，实测自检结果是"0 处不同"）。所以只要等它算完再改，
+// 那一次自检就看不见我们的改动。这一版就是验证这个时序能不能成立：
+// 先在 100ms 之后把 0x40e7e4（上报并退出）的第一条指令改成 ret。
+static int g_repatch_done;
+
+volatile uint64_t g_verdict_calls;
+
+// 盾的判定函数替身：恒返回 1（让 0x5d87a4 的 tbnz 直接跳过退出流程），
+// 同时记一次数——用它来判断补丁到底有没有被用到。
+__attribute__((noinline, no_stack_protector)) long verdict_pass(void) {
+    g_verdict_calls = g_verdict_calls + 1;
+    return 1;
+}
+
+static void patch_words(uint64_t addr, const uint32_t *ws, int n, const char *what) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(ps - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)ps, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("解保护失败 kr=", kr); return; }
+    for (int i = 0; i < n; i++)
+        *(volatile uint32_t *)(uintptr_t)(addr + (uint64_t)i * 4) = ws[i];
+    sys_icache_invalidate((void *)(uintptr_t)addr, (size_t)(n * 4));
+    say_hex(what, addr);
+    for (int i = 0; i < n; i++)
+        say_hex("  现=", *(volatile uint32_t *)(uintptr_t)(addr + (uint64_t)i * 4));
+}
+
+static void patch_ret(uint64_t addr, const char *what) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(ps - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)ps, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("解保护失败 kr=", kr); return; }
+    uint32_t old = *(volatile uint32_t *)(uintptr_t)addr;
+    *(volatile uint32_t *)(uintptr_t)addr = 0xD65F03C0u;   // ret
+    sys_icache_invalidate((void *)(uintptr_t)addr, 4);
+    say_hex(what, addr);
+    say_hex("  原指令=", old);
+    say_hex("  现指令=", *(volatile uint32_t *)(uintptr_t)addr);
+}
+
+static void patch_exit_after_selfcheck(uint64_t el) {
+    if (g_repatch_done || !g_base || el < DO_REPATCH_AT) return;
+    g_repatch_done = 1;
+
+    // 0x5d87a4 是 `tbnz w0, #0, 0x5d87e0`：只要 0x712668 的返回值最低位是 1，
+    // 整条退出流程就被跳过。所以让这个判定函数恒返回 1 —— 这才是"判定通过"，
+    // 而不是像 0x40e7e4 那样被硬挡住（那样 App 会停在启动图等结果）。
+    // 补丁打在盾的 __TEXT 上，必须等它的哈希自检（44-60ms）过去，
+    // 所以统一放在 100ms 之后。
+    // 不直接写 mov w0,#1;ret，而是跳到我们自己的函数上：这样既能返回 1，
+    // 又能数出它到底被调用了多少次。盾在 0x1145xxxx、我们在 0x11fxxxxx，
+    // 相距十几 MB，在 b 指令 ±128MB 的范围之内。
+    uint64_t site = g_base + 0x712668;
+    uint64_t fn = (uint64_t)(uintptr_t)&verdict_pass;
+    int64_t delta = (int64_t)fn - (int64_t)site;
+    if (delta >= -(1LL << 27) && delta < (1LL << 27)) {
+        uint32_t b = 0x14000000u | (uint32_t)((delta >> 2) & 0x03FFFFFFu);
+        patch_words(site, &b, 1, "已把判定函数改成跳到替身，地址=");
+        say_hex("  替身地址=", fn);
+        say_hex("  编码=", b);
+    } else {
+        static const uint32_t ret1[] = { 0x52800020u, 0xD65F03C0u };   // mov w0,#1 ; ret
+        patch_words(site, ret1, 2, "距离太远，改为就地恒返回 1，地址=");
+    }
+
+    // 只改判定函数，不再去挡 0x40e7e4。上一版两者都改，进程能活 14 秒但停在启动图——
+    // 那是 App 在等一个被我们永久挡住的结果。让判定返回 1 才是"检查通过"，
+    // 挡住退出只是"检查永远不结束"。
+#ifndef DO_ALSO_RET
+#define DO_ALSO_RET 0
+#endif
+#if DO_ALSO_RET
+    patch_ret(g_base + 0x40e7e4, "已在自检之后把退出函数改成 ret，地址=");
+#endif
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
@@ -3112,6 +3235,7 @@ static void *heartbeat(void *arg) {
             dump_threads(g_snap_at[g_snap_i]);
             g_snap_i++;
         }
+        patch_exit_after_selfcheck(el);
         if (el - last_hb >= 50) {
             last_hb = el;
             char buf[192];
@@ -3128,6 +3252,7 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
             o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
             o_s(&o, " 退出函数="); o_d(&o, (long long)g_exitfn_hits);
+            o_s(&o, " 判定调用="); o_d(&o, (long long)g_verdict_calls);
             o_s(&o, " 内存MB="); o_d(&o, (long long)(footprint_kb() / 1024));
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
