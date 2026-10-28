@@ -52,7 +52,7 @@
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
-#define DO_REPATCH_AT 100  // 65ms 打会撞上刚结束的自检（SIGBUS/SIGILL）  // 什么时候改盾的代码（自检 44-60ms 之后、判定 70-80ms 之前）
+#define DO_REPATCH_AT 100  // 3ms 打会被自检发现（61ms SIGBUS），100ms 之后安全但已错过判定  // 什么时候改盾的代码（自检 44-60ms 之后、判定 70-80ms 之前）
 #define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
