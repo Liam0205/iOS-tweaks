@@ -52,6 +52,9 @@
 // 两个干预开关。0.0.130 之前把"让盾对注入库的读取失败"留在了代码里，
 // 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
 // 现在分开关，一次只上一个。
+// 0.0.240：要弄清最后那次 SIGILL 是谁发的，得先知道盾对信号做了什么。
+// 它装 sigaction / 改信号掩码走的是自己的裸系统调用，libc 层钩子看不到。
+// 这里打开网关接管，只记录信号相关和进程控制相关的编号。
 #define DO_TAKEOVER 0   // 0.0.186：不接管网关。0.0.183 之后每次都在 20ms 停写日志、
                         // 约 600ms SIGSEGV；0.0.182 却能活 5.9s。先确认接管本身是不是元凶。
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
@@ -80,6 +83,11 @@
 // 而 kill 就住在同一页的 0x1e0dae27c。MSHookFunction 改了这一页，
 // 摘要自然对不上——这很可能就是原因码 5 的真正来源。先不挂，验一次。
 #define DO_KILLHOOK 0
+// 0.0.238：0.0.235-237 三次实验都以"正常退出，退出码 1"结束——不是崩溃，也不是
+// SIGKILL。也就是说最后拍板的是 exit(1) 的调用方。这里只记这个调用方是谁，
+// 不改任何行为：返回地址落在 App 里，说明是 App 自己决定退出；落在盾里，
+// 说明还是盾。
+#define DO_EXITHOOK 1
 // 0.0.184：自检结构的扫描要读 9MB 再用 115 万次 vm_read 试探，
 // 在盾已经动手的时刻跑它，会把自己的观测结果搅乱（0.0.183 两次都 SIGSEGV）。
 // 这个问题已经有结论了，先关掉。
@@ -207,17 +215,26 @@ static void emit_ts(const char *s, size_t n);
 // 无条件跳往"只上报"分支（0x40e848）的 b，两条退出链就都变成"记一笔然后正常返回"。
 // 这样调用方拿到的是正常的返回路径，而不是被我们硬拦下来之后的垃圾状态。
 #define DO_FAIL_EXIT_NOP 0
+// 0.0.237：0x7133e4 是虚拟机里那次"原因码 5 + 说明"的上报。失败状态是在这里
+// 记下的；只要这次上报不发生，0x712668 也许就会返回成功。Round 18 试过这条，
+// 当时没有自检旁路所以被 SIGBUS 打掉；现在可以安全地再试一次。
 #define DO_GATE_RET 0
 // 0.0.207：闸门改成 ret 之后进程照样以退出码 1 结束，说明 exit 不是从闸门发的。
 // 盾自己的退出函数是 0x5d842c（除了闸门里那处间接调用，还有四个直接调用点）。
 // 把它整个换成 ret，如果进程仍然退出，那 exit 就不是盾发的。
+// 0.0.239：0.0.238 证明了进程不是走 libc 的 exit/_exit 结束的——钩子装上了却
+// 一条记录都没有。真正发出 SYS_exit 的是盾自己的 0x5d842c 末尾那次间接调用。
+// 既然自检旁路已经能让代码补丁不被 SIGBUS 打掉，这里直接把这函数改成 ret，
+// 让它"退不掉"，看进程能不能越过 ~550ms 那道坎。
+// 0.0.243：0.0.241（跳过检查）已经把存活拉到 910ms，但那里仍然以退出码 1 收场。
+// 这一版把退出函数一并改成 ret，看 910ms 那道坎是它自己设的时限，还是又一条击杀路径。
 #define DO_EXITFN_RET 0
-#define DO_EXITPROBE 1
+#define DO_EXITPROBE 0
 #define OFF_GATE_NULL 0x40e804ULL
 #define WORD_B_REPORT_FROM_NULL 0x14000011U   // → 0x40e848
 #define OFF_GATE_EMPTY 0x40e80cULL
 #define WORD_B_REPORT_FROM_EMPTY 0x1400000fU  // → 0x40e848
-#define DO_REPORT_PROBE 1
+#define DO_REPORT_PROBE 0
 // 0.0.214：5d8758 这个函数的形状是
 //   5d87a0  bl  0x712668        ; 判定，结果在 w0
 //   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
@@ -227,6 +244,11 @@ static void emit_ts(const char *s, size_t n);
 // 0.0.224：Round 4 当场读出过检查表：3 项里第 1 项报警，判定函数是 0x6f3d54，返回 1。
 // 现在能改代码了，直接把这一项改成恒返回 0——这是让判定真正通过，不是拦退出。
 #define DO_CHECKITEM_OK 0
+// 0.0.236：区分"盾抽查了这个地址"和"走成功路径必然出事"。
+// 把 0x5d87a4 的 tbnz 换成等价的 nop：未打补丁时位 0 为 0、本来就不跳，
+// 所以行为完全不变。如果这样仍以退出码 1 结束，说明盾并不抽查这里。
+#define DO_VERDICT_NOP 0
+#define OFF_VERDICT_TBNZ2 0x5d87a4ULL
 // 0.0.226：除了那条被旁路的 xxHash，盾还有一张 SHA-256 完整性表，
 // 校验函数是 0x5e7aa4（返回值位 0 被调用方直接当布尔用）。
 // 先假设"返回 0 = 通过"，把它固定成 0，看 590ms 那次击杀是否消失。
@@ -245,12 +267,19 @@ static void emit_ts(const char *s, size_t n);
 // 第五节记录过"置空 71 个 __mod_init_func 无效，盾走 ObjC +load"。
 // 现在改了代码不会被自检发现，可以第一次直接把 +load 改成 ret。
 //   0x228f74 = PRMShieldEventManager 的 +load
-#define DO_SHIELD_NOLOAD 0
+// 0.0.241：换思路。前面 21 轮都在"盾判定失败之后去挡它的各种击杀路径"，
+// 挡一条就换一条，是打地鼠。这次改成不让它去做判定：
+// 两个事件管理器的 performSecurityChecks 都是 mov w0,#1 之后 b 0x38d974，
+// 把那个 b 换成 ret，就变成"直接回答 1，完全不进检查"。
+// +load 保持原样，引擎照常初始化，避免半初始化状态引来别的崩溃。
+#define DO_SHIELD_NOLOAD 1
 // 0.0.223：盾会通过自己的网关装信号处理器（sigaction = 46），把我们的换掉。
 // 在网关里把 46 号整体挡掉之后，它永远装不上，我们的故障处理函数就一直有效。
 // libc 的 sigaction 走 libSystem，不经这个网关，所以不会误伤我们自己。
 #define DO_BLOCK_SIGACTION 0
 #define OFF_MGR_LOAD 0x228f74ULL
+#define OFF_MGR_CHECK 0x229110ULL   // PRMShieldEventManager：b 0x38d974
+#define OFF_CB_CHECK  0x693f8cULL   // ShieldCallbackManager：b 0x38d974
 #define WORD_RET 0xd65f03c0U
 #define OFF_VERDICT_TBNZ 0x5d87a4ULL
 #define WORD_B_RETURN    0x1400000fU   // b 0x5d87e0
@@ -290,6 +319,7 @@ static void *ver(void *arg);
 static void *busy_probe(void *arg);
 
 static int install_exit_probe(void);
+static void arm_fault_probe(void);
 static int install_report_probe(void);
 static void arm_fault_probe(void);
 static void install_sighooks(void);
@@ -326,8 +356,15 @@ static void install_hash_bypass(void) {
 #if DO_VERDICT_OK
     patch_word(g_base + OFF_VERDICT_TBNZ, WORD_B_RETURN);
 #endif
+#if DO_VERDICT_NOP
+    patch_word(g_base + OFF_VERDICT_TBNZ2, WORD_NOP);
+#endif
 #if DO_SHIELD_NOLOAD
+    patch_word(g_base + OFF_MGR_CHECK, WORD_RET);
+    patch_word(g_base + OFF_CB_CHECK, WORD_RET);
+#if DO_SHIELD_NOLOAD >= 2
     patch_word(g_base + OFF_MGR_LOAD, WORD_RET);
+#endif
 #endif
 #if DO_CHECKITEM_OK
     patch_word(g_base + OFF_CHECK_ITEM1, WORDS_ITEM_OK_0);
@@ -1009,8 +1046,12 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
         static uint32_t dn;
         uint32_t c = ++dn;
         // 关心的编号照常记；其余按计数抽样，用来证明"这段时间里网关一直在被人们调用"。
-        int want = (nr == 1) || (nr == 5) || (nr == 33) || (nr == 197) ||
-                   (nr == 202) || (nr == 294) || (nr == 46) || (nr > 1000);
+        // 0.0.240：只关心"盾怎么处置信号"和"谁在结束进程"。
+        // 1=exit 37=kill 46=sigaction 48=sigprocmask 53=sigaltstack
+        // 95=sigsuspend 116=sigwait 169=csops 202=sysctl 336=proc_info
+        int want = (nr == 1) || (nr == 37) || (nr == 46) || (nr == 48) ||
+                   (nr == 53) || (nr == 95) || (nr == 116) || (nr == 169) ||
+                   (nr == 202) || (nr == 336);
         if (want) gw_direct(1, nr, a0, a1, a2);
         else if ((c % 500) == 0) gw_direct(9, nr, c, 0, 0);
     }
@@ -3419,6 +3460,42 @@ static void install_kill_hooks(void) {
     say_hex("已挂 kill hook，地址=", (unsigned long long)(uintptr_t)k);
 }
 
+// 0.0.238：exit/_exit 只记录不干预。
+static void (*o_exit)(int);
+static void (*o__exit)(int);
+
+static void exit_record(uint64_t kind, int code, void *ra) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x4558495400000000ULL | (kind & 0xff);
+    r[1] = (uint64_t)(int64_t)code;
+    r[2] = (uint64_t)(uintptr_t)ra;
+    r[3] = (uint64_t)g_base;
+    r[4] = up_ms() - g_t0;
+    r[5] = 0;
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+static void my_exit(int code) {
+    exit_record(0x21, code, __builtin_return_address(0));
+    if (o_exit) o_exit(code);
+    _exit(code);
+}
+static void my__exit(int code) {
+    exit_record(0x22, code, __builtin_return_address(0));
+    if (o__exit) o__exit(code);
+    __builtin_trap();
+}
+
+static void install_exit_hooks(void) {
+    void *e = dlsym(RTLD_DEFAULT, "exit");
+    void *x = dlsym(RTLD_DEFAULT, "_exit");
+    if (e) MSHookFunction(e, (void *)my_exit,  (void **)&o_exit);
+    if (x) MSHookFunction(x, (void *)my__exit, (void **)&o__exit);
+    say_hex("已挂 exit hook，exit 地址=", (unsigned long long)(uintptr_t)e);
+    say_hex("              _exit 地址=", (unsigned long long)(uintptr_t)x);
+}
+
 static volatile int g_drain_loops;
 
 static void *drainer(void *arg) {
@@ -4550,6 +4627,114 @@ static int install_report_probe(void) {
 // 只有几种来源：故意写进去的 brk/未定义指令、被关掉使能位的 mrs cntpct_el0、
 // 或者我们自己的补丁写坏了。装一个故障处理函数，把出事那一刻的 pc/lr/sp
 // 和故障地址原样记下来，一次性看清是哪一种。
+// 0.0.244：退出函数 0x5d842c 换成"守护桩"。
+// 它做两件事再原样返回：把调用者记下来；把我们的故障处理器重新装一遍。
+// 后者是关键——盾可能在 40ms 之后用自己的裸系统调用把处理器换掉，
+// 而我们的线程那时已经停了，没有别的机会再装一次。
+#define DO_EXITFN_GUARD 1
+static volatile uint64_t g_guard_hits;
+
+static void usr1_probe(int sig, siginfo_t *si, void *ucv) {
+    (void)si; (void)ucv;
+    if (g_gwfd >= 0) {
+        uint64_t r[6] = { 0x5553315000000001ULL, (uint64_t)sig, 0, 0,
+                          g_guard_hits, (uint64_t)g_base };
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+}
+
+__attribute__((noinline, used)) void exitfn_guard(uint64_t reason, uint64_t desc, uint64_t caller) {
+    g_guard_hits = g_guard_hits + 1;
+    if (g_gwfd >= 0) {
+        uint64_t r[6] = { 0x4558495400000011ULL, caller, reason, desc,
+                          (uint64_t)g_guard_hits, (uint64_t)g_base };
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+    arm_fault_probe();
+    {
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+    }
+    // 0.0.245：自检。此刻发一个 SIGUSR1 给自己，看装上去的处理器到底还在不在。
+    // 在的话会写一条 USR1 记录；不在的话进程应该当场被 SIGUSR1 结束——而我们现在
+    // 看到的是活到了 SIGILL，说明这里的处理器是被盾用它自己的裸系统调用换掉的。
+    if (g_guard_hits == 1) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = usr1_probe;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        raise(SIGUSR1);
+        if (g_gwfd >= 0) {
+            uint64_t r[6] = { 0x5553315000000002ULL, 0, 0, 0, 0, (uint64_t)g_base };
+            raw_write(g_gwfd, r, sizeof(r));
+        }
+        // SIGUSR1 能送到，只证明普通信号这条路通。SIGILL 是硬件异常，
+        // 内核走的是另一条路，这里单独试一次：执行一条 udf，看处理器会不会
+        // 把 pc 往后挪一格让我们继续。
+        __asm__ volatile("udf #0" ::: "memory");
+        if (g_gwfd >= 0) {
+            uint64_t r[6] = { 0x5544463000000001ULL, 0, 0, 0, 0, (uint64_t)g_base };
+            raw_write(g_gwfd, r, sizeof(r));
+        }
+    }
+    // 0.0.247：第二次退出调用处停 300ms，每 10ms 写一条心跳。
+    // 如果进程在这 300ms 里就没了，说明凶手是另一条线程，与"退出调用返回之后
+    // 继续往下走"无关；如果心跳写满 300ms、进程在返回之后才死，那问题就在续行路径上。
+    // 0.0.248：0.0.247 证明致命 SIGILL 发生在退出调用返回之后，也就是续行路径上。
+    // 那就把调用栈抓出来，好顺着去找那一层的 udf。
+    if (g_guard_hits <= 2) {
+        uint64_t fp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+        for (int i = 0; i < 14 && fp; i++) {
+            uint64_t nfp = 0, lr = 0;
+            if (!safe_read(fp, &nfp, 8)) break;
+            if (!safe_read(fp + 8, &lr, 8)) break;
+            if (g_gwfd >= 0) {
+                uint64_t r[6] = { 0x4652414d00000001ULL, (uint64_t)g_guard_hits,
+                                  (uint64_t)(i + 1), lr, fp, (uint64_t)g_base };
+                raw_write(g_gwfd, r, sizeof(r));
+            }
+            if (nfp <= fp) break;
+            fp = nfp;
+        }
+    }
+}
+
+__attribute__((naked)) static void exitfn_guard_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x20\n"
+        "stp x29, x30, [sp, #0x10]\n"
+        "stp x0,  x1,  [sp, #0x00]\n"
+        "mov x2, x30\n"
+        "bl _exitfn_guard\n"
+        "ldp x0,  x1,  [sp, #0x00]\n"
+        "ldp x29, x30, [sp, #0x10]\n"
+        "add sp, sp, #0x20\n"
+        "ret\n"
+    );
+}
+
+static int install_exitfn_guard(void) {
+    if (!g_base) return 0;
+    uintptr_t addr = g_base + 0x5d842cULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("退出守护：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&exitfn_guard_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("退出守护：已装到 ", addr);
+    return 1;
+}
+
 #define DO_FAULTPROBE 1
 static char g_faultpath[256];
 
@@ -4603,6 +4788,34 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
         }
         r[5] = (uint64_t)g_base;
         raw_write(g_gwfd, r, sizeof(r));
+    }
+    // 0.0.244：盾里 6434 条 brk #1 就是它的"故意陷阱"。以前这里一律重新抛出，
+    // 于是每一次都由我们亲手把进程送走。现在辨认指令：如果是 brk / udf，
+    // 就把 pc 往后挪一条、直接返回，等于这条陷阱没发生过；其余情况维持原样。
+    {
+        ucontext_t *uc = (ucontext_t *)ucv;
+        if (uc && uc->uc_mcontext) {
+            uint64_t pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+            uint32_t w = 0;
+            if (safe_read(pc, &w, 4)) {
+                int trap = ((w & 0xffe0001fU) == 0xd4200000U) ||   // brk #imm16
+                           ((w & 0xffe0001fU) == 0xd4400000U) ||   // hlt #imm16
+                           ((w & 0xffff0000U) == 0x00000000U);     // udf #imm16
+                if (trap) {
+                    static volatile int skipped;
+                    if (skipped < 400) {
+                        skipped++;
+                        uc->uc_mcontext->__ss.__pc = pc + 4;
+                        if (g_gwfd >= 0) {
+                            uint64_t q[6] = { 0x5452415000000001ULL, pc, w,
+                                              (uint64_t)skipped, (uint64_t)g_base, 0 };
+                            raw_write(g_gwfd, q, sizeof(q));
+                        }
+                        return;
+                    }
+                }
+            }
+        }
     }
     signal(sig, SIG_DFL);
     raise(sig);
@@ -4760,7 +4973,9 @@ __attribute__((constructor)) static void ctor(void) {
     {
         // 网关直写用的二进制记录单独一个文件，和文本日志混在一起会没法解析。
         NSString *gp = [caches stringByAppendingPathComponent:@"hsbchkbypass-gw.bin"];
-        g_gwfd = open([gp fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        // 0.0.240：改成追加。这个 App 的构造函数一次启动里会跑好几次，
+        // 之前每次都用 O_TRUNC，等于只留下最后一轮写下的记录。
+        g_gwfd = open([gp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
         NSString *fp = [caches stringByAppendingPathComponent:@"hsbchkbypass-fault.bin"];
         {
             const char *rp2 = [fp fileSystemRepresentation];
@@ -4775,11 +4990,14 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.234 启动（只留退出钉住，理清击杀路径）=====\n");
+    say("===== 0.0.248 启动（抓退出调用的调用栈）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
     install_hash_bypass();
+#if DO_EXITFN_GUARD
+    install_exitfn_guard();
+#endif
 #endif
 #if DO_SIGSAMPLE
     arm_sig_sample();
@@ -4826,6 +5044,9 @@ __attribute__((constructor)) static void ctor(void) {
     }
 #endif
     if (DO_SYMCHK) dump_sym_heads();
+#if DO_EXITHOOK
+    install_exit_hooks();
+#endif
 #if DO_KILLHOOK
     install_kill_hooks();
 #else
