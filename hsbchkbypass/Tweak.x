@@ -53,7 +53,8 @@
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
-#define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
+#define DO_BLKEXIT  0   // 不把 exit 发出去，让调用返回 0
+#define DO_CTRLEXIT 1   // 700ms 时自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
@@ -334,8 +335,11 @@ static uint64_t rec_ms(uint64_t ts) {
 
 static volatile int64_t g_fake_rw;
 static uint64_t g_flag_last;
+static int g_ctrl_done;
 static volatile uint64_t g_ret_override;   // 非零时用它替换系统调用的返回值
 static volatile int g_blk_mmap;
+static volatile int64_t g_mmap_blocked;   // 拦截生效了 N 次
+static uint64_t g_mmap_len;
 static volatile int g_skip_svc;    // 置位时这次系统调用不发出去，直接返回 0
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
 // 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
@@ -606,7 +610,7 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 
     // 盾把整份共享缓存（约 1.42GB）只读映射进进程，很可能是拿磁盘原件和内存活副本比对。
     // 这次实验让它失败，看判定是否变化。只通过网关改返回值，不碰任何代码或数据。
-    if (DO_BLKIMMAP && nr == 197 && a1 > 0x10000000ULL) g_blk_mmap = 1;
+    if (DO_BLKIMMAP && nr == 197 && a1 > 0x10000000ULL) { g_blk_mmap = 1; g_mmap_len = a1; }
 
     // 第 1 号是 exit。拦截系统调用 ≠ 拦截函数：这里只是不把它发出去、让调用返回 0，
     // 调用方会以为处理完了继续跑。Round 4 做过这件事，但当时的存活测量被
@@ -681,6 +685,9 @@ void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
     if (g_blk_mmap) {
         g_blk_mmap = 0;
         g_ret_override = (uint64_t)-1;         // EPERM
+        g_mmap_blocked++;
+        say_hex("已拦下整份缓存映射 长度=", g_mmap_len);
+        say_hex("  累计拦下=", (uint64_t)g_mmap_blocked);
         return;
     }
     if (nr != (uint64_t)-31 || a0 < 0x1000) return;
@@ -2390,6 +2397,16 @@ static void *heartbeat(void *arg) {
     for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
         uint64_t el = rec_ms(read_pct());
+#if DO_CTRLEXIT
+        if (!g_ctrl_done && el >= 700) {
+            g_ctrl_done = 1;
+            say_hex("对照：自己发裸 exit(7)，此刻时刻=", el);
+            register long x16 __asm__("x16") = 1;
+            register long x0  __asm__("x0")  = 7;
+            __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x16) : "memory", "cc");
+            say_hex("对照：exit 之后居然还能写日志，返回值=", (uint64_t)x0);
+        }
+#endif
 #if DO_LATEDL
         if (!g_late_tried && el >= 45) {
             g_late_base = 1;   // 只试一次
@@ -2452,7 +2469,7 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 已重定向="); o_u(&o, (unsigned long long)g_redirects);
             o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
             o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
-            o_s(&o, " 哨兵被读="); o_d(&o, g_sent_hit);
+            o_s(&o, " 拦下映射="); o_d(&o, g_mmap_blocked);
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
         }
@@ -2475,7 +2492,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.167 启动（拦住 exit 系统调用，用绑定 pid 的测量重测）=====\n");
+    say("===== 0.0.169 启动（对照：自己发裸 exit(7) 验证这条系统调用）=====\n");
 
     try_takeover();
     {
