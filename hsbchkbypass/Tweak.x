@@ -48,17 +48,17 @@
 // 两个干预开关。0.0.130 之前把"让盾对注入库的读取失败"留在了代码里，
 // 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
 // 现在分开关，一次只上一个。
-#define DO_TAKEOVER 1   // 接管网关（0 = 完全不干预，只留着当对照）
+#define DO_TAKEOVER 1   // 接管网关（只为拿到盾基址并观察）
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
-#define DO_REPATCH_AT 100  // 62/65/68ms 都撞上自检收尾（崩），100ms 之后安全但已错过判定
+#define DO_REPATCH_AT 71
 #define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
 #define DO_SETFLAG_AT 20  // 在第几毫秒写
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
-#define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
+#define DO_BLKEXIT  0   // 不拦 exit：只让代码补丁干活，排除"跳过 exit 导致调用方拿着垃圾状态继续"
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
 #define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
 #define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
@@ -356,8 +356,8 @@ static volatile int64_t g_mmap_blocked;   // 拦截生效了 N 次
 static uint64_t g_mmap_len;
 // 网关的汇编用 64 位 LDR/STR 访问它，所以这里必须是 8 字节且对齐的。
 // 0.0.170 调整代码布局后它落到 0x1100c，链接期才发现这个隐患。
-static volatile uint64_t g_block_nr;   // 非零时，编号等于它的系统调用不发出去、直接返回 0
-volatile uint64_t g_block_nr2;  // 同上，第二个要拦的编号（kill=37）
+static __attribute__((used)) volatile uint64_t g_block_nr;   // 非零时，编号等于它的系统调用不发出去、直接返回 0
+__attribute__((used)) volatile uint64_t g_block_nr2;  // 同上，第二个要拦的编号（kill=37）
 volatile uint64_t g_kill_seen;  // 网关看到 kill 的次数
 volatile uint64_t g_kill_blocked;
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
@@ -3073,26 +3073,10 @@ static void patch_exit_after_selfcheck(uint64_t el) {
     if (g_repatch_done || !g_base || el < DO_REPATCH_AT) return;
     g_repatch_done = 1;
 
-    // 0x5d87a4 是 `tbnz w0, #0, 0x5d87e0`：只要 0x712668 的返回值最低位是 1，
-    // 整条退出流程就被跳过。所以让这个判定函数恒返回 1 —— 这才是"判定通过"，
-    // 而不是像 0x40e7e4 那样被硬挡住（那样 App 会停在启动图等结果）。
-    // 补丁打在盾的 __TEXT 上，必须等它的哈希自检（44-60ms）过去，
-    // 所以统一放在 100ms 之后。
-    // 不直接写 mov w0,#1;ret，而是跳到我们自己的函数上：这样既能返回 1，
-    // 又能数出它到底被调用了多少次。盾在 0x1145xxxx、我们在 0x11fxxxxx，
-    // 相距十几 MB，在 b 指令 ±128MB 的范围之内。
-    uint64_t site = g_base + 0x712668;
-    uint64_t fn = (uint64_t)(uintptr_t)&verdict_pass;
-    int64_t delta = (int64_t)fn - (int64_t)site;
-    if (delta >= -(1LL << 27) && delta < (1LL << 27)) {
-        uint32_t b = 0x14000000u | (uint32_t)((delta >> 2) & 0x03FFFFFFu);
-        patch_words(site, &b, 1, "已把判定函数改成跳到替身，地址=");
-        say_hex("  替身地址=", fn);
-        say_hex("  编码=", b);
-    } else {
-        static const uint32_t ret1[] = { 0x52800020u, 0xD65F03C0u };   // mov w0,#1 ; ret
-        patch_words(site, ret1, 2, "距离太远，改为就地恒返回 1，地址=");
-    }
+    // 只做一件事：把失败块里那次退出（0x7133e4 bl 0x40e7e4）改成 nop。
+    // 不碰函数入口——实测改入口拦不住已经在函数里的线程。
+    static const uint32_t nop1[] = { 0xD503201Fu };
+    patch_words(g_base + 0x7133e4, nop1, 1, "已把失败块里那次退出改成 nop，地址=");
 
     // 只改判定函数，不再去挡 0x40e7e4。上一版两者都改，进程能活 14 秒但停在启动图——
     // 那是 App 在等一个被我们永久挡住的结果。让判定返回 1 才是"检查通过"，
@@ -3103,6 +3087,25 @@ static void patch_exit_after_selfcheck(uint64_t el) {
 #if DO_ALSO_RET
     patch_ret(g_base + 0x40e7e4, "已在自检之后把退出函数改成 ret，地址=");
 #endif
+}
+
+
+// ---------------------------------------------------------------- 自检的期望值
+//
+// 0x43cc0c 读 [0x848fb8]，那是一个指向 0x30 字节结构的指针；0x43cc38 起把这 30 字节
+// 按 msub/add 的线性运算解混淆出期望哈希，最后 0x43ccdc 与算出来的值比较。
+// 只要能把结构里的期望值改成"补丁后的实际哈希"，自检就会通过。
+// 这一步先把结构原样 dump 出来，配合离线复刻哈希来验证。
+static void dump_expect_struct(uint64_t el) {
+    static int done;
+    if (done || !g_base || el < 30) return;
+    done = 1;
+    uint64_t p = *(volatile uint64_t *)(g_base + 0x848fb8);
+    say_hex("期望值结构指针=", p);
+    if (p < 0x100000000ULL || p > 0x800000000ULL) return;
+    dump_mem("期望结构 0x30 字节 @", p, 0x30);
+    // 自检比的是哪一页：把盾 __TEXT 的头 64 字节也 dump 出来做对照
+    dump_mem("盾 __TEXT 头 64 字节 @", g_base, 64);
 }
 
 static void *heartbeat(void *arg) {
@@ -3235,6 +3238,7 @@ static void *heartbeat(void *arg) {
             dump_threads(g_snap_at[g_snap_i]);
             g_snap_i++;
         }
+        dump_expect_struct(el);
         patch_exit_after_selfcheck(el);
         if (el - last_hb >= 50) {
             last_hb = el;
