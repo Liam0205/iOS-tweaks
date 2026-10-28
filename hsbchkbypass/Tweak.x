@@ -52,7 +52,7 @@
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
-#define DO_REPATCH_AT 71
+#define DO_REPATCH_AT 9999
 #define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
@@ -61,11 +61,11 @@
 #define DO_BLKEXIT  0   // 不拦 exit：只让代码补丁干活，排除"跳过 exit 导致调用方拿着垃圾状态继续"
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
 #define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
-#define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
+#define DO_FILELOG  0   // 记 open/access 的返回值
 #define DO_ENVHOOK  0   // 挂 libc 的 getenv/uname（实测会让盾提前动手）
 #define DO_EXITFN   0   // 1=改成替身 2=原值写回（隔离"写入方式"和"写入值"）   // 把 0x40e7e4 的退出目标换成替身（要按混淆基准编码）
-#define DO_DN_PARK  1   // 1=让那条线程原地停住 2=正常返回给调用方
-#define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
+#define DO_DN_PARK  0   // 1=让那条线程原地停住 2=正常返回给调用方
+#define DO_DIENEXT  0   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
 #define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
@@ -522,6 +522,42 @@ static void emit_rec(const rec_t *r, uint64_t now) {
 
 // 从网关处理函数里直接落地的一行：纯算术 + 裸 write。
 static void flush_ring(void);
+static void dump_mem(const char *label, uint64_t addr, int n);
+
+// 退出那一刻，把失败函数（0x712668）的局部变量原样读出来。
+// 它的帧是 sp+0x1a0（x29 = sp+0x1a0），所以 [sp+X] 就是 [x29 - 0x1a0 + X]。
+// 关键几格：+0x48 是被调用去取"说明文字"的对象（它返回了空，才走到退出），
+// +0x58 是 x24（检查对象），+0x90 是取到的虚函数指针。
+static void dump_exit_frames(uint64_t fp0) {
+    uint64_t fp = fp0;
+    for (int k = 0; k < 16; k++) {
+        if (fp < 0x100000000ULL || (fp & 7) || fp > 0x800000000ULL) break;
+        uint64_t nx = *(volatile uint64_t *)(uintptr_t)fp;
+        uint64_t lr = *(volatile uint64_t *)(uintptr_t)(fp + 8);
+        if (lr > g_base && lr < g_base + 0x8c0000 && (lr - g_base) == 0x5d87a4) {
+            uint64_t sp = fp - 0x1a0;
+            dump_mem("  失败帧 sp..sp+0xf0 @", sp, 0xf0);
+            uint64_t msg = *(volatile uint64_t *)(uintptr_t)(sp + 0x48);
+            uint64_t obj = *(volatile uint64_t *)(uintptr_t)(sp + 0x58);
+            uint64_t fld = *(volatile uint64_t *)(uintptr_t)(sp + 0x90);
+            say_hex("  [sp+0x48] 消息对象=", msg);
+            say_hex("  [sp+0x58] 检查对象=", obj);
+            say_hex("  [sp+0x90] 取值函数=", fld);
+            if (obj > 0x100000000ULL && obj < 0x800000000ULL)
+                dump_mem("    检查对象 0x60 @", obj, 0x60);
+            if (msg > 0x100000000ULL && msg < 0x800000000ULL) {
+                dump_mem("    消息对象 0x40 @", msg, 0x40);
+                uint64_t vt = *(volatile uint64_t *)(uintptr_t)msg;
+                if (vt > 0x100000000ULL && vt < 0x800000000ULL)
+                    dump_mem("    消息虚表 0x40 @", vt, 0x40);
+            }
+            if (fld > g_base && fld < g_base + 0x8c0000)
+                dump_mem("    取值函数前 0x30 字节 @", fld, 0x30);
+            return;
+        }
+        fp = nx;
+    }
+}
 
 static void emergency_line(const rec_t *r) {
     char buf[640];
@@ -741,6 +777,7 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     if (nr == 1) {
         unsigned h = (g_head + RING - 1) % RING;
         emergency_line(&g_ring[h]);
+        if (g_base) dump_exit_frames(g_last_fp);
         // 排空线程在判定前那几十毫秒里落后几百条，而进程马上就要退出，
         // 那些还没来得及写出去的记录正是最要紧的一段。这里同步冲一遍。
         flush_ring();
@@ -1230,7 +1267,9 @@ static void *poller(void *arg) {
     for (int i = 0; i < 30000; i++) {
         if (i > 500) usleep(1000);
         try_takeover();
+#if DO_DIENEXT
         install_dienext();
+#endif
 #if DO_EXITFN
         install_exitfn();
 #endif
@@ -3108,6 +3147,143 @@ static void dump_expect_struct(uint64_t el) {
     dump_mem("盾 __TEXT 头 64 字节 @", g_base, 64);
 }
 
+// ---------------------------------------------------------------- 检查表本体
+//
+// 0x6f3d54 是检查表的汇总函数：它拿 param_1 = 检查表对象，依次遍历四组向量，
+// 对每一项调对应类的"判定"函数，任一项非零就返回 1（报警）。四组向量在对象里的
+// 位置和元素大小可以直接从它的反汇编读出来：
+//
+//   +0x10 元素 0x30  → 0x6f2454（比较某个指针指向的 int 与期望 int）
+//                     元素 +0x18 = 启用字节，+0x20 = 指针，+0x28 = 期望 int
+//   +0x28 元素 0x58  → 0x6f32d4
+//   +0x40 元素 0x18  → 0x6f2118（dlsym 一个名字，命中的地址必须落已加载镜像里）
+//   +0x58 元素 0x20  → 0x6f3180（某个指针必须落在已加载镜像里）
+//
+// 单例指针存在 +0x8509d0（惰性创建）。这里只读不写，先看清表里到底有什么、
+// 哪一项在报警——这是"从数据侧让判定通过"唯一能下手的地方。
+static void dump_mem_safe(const char *label, uint64_t addr, int n) {
+    static const char hx[] = "0123456789abcdef";
+    unsigned char m[192];
+    if (n > (int)sizeof(m)) n = (int)sizeof(m);
+    char buf[640];
+    out_t o = { buf, buf + sizeof(buf) - 1 };
+    o_s(&o, label); o_h(&o, addr); o_s(&o, ": ");
+    if (!safe_read(addr, m, (size_t)n)) {
+        o_s(&o, "<不可读>\n");
+        emit_ts(buf, (size_t)(o.p - buf));
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        o_ch(&o, hx[m[i] >> 4]); o_ch(&o, hx[m[i] & 15]); o_ch(&o, ' ');
+    }
+    o_ch(&o, '\n');
+    emit_ts(buf, (size_t)(o.p - buf));
+}
+
+static void probe_checks(uint64_t el) {
+    static int done;
+    if (done || !g_base || el < 20) return;
+    uint64_t p = 0;
+    if (!safe_read(g_base + 0x8509d0, &p, 8)) { say_hex("读不到检查表槽=", g_base + 0x8509d0); done = 1; return; }
+    if (p < 0x100000000ULL || p > 0x800000000ULL) return;   // 还没建出来，下一拍再看
+    done = 1;
+    say_hex("检查表单例=", p);
+    dump_mem_safe("  单例头 0x80 @", p, 0x80);
+
+    static const uint64_t voff[4] = { 0x10, 0x28, 0x40, 0x58 };
+    static const uint64_t vsz[4]  = { 0x30, 0x58, 0x18, 0x20 };
+    for (int k = 0; k < 4; k++) {
+        uint64_t b = 0, e = 0;
+        if (!safe_read(p + voff[k], &b, 8)) continue;
+        if (!safe_read(p + voff[k] + 8, &e, 8)) continue;
+        if (e < b || b < 0x100000000ULL || e > 0x800000000ULL) continue;
+        uint64_t n = (e - b) / vsz[k];
+        char lab[48];
+        out_t o = { lab, lab + sizeof(lab) - 1 };
+        o_s(&o, "向量"); o_d(&o, k); o_s(&o, " 条数=");
+        o_ch(&o, '\0');
+        say_hex(lab, n);
+        say_hex("  起=", b);
+        for (uint64_t i = 0; i < n && i < 3; i++) {
+            uint64_t it = b + i * vsz[k];
+            dump_mem_safe("  项 @", it, (int)vsz[k]);
+            if (vsz[k] == 0x30) {
+                uint64_t vt = 0, f = 0;
+                uint64_t a = 0, ex = 0;
+                if (safe_read(it, &vt, 8) && vt > 0x100000000ULL && safe_read(vt + 0x10, &f, 8))
+                    say_hex("    vtable+0x10=", f);
+                // 判定函数 0x6f2454 的语义：*ptr == 期望值 才算通过
+                if (safe_read(it + 0x20, &a, 8) && a > 0x100000000ULL) {
+                    uint32_t cur = 0;
+                    if (safe_read(it + 0x28, &ex, 8) && safe_read(a, &cur, 4)) {
+                        say_hex("    当前 int=", cur);
+                        say_hex("    期望 int=", ex);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 0x43cc38 起把这 0x38 字节按线性关系解混淆：
+//
+//   期望哈希 = a4 - a3*a6
+//   哈希函数 = S + a6*a0 - a1 + a5 - a4*a6
+//   参数 x0  = S + a6*a0 - a1 + a2 - a6*a1
+//   参数 x1  = a3 - a2*a6
+//
+// 真实地址是 S = [0x848fb8] - K，K 是盾的每进程基准，事先不知道。
+// 但结构本身就在盾的镜像里，而上面四条给了一组很强的自洽条件：算出来的
+// 哈希函数必须落在盾的 __TEXT 里，x0/x1 必须可读。所以不用求 K，
+// 直接在镜像里找满足条件的 0x38 字节块即可。只读不写。
+static void probe_selfcheck(uint64_t el) {
+    static int done;
+    if (done || !g_base || el < 28) return;
+    done = 1;
+
+    uint64_t E = 0;
+    if (!safe_read(g_base + 0x848fb8, &E, 8) || !E) { say("读不到 0x848fb8\n"); return; }
+    say_hex("E=", E);
+
+    const uint64_t IMG = 0x8c0000;
+    uint8_t *buf = (uint8_t *)malloc(IMG + 0x40);
+    if (!buf) { say("内存不足\n"); return; }
+    for (uint64_t off = 0; off < IMG; off += 0x4000) {
+        uint64_t want = (IMG - off) < 0x4000 ? (IMG - off) : 0x4000;
+        safe_read(g_base + off, buf + off, (size_t)want);
+    }
+
+    int found = 0;
+    for (uint64_t off = 0; off + 0x38 <= IMG; off += 8) {
+        const uint64_t *a = (const uint64_t *)(buf + off);
+        uint64_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4], a5 = a[5], a6 = a[6];
+        if (!a0 && !a1 && !a2 && !a3 && !a4 && !a6) continue;
+        uint64_t S = g_base + off;
+        uint64_t fn = S + a6 * a0 - a1 + a5 - a4 * a6;
+        if (fn < g_base + 0x8000 || fn >= g_base + 0x80c000) continue;
+        uint64_t x0 = S + a6 * a0 - a1 + a2 - a6 * a1;
+        uint64_t x1 = a3 - a2 * a6;
+        uint8_t t = 0;
+        if (!safe_read(x1, &t, 1)) continue;
+        if (!safe_read(x0, &t, 1)) continue;
+        found++;
+        say_hex("候选 off=", off);
+        say_hex("  fn=", fn - g_base);
+        say_hex("  期望=", a4 - a3 * a6);
+        if (fn - g_base == 0x65bfa8) {
+            say_hex("  ★ 命中的就是自检用的那个 xxHash，x0=", x0 - g_base);
+            say_hex("     x1=", x1);
+            if (E > S) say_hex("     K=", E - S);
+            dump_mem_safe("     结构 0x38 @", S, 0x38);
+            dump_mem_safe("     x1 起 32 字节 @", x1, 32);
+        }
+        if (found >= 400) break;
+    }
+    say_hex("候选总数=", (uint64_t)found);
+    if (!found) say("没找到自洽的自检结构\n");
+    free(buf);
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
@@ -3238,7 +3414,8 @@ static void *heartbeat(void *arg) {
             dump_threads(g_snap_at[g_snap_i]);
             g_snap_i++;
         }
-        dump_expect_struct(el);
+        probe_selfcheck(el);
+        probe_checks(el);
         patch_exit_after_selfcheck(el);
         if (el - last_hb >= 50) {
             last_hb = el;
@@ -3251,8 +3428,10 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
             o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
             o_s(&o, " 拦下映射="); o_d(&o, g_mmap_blocked);
+#if DO_DIENEXT
             o_s(&o, " 转发="); o_d(&o, (long long)g_dn_hits);
             o_s(&o, " 改成返回="); o_d(&o, (long long)g_dn_fixed);
+#endif
             o_s(&o, " 跳过返回="); o_h(&o, g_skip_ret);
             o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
             o_s(&o, " 退出函数="); o_d(&o, (long long)g_exitfn_hits);
