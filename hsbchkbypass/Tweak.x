@@ -25,6 +25,7 @@
 #import <string.h>
 #import <stdlib.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <pthread.h>
 #import <signal.h>
 #import <setjmp.h>
@@ -51,7 +52,7 @@
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
-#define DO_VTPATCH  1   // 保留真实检查项，只换它们的判定函数
+#define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_SETFLAG  0   // 反过来：在判定之前把它设成非零（该位置只读，写入即 SIGBUS）
 #define DO_SETFLAG_AT 20  // 在第几毫秒写
@@ -60,6 +61,7 @@
 #define DO_CTRLEXIT 0   // 自己发一次裸 exit(7)，用来验证这条系统调用是否真的有效
 #define DO_NORECORD 0   // 1 = 完全不记录系统调用，用来判断探针开销是否拖垮启动
 #define DO_FILELOG  0   // 记 open/access 的返回值（怀疑它在小栈线程上溢出）
+#define DO_ENVHOOK  0   // 挂 libc 的 getenv/uname（实测会让盾提前动手）
 #define DO_EXITFN   0   // [0x848d70] 是减法基准值不是函数指针，按函数指针改写会立刻崩
 #define DO_DN_PARK  1   // 1=让那条线程原地停住 2=正常返回给调用方
 #define DO_DIENEXT  1   // 把退出函数末尾的"下一站"换成按栈帧正常收尾的替身
@@ -2922,6 +2924,64 @@ static uint64_t footprint_kb(void) {
     return (uint64_t)(vi.phys_footprint / 1024);
 }
 
+
+// ---------------------------------------------------------------- 看 RASP 这一层
+//
+// 盾是 C++ 核心，但把结论交给 App 走的是 RASPFramework 的 ObjC 接口。
+// 汇丰中国那套（ZDefend）就是靠 hook ObjC 层把威胁详情读出来的。
+// 香港这套先看清楚有哪些类、哪些方法，再决定读哪个。
+static int name_hits(const char *n) {
+    static const char *kw[] = {"RASP","Security","Blocker","Strategy","Promon","Threat","Jailbreak",NULL};
+    for (int i = 0; kw[i]; i++) if (strstr(n, kw[i])) return 1;
+    return 0;
+}
+
+static void dump_objc_classes(void) {
+    int cnt = objc_getClassList(NULL, 0);
+    if (cnt <= 0) { say("取不到类列表\n"); return; }
+    Class *cls = (Class *)malloc(sizeof(Class) * (size_t)cnt);
+    if (!cls) return;
+    cnt = objc_getClassList(cls, cnt);
+    int shown = 0;
+    for (int i = 0; i < cnt && shown < 60; i++) {
+        const char *n = class_getName(cls[i]);
+        if (!n || !name_hits(n)) continue;
+        shown++;
+        char lb[192];
+        out_t o = { lb, lb + sizeof(lb) - 1 };
+        o_s(&o, "类 "); o_s(&o, n); o_ch(&o, '\n');
+        emit_ts(lb, (size_t)(o.p - lb));
+        if (1) continue;   // 先只要类名：方法表太慢，会把心跳线程占住几百毫秒
+        unsigned mc = 0;
+        Method *ms = class_copyMethodList(cls[i], &mc);
+        if (ms) {
+            for (unsigned k = 0; k < mc && k < 40; k++) {
+                const char *sn = sel_getName(method_getName(ms[k]));
+                char b2[160];
+                out_t o2 = { b2, b2 + sizeof(b2) - 1 };
+                o_s(&o2, "    -"); o_s(&o2, sn); o_ch(&o2, '\n');
+                emit_ts(b2, (size_t)(o2.p - b2));
+            }
+            free(ms);
+        }
+        // 类方法（很多单例是 +shared 形式）
+        Class meta = object_getClass((id)cls[i]);
+        unsigned mm = 0;
+        Method *mm2 = class_copyMethodList(meta, &mm);
+        if (mm2) {
+            for (unsigned k = 0; k < mm && k < 20; k++) {
+                const char *sn = sel_getName(method_getName(mm2[k]));
+                char b3[160];
+                out_t o3 = { b3, b3 + sizeof(b3) - 1 };
+                o_s(&o3, "    +"); o_s(&o3, sn); o_ch(&o3, '\n');
+                emit_ts(b3, (size_t)(o3.p - b3));
+            }
+            free(mm2);
+        }
+    }
+    free(cls);
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
@@ -2939,6 +2999,29 @@ static void *heartbeat(void *arg) {
     for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
         uint64_t el = rec_ms(read_pct());
+        {
+            static int said_cls;
+            {
+            // objc_getClassList 一次遍历会让盾在 456ms 直接 raise(SIGSEGV)，
+            // 所以改成逐个按名字查——开销只有几次哈希，不碰全局类表。
+            static int said_cls;
+            if (!said_cls && el >= 400) {
+                said_cls = 1;
+                static const char *cand[] = {
+                    "AppSecurityEvent","AppSecurityState","AppSecurityEventProvider",
+                    "UntrustedBlockerConfiguration","JailbrokenStrategy","RASPManager",
+                    "RASP","PromonShield","ShieldManager", NULL };
+                for (int i = 0; cand[i]; i++) {
+                    Class c = objc_getClass(cand[i]);
+                    char lb[96];
+                    out_t o = { lb, lb + sizeof(lb) - 1 };
+                    o_s(&o, "类 "); o_s(&o, cand[i]); o_s(&o, c ? " 有" : " 无");
+                    o_ch(&o, '\n');
+                    emit_ts(lb, (size_t)(o.p - lb));
+                }
+            }
+        }
+        }
 #if DO_DIENEXT
         // 盾在运行期会改写自己的代码（App 里带着 __ostekake 段）。所以"磁盘上
         // 0x5d848c 是 bl 0x774770"不能直接当成运行期事实：先把那一刻的字节打出来比。
@@ -3082,7 +3165,9 @@ __attribute__((constructor)) static void ctor(void) {
     }
     fill_img_tab();
     install_kill_hooks();
+#if DO_ENVHOOK
     install_env_hooks();
+#endif
     if (DO_HOOKCHK) check_hooks();
     compare_self_with_disk();
     if (DO_DISKCHECK) { pthread_t dt; pthread_create(&dt, NULL, disk_check, NULL); }
