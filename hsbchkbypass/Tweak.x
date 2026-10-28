@@ -243,6 +243,10 @@ static void emit_ts(const char *s, size_t n);
 //   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
 //   5d87d4  blr x8              ; 否则调退出
 // 把 tbnz 换成无条件跳往"正常返回"，这一次判定就等于永远通过。
+// 0.0.262：0.0.261 让理由码 5 消失了，但判定本身仍返回失败（退出调用者变成
+// +0x5d87d8）。这一步直接把 0x5d87a4 的 tbnz 换成无条件跳往成功出口。
+// Round 21 单独做过这一步会挨 SIGILL，但现在退出守护、虚拟机成功出口都在，
+// 死法可能已经不同。
 #define DO_VERDICT_OK 0
 // 0.0.224：Round 4 当场读出过检查表：3 项里第 1 项报警，判定函数是 0x6f3d54，返回 1。
 // 现在能改代码了，直接把这一项改成恒返回 0——这是让判定真正通过，不是拦退出。
@@ -275,7 +279,10 @@ static void emit_ts(const char *s, size_t n);
 // 两个事件管理器的 performSecurityChecks 都是 mov w0,#1 之后 b 0x38d974，
 // 把那个 b 换成 ret，就变成"直接回答 1，完全不进检查"。
 // +load 保持原样，引擎照常初始化，避免半初始化状态引来别的崩溃。
-#define DO_SHIELD_NOLOAD 1
+// 0.0.268：0.0.241 起把两个 performSecurityChecks 改成直接返回 1，
+// 等于检查根本没跑、判定拿不到结果——这本身就可能制造出"无说明的失败"。
+// 这一版把它关掉，看检查链（0x5d883c / 0x5d8ed0）会不会真的跑起来。
+#define DO_SHIELD_NOLOAD 0
 // 0.0.223：盾会通过自己的网关装信号处理器（sigaction = 46），把我们的换掉。
 // 在网关里把 46 号整体挡掉之后，它永远装不上，我们的故障处理函数就一直有效。
 // libc 的 sigaction 走 libSystem，不经这个网关，所以不会误伤我们自己。
@@ -4804,6 +4811,7 @@ static void vm_rec(uint64_t kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d
 }
 
 static void dump_got(void);
+void vm_state_log(uint32_t st);
 
 __attribute__((noinline, used)) void vm_report_log(uint64_t obj, uint64_t fn) {
     // 0.0.258：构造函数里读这些槽太早，那时还是密文。探针在 71ms 才跑，
@@ -4884,6 +4892,16 @@ uint64_t g_vm_gt, g_vm_fall;   // 只在桩的内联汇编里引用，必须非 
 static volatile uint64_t g_vm_states;
 #define VM_STATE_CAP 60000
 
+__attribute__((noinline, used)) void vm_state_log2(uint32_t st, uint64_t ra) {
+    uint64_t n = g_vm_states;
+    if (n == 0 && g_gwfd >= 0) {
+        uint64_t r[6] = { 0x564D434100000001ULL, ra, 0, up_ms() - g_t0, 0,
+                          (uint64_t)g_base };
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+    vm_state_log(st);
+}
+
 __attribute__((noinline, used)) void vm_state_log(uint32_t st) {
     uint64_t n = g_vm_states;
     if (n >= VM_STATE_CAP) return;
@@ -4906,7 +4924,8 @@ __attribute__((naked)) static void vm_state_stub(void) {
         "stp x0,  x1,  [sp, #0x10]\n"
         "stp x8,  x9,  [sp, #0x20]\n"
         "mov w0, w8\n"
-        "bl _vm_state_log\n"
+        "mov x1, x30\n"
+        "bl _vm_state_log2\n"
         "ldp x8,  x9,  [sp, #0x20]\n"
         "ldp x0,  x1,  [sp, #0x10]\n"
         "ldp x29, x30, [sp, #0x00]\n"
@@ -4971,6 +4990,8 @@ static void dump_thunks(void) {
 static const uint32_t g_got_slots[] = {
     0x84c098, 0x80c2f8, 0x80c300, 0x80c308, 0x84c948,
     0x84c8a8, 0x84c700, 0x84c768, 0x84c580, 0x84c8f0,
+    // 0.0.264：0x713720 内部调的三个桩，静态绑定表里查不到，只能运行期解。
+    0x84c000, 0x84bf88, 0x84c020,
 };
 
 static void dump_got(void) {
@@ -4993,6 +5014,304 @@ static void dump_got(void) {
         r[3] = n0; r[4] = n1; r[5] = (uint64_t)g_base;
         raw_write(g_gwfd, r, sizeof(r));
     }
+}
+
+// 0.0.259：顺着"上报链"往上追。
+//
+// 0x712668 是事件的上报通道（互斥量、条件变量、属性读写），不是检测。
+// 真正干活的是 0x5d8758 传进去的回调 0x5d883c：
+//   5d888c  bl 0x5d8ed0    ← 检查表执行器
+//   5d8894  bl 0x6adf2c    ← 取一个对象
+//   5d88d0  blr x8         ← 虚表调用，疑似真正的检查
+// 这一版在三个点插桩，一次看清谁被调用、调到了哪里。
+#define DO_CHAIN_LOG 1
+// 0.0.261：离线摊平之后发现，"0x713720 返回 0"会让虚拟机当场结束，
+// 返回非零才一路走到原因码 5。把那次 csel 抹掉，等于固定走成功出口。
+#define DO_VM_FORCE_OK 0
+// 0.0.263：上一版只是把分派结果改成"w0 为零"那条，w0 本身仍是非零。
+// 这一版直接让 0x713720 返回 0，配合它真实被调用时的上下文再看一次。
+#define DO_GATE_RET_ZERO 0
+// 0.0.264：不改行为，只记录 0x713720 的返回值，并解出它内部调的三个桩。
+#define DO_GATE713720_PROBE 1
+// 0.0.266：记录 0x713720 里那次 open 的路径与标志。
+#define DO_OPEN_PATH_LOG 1
+// 0.0.267：记录 0x713720 里那次 open 的返回值。
+#define DO_FD_LOG 1
+#define OFF_GATE713720 0x713720ULL
+#define OFF_VM_CSEL 0x712e10ULL
+uint64_t g_ch_cb, g_ch_ct, g_ch_vt;
+static volatile uint64_t g_cb_n, g_ct_n, g_chvt_n;
+
+static void chain_rec(uint64_t tag, uint64_t a, uint64_t b) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4348414900000000ULL | (tag & 0xff), a, b,
+                      up_ms() - g_t0, 0, (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((noinline, used)) void ch_cb_log(uint64_t x19) { g_cb_n++; chain_rec(1, x19, g_cb_n); }
+__attribute__((noinline, used)) void ch_ct_log(uint64_t x0)  { g_ct_n++; chain_rec(2, x0, g_ct_n); }
+__attribute__((noinline, used)) void ch_vt_log(uint64_t target, uint64_t self, uint64_t idx) {
+    g_chvt_n++; chain_rec(3, target, self); chain_rec(4, idx, g_chvt_n);
+}
+
+__attribute__((naked)) static void ch_cb_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "mov x0, x8\n"
+        "bl _ch_cb_log\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "sub sp, sp, #0x80\n"
+        "stp x26, x25, [sp, #0x30]\n"
+        "stp x24, x23, [sp, #0x40]\n"
+        "stp x22, x21, [sp, #0x50]\n"
+        "adrp x16, _g_ch_cb@PAGE\n"
+        "ldr x16, [x16, _g_ch_cb@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+__attribute__((naked)) static void ch_ct_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "bl _ch_ct_log\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "sub sp, sp, #0x40\n"
+        "stp x20, x19, [sp, #0x20]\n"
+        "stp x29, x30, [sp, #0x30]\n"
+        "adrp x16, _g_ch_ct@PAGE\n"
+        "ldr x16, [x16, _g_ch_ct@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+__attribute__((naked)) static void ch_vt_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x60\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "str x22,      [sp, #0x30]\n"
+        "mov x0, x8\n"                 // 目标
+        "mov x1, x22\n"                // 对象
+        "ldr x2, [sp, #0x30]\n"
+        "bl _ch_vt_log\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x60\n"
+        "blr x8\n"
+        "adrp x16, _g_ch_vt@PAGE\n"
+        "ldr x16, [x16, _g_ch_vt@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static void patch_entry_stub(uintptr_t addr, void *stub) {
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("链接探针：改页失败 kr=", (unsigned long long)kr); return; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+}
+
+// 0.0.264：记录 0x713720 的返回值。
+//
+// 虚拟机第一次分派（0x712dcc）构造完事件之后调 0x713720，然后按返回值分叉：
+// 返回非零走 0x564fec1b（最终到原因码 5），返回 0 走 0x07480f1e。
+// 把每个分支的目标放进全局，避开 ±128MB 的分支范围。
+uint64_t g_g713720_gt, g_g713720_eq;
+static volatile uint64_t g_g713720_n;
+
+__attribute__((noinline, used)) void gate713720_log(uint64_t v) {
+    // 0.0.265：构造函数里读 GOT 太早（还是密文），挪到这里——此刻 71ms，已经填好。
+    { static int once; if (!once) { once = 1; dump_got(); dump_thunks(); } }
+    g_g713720_n++;
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4737313300000001ULL, v, g_g713720_n, up_ms() - g_t0, 0,
+                      (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void gate713720_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "mov x0, x0\n"
+        "bl _gate713720_log\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "cmp w0, #0x0\n"
+        "adrp x16, _g_g713720_eq@PAGE\n"
+        "ldr x16, [x16, _g_g713720_eq@PAGEOFF]\n"
+        "adrp x17, _g_g713720_gt@PAGE\n"
+        "ldr x17, [x17, _g_g713720_gt@PAGEOFF]\n"
+        "csel x16, x17, x16, ne\n"
+        "br x16\n"
+    );
+}
+
+static int install_gate713720_probe(void) {
+    if (!g_base) return 0;
+    g_g713720_eq = g_base + 0x712e00ULL;   // w0 == 0：成功分支
+    g_g713720_gt = g_base + 0x712e08ULL;   // w0 != 0：失败分支
+    uintptr_t addr = g_base + 0x712dfcULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("71桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&gate713720_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("71桩：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.266：0x713720 读文件失败，是原因码 5 的源头。
+//
+// 它先用 0x2f5fbc / 0x94580 拼出一个路径字符串，再调 0x693aa0（open 封装，
+// 只认 x0=路径、w1=标志），返回负值就切到失败状态。这里把路径和标志记下来，
+// 就知道它到底要打开什么。
+uint64_t g_open_resume;
+static volatile uint64_t g_open_n;
+
+__attribute__((noinline, used)) void open_path_log(uint64_t str, uint64_t flags) {
+    g_open_n++;
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4F50454E00000001ULL, str, flags, g_open_n,
+                      up_ms() - g_t0, (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+    if (!str) return;
+    for (int i = 0; i < 5; i++) {
+        uint64_t w = 0;
+        if (!safe_read(str + (uint64_t)i * 8, &w, 8)) break;
+        uint64_t q[6] = { 0x4F50454E00000002ULL, (uint64_t)i, w, 0, 0, (uint64_t)g_base };
+        raw_write(g_gwfd, q, sizeof(q));
+    }
+}
+
+__attribute__((naked)) static void open_path_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x60\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x2,  x3,  [sp, #0x20]\n"
+        "stp x8,  x9,  [sp, #0x30]\n"
+        "str x10,      [sp, #0x40]\n"
+        "bl  _open_path_log\n"
+        // 参数原样还原后再记录
+        "ldp x8,  x9,  [sp, #0x30]\n"
+        "ldp x2,  x3,  [sp, #0x20]\n"
+        "ldp x10, x11, [sp, #0x10]\n"
+        "mov x1, x11\n"
+        "mov x0, x10\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x60\n"
+        // 重放被覆盖的四条序言
+        "sub sp, sp, #0x30\n"
+        "stp x29, x30, [sp, #0x20]\n"
+        "add x29, sp, #0x20\n"
+        "stur x0, [x29, #-0x8]\n"
+        "adrp x16, _g_open_resume@PAGE\n"
+        "ldr x16, [x16, _g_open_resume@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_open_path_probe(void) {
+    if (!g_base) return 0;
+    g_open_resume = g_base + 0x693ab0ULL;   // stur w1,[x29,#-0xc]
+    uintptr_t addr = g_base + 0x693aa0ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("开文件桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&open_path_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("开文件桩：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.267：0.693aa0 是整个盾共用的 open 封装，抓到的 16 次不全来自
+// 0x713720。0x7138a0（"mov x20, x0"）只在 0x713720 的这条路上执行，
+// 在那里记 x0，就是这次 open 的返回值：非负是 fd，负数是 errno 取反。
+uint64_t g_fd_resume;
+static volatile uint64_t g_fd_n;
+
+__attribute__((noinline, used)) void fd_log(uint64_t fd) {
+    g_fd_n++;
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4644524554000001ULL, fd, g_fd_n, up_ms() - g_t0, 0,
+                      (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void fd_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x2,  x3,  [sp, #0x20]\n"
+        "bl _fd_log\n"
+        "ldp x2,  x3,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "mov x20, x0\n"
+        "adrp x16, _g_fd_resume@PAGE\n"
+        "ldr x16, [x16, _g_fd_resume@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_fd_probe(void) {
+    if (!g_base) return 0;
+    g_fd_resume = g_base + 0x7138a4ULL;
+    uintptr_t addr = g_base + 0x7138a0ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("fd桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&fd_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("fd桩：已装到 ", addr);
+    return 1;
 }
 
 static int install_vm_desc_probe(void) {
@@ -5271,7 +5590,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.258 启动（延后读 GOT）=====\n");
+    say("===== 0.0.268 启动（关掉跳过安全检查）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -5284,6 +5603,34 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_VM_STATE_LOG
     install_vm_state_probe();
+#endif
+#if DO_GATE713720_PROBE
+    install_gate713720_probe();
+#endif
+#if DO_OPEN_PATH_LOG
+    install_open_path_probe();
+#endif
+#if DO_FD_LOG
+    install_fd_probe();
+#endif
+#if DO_GATE_RET_ZERO
+    patch_word(g_base + OFF_GATE713720,     0x52800000U);   // mov w0, #0
+    patch_word(g_base + OFF_GATE713720 + 4, 0xd65f03c0U);   // ret
+#endif
+#if DO_VM_FORCE_OK
+    // 0x712dfc: cmp w0,#0（0x713720 的返回值）
+    // 0x712e10: csel w8, w9, w8, ne —— 非零就选 0x564fec1b（失败链的起点）
+    // 换成 nop 之后 w8 永远是 0x0748f1e，虚拟机当场结束，不再走原因码 5。
+    patch_word(g_base + OFF_VM_CSEL, WORD_NOP);
+#endif
+#if DO_CHAIN_LOG
+    g_ch_cb = g_base + 0x5d884cULL;   // 回调被覆盖四条之后的续行
+    g_ch_ct = g_base + 0x5d8ee0ULL;   // 检查表执行器续行
+    g_ch_vt = g_base + 0x5d88d4ULL;   // 虚表调用之后
+    patch_entry_stub(g_base + 0x5d883cULL, (void *)&ch_cb_stub);
+    patch_entry_stub(g_base + 0x5d8ed0ULL, (void *)&ch_ct_stub);
+    patch_entry_stub(g_base + 0x5d88d0ULL, (void *)&ch_vt_stub);
+    say("链接探针：已装（回调 / 检查表 / 虚表调用）\n");
 #endif
     dump_thunks();
     dump_got();

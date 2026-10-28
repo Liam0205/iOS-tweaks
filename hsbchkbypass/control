@@ -1,6 +1,6 @@
 Package: page.0x01.hsbchkbypass
 Name: HSBCHKBypass-汇丰香港反检测-rootless
-Version: 0.0.258
+Version: 0.0.268
 Architecture: iphoneos-arm64
 Description: 让汇丰香港（hk.com.hsbc.hsbchkmobilebanking）在越狱设备上正常运行。目前仍在排查阶段，尚未有可用版本。
 Maintainer: Liam
