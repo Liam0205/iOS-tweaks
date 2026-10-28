@@ -503,6 +503,7 @@ static void emergency_line(const rec_t *r) {
     out_t o = { buf, buf + sizeof(buf) - 1 };
     o_s(&o, "!! exit code="); o_u(&o, r->a0);
     o_s(&o, " 调用点=+");     o_h(&o, r->caller - g_base);
+    o_s(&o, " pid=");         o_d(&o, getpid());
     o_s(&o, " tid=");         o_u(&o, r->tid);
     o_s(&o, " 时刻=");         o_u(&o, g_ts0 && r->ts > g_ts0 ? (r->ts - g_ts0) / 24000 : 0);
     o_s(&o, "ms 已重定向=");   o_u(&o, (unsigned long long)g_redirects);
@@ -2457,7 +2458,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.165 启动（让共享缓存的整体映射失败）=====\n");
+    say("===== 0.0.166 启动（退出记录带 pid，用于区分重新拉起）=====\n");
 
     try_takeover();
     {

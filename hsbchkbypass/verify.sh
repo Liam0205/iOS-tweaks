@@ -94,11 +94,26 @@ for i in \$(seq 1 300); do
     break
   fi
 done
+# 按 pid 统计存活时间。系统会在 App 死后再拉起一次，把两次的存活加起来会得出
+# "活了 5-8 秒"这种假结论——这个坑在 Round 9 踩过。注意这条 heredoc 没有引号，
+# 远端 shell 要用的 $ 全部得写成 \$，否则会在本机先展开。
+sleep 0.3
+FIRST=\$(ps -eo pid,args | grep -F 'HongKong.app/HongKong' | grep -v grep | awk '{print \$1}' | head -1)
+LAST="\$FIRST"; T=0; CHANGES=0
 for i in \$(seq 1 $SECS); do
   sleep 1
-  ps -eo args | grep -F 'HongKong.app/HongKong' | grep -v grep >/dev/null || { echo "第 \${i}s 退出"; exit 0; }
+  CUR=\$(ps -eo pid,args | grep -F 'HongKong.app/HongKong' | grep -v grep | awk '{print \$1}' | head -1)
+  if [ -n "\$FIRST" ] && [ "\$CUR" = "\$FIRST" ]; then T=\$((T+1)); fi
+  if [ -n "\$CUR" ] && [ "\$CUR" != "\$LAST" ]; then CHANGES=\$((CHANGES+1)); fi
+  LAST="\$CUR"
 done
-echo "存活 ${SECS}s"
+if [ -z "\$FIRST" ]; then
+  echo "没抓到首个 pid"
+elif [ "\$CHANGES" -gt 0 ]; then
+  echo "首个 pid \$FIRST 只活到第 \${T}s（期间 pid 又出现过 \$CHANGES 次，那是系统重新拉起的另一个进程）"
+else
+  echo "首个 pid \$FIRST 存活 \${T}s（pid 没变过）"
+fi
 EOF
 done
 
