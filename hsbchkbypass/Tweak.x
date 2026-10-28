@@ -237,7 +237,7 @@ static void emit_ts(const char *s, size_t n);
 // 0.0.250：把"每一次上报"都记下来：原因码、说明指针、说明前 8 字节、调用者，
 // 以及当时 SIGILL 的处置函数是不是还是我们的。探针每次都会把我们的处理器重装一遍，
 // 所以它同时也是"盾换完处理器之后我们补装回去"的唯一时机。
-#define DO_REPORT_PROBE 1
+#define DO_REPORT_PROBE 0
 // 0.0.214：5d8758 这个函数的形状是
 //   5d87a0  bl  0x712668        ; 判定，结果在 w0
 //   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
@@ -247,7 +247,7 @@ static void emit_ts(const char *s, size_t n);
 // +0x5d87d8）。这一步直接把 0x5d87a4 的 tbnz 换成无条件跳往成功出口。
 // Round 21 单独做过这一步会挨 SIGILL，但现在退出守护、虚拟机成功出口都在，
 // 死法可能已经不同。
-#define DO_VERDICT_OK 0
+#define DO_VERDICT_OK 1
 // 0.0.224：Round 4 当场读出过检查表：3 项里第 1 项报警，判定函数是 0x6f3d54，返回 1。
 // 现在能改代码了，直接把这一项改成恒返回 0——这是让判定真正通过，不是拦退出。
 #define DO_CHECKITEM_OK 0
@@ -4641,7 +4641,7 @@ static int install_report_probe(void) {
 // 它做两件事再原样返回：把调用者记下来；把我们的故障处理器重新装一遍。
 // 后者是关键——盾可能在 40ms 之后用自己的裸系统调用把处理器换掉，
 // 而我们的线程那时已经停了，没有别的机会再装一次。
-#define DO_EXITFN_GUARD 1
+#define DO_EXITFN_GUARD 0
 static volatile uint64_t g_guard_hits;
 
 // 0.0.251：0.0.250 证明上报那一刻 SIGILL 的处置函数还是我们的，可致命的那次
@@ -4798,7 +4798,7 @@ static int install_exitfn_guard(void) {
 // 在 0x7133d0 开头插桩，把这四件事记下来：对象指针、虚表项、说明指针、
 // 以及两者开头几十个字节。这四行指令正好 16 字节，续行点 0x7133e0
 // （mov w0,#5）完好，桩里原样重放即可。
-#define DO_VM_DESC_LOG 1
+#define DO_VM_DESC_LOG 0
 static uint64_t g_vm_join;
 static volatile uint64_t g_vm_hits;
 
@@ -4887,7 +4887,7 @@ __attribute__((naked)) static void vm_desc_stub(void) {
 //   7126ec  b.gt 0x712788
 //   7126f0  mov w8, #0x12ec
 // 桩里按分支结果分别重放到 0x7126f4 或 0x712788。
-#define DO_VM_STATE_LOG 1
+#define DO_VM_STATE_LOG 0
 uint64_t g_vm_gt, g_vm_fall;   // 只在桩的内联汇编里引用，必须非 static
 static volatile uint64_t g_vm_states;
 #define VM_STATE_CAP 60000
@@ -5032,17 +5032,20 @@ static void dump_got(void) {
 // 这一版直接让 0x713720 返回 0，配合它真实被调用时的上下文再看一次。
 #define DO_GATE_RET_ZERO 0
 // 0.0.264：不改行为，只记录 0x713720 的返回值，并解出它内部调的三个桩。
-#define DO_GATE713720_PROBE 1
+#define DO_GATE713720_PROBE 0
 // 0.0.266：记录 0x713720 里那次 open 的路径与标志。
-#define DO_OPEN_PATH_LOG 1
+#define DO_OPEN_PATH_LOG 0
 // 0.0.267：记录 0x713720 里那次 open 的返回值。
-#define DO_FD_LOG 1
+#define DO_FD_LOG 0
 // 0.0.269：记录 0x713720 里那次 4 字节 read 的参数与结果。
-#define DO_READ_LOG 1
+#define DO_READ_LOG 0
 // 0.0.270：记录 0x713720 自己的状态跳转。
-#define DO_VM2_LOG 1
+#define DO_VM2_LOG 0
 // 0.0.271：在 0x713720 的关键位置放"到此一游"，确定它停在哪一步。
-#define DO_MARKS 1
+// 0.0.273：0.0.272 证明死在 0x713888 之后、0x7138a4 之前这三条调用里。
+// 用一个桩覆盖 0x713890..0x7138a0（add / bl 0x94580 / mov w1,#0 / bl open），
+// 每步之间各留一个记录点，就能确定是哪一步不返回。
+#define DO_MARKS 0
 #define OFF_GATE713720 0x713720ULL
 #define OFF_VM_CSEL 0x712e10ULL
 uint64_t g_ch_cb, g_ch_ct, g_ch_vt;
@@ -5331,7 +5334,7 @@ static int install_fd_probe(void) {
 //   bl  read
 //   cmp x0, #0x4    ; 必须刚好读到 4 字节
 // 在它前面插桩，把 fd / 缓冲区 / 长度、以及读回来的字节都记下来。
-uint64_t g_read_target, g_read_resume;
+uint64_t g_read_target, g_read_resume, g_read_next;
 static volatile uint64_t g_read_n;
 
 __attribute__((noinline, used)) void rd_log(uint64_t fd, uint64_t buf, uint64_t len) {
@@ -5370,8 +5373,15 @@ __attribute__((naked)) static void rd_stub(void) {
         "ldr x0, [sp, #0x28]\n"
         "ldp x29, x30, [sp, #0x00]\n"
         "add sp, sp, #0x50\n"
-        "adrp x16, _g_read_resume@PAGE\n"
-        "ldr x16, [x16, _g_read_resume@PAGEOFF]\n"
+        // 0.0.280：本桩的 16 字节覆盖了 0x713908–0x713914 那三条
+        // （cmp x0,#4 / mov w8 / movk w8），原来跳回 0x713908 等于跳进
+        // 自己的字面量。这里把这四条原样重放，再落到 0x713918 的 b。
+        "cmp x0, #0x4\n"
+        "mov w8, #0xafbe\n"
+        "movk w8, #0x1213, lsl #16\n"
+        "csel w9, w8, w26, eq\n"
+        "adrp x16, _g_read_next@PAGE\n"
+        "ldr x16, [x16, _g_read_next@PAGEOFF]\n"
         "br x16\n"
     );
 }
@@ -5379,7 +5389,8 @@ __attribute__((naked)) static void rd_stub(void) {
 static int install_read_probe(void) {
     if (!g_base) return 0;
     g_read_target = g_base + 0x4365d4ULL;   // read 的裸系统调用封装
-    g_read_resume = g_base + 0x713908ULL;   // cmp x0, #0x4
+    g_read_resume = g_base + 0x713908ULL;
+    g_read_next   = g_base + 0x713918ULL;   // b 0x71378c
     uintptr_t addr = g_base + 0x713904ULL;
     uintptr_t page = addr & ~(uintptr_t)0xfff;
     kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
@@ -5491,8 +5502,43 @@ static void mark(uint32_t tag, uint64_t extra) {
     raw_write(g_gwfd, r, sizeof(r));
 }
 __attribute__((noinline, used)) void mark_a(void) { mark(1, 0); }   // 0x713888 之前
-__attribute__((noinline, used)) void mark_b(void) { mark(2, 0); }   // 0x7138a0 之后
+__attribute__((noinline, used)) void mark_old_b(void) { mark(2, 0); }
 __attribute__((noinline, used)) void mark_c(void) { mark(3, 0); }   // 进 0x7138ac 环
+
+__attribute__((noinline, used)) void mark2(void) { mark(5, 0); }
+
+__attribute__((naked)) static void mark_a2_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x70\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "stp x19, x20, [sp, #0x30]\n"
+        "add x19, sp, #0x70\n"           // 原始 sp
+        "mov w0, #1\n"
+        "mov x1, #0\n"
+        "bl _mark\n"                     // MARK1：进入本块
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "add x8, x19, #0x8\n"            // 重放 add x8, sp, #0x8
+        "bl 0x2f5fbc\n"                  // 重放 bl 0x2f5fbc
+        "mov x20, x19\n"
+        "add x0, x20, #0x8\n"            // 重放 add x0, sp, #0x8
+        "bl 0x94580\n"                   // 重放 bl 0x94580
+        "stp x0, x1, [sp, #0x40]\n"
+        "mov w0, #5\n"
+        "mov x1, #0\n"
+        "bl _mark\n"                     // MARK5：两个拼串调用都返回了
+        "ldp x0, x1, [sp, #0x40]\n"
+        "ldp x19, x20, [sp, #0x30]\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x70\n"
+        "adrp x16, _g_mk_next@PAGE\n"
+        "ldr x16, [x16, _g_mk_next@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
 
 __attribute__((naked)) static void mark_a_stub(void) {
     __asm__ volatile(
@@ -5525,15 +5571,183 @@ __attribute__((naked)) static void mark_c_stub(void) {
         "br x16\n"
     );
 }
-uint64_t g_mk_next, g_mk_loop;
+uint64_t g_mk_next, g_mk_loop, g_mk_disp;
+
+// 0.0.273：两个互不重叠的桩。
+//   A 覆盖 0x713888..0x713898（add / bl 0x2f5fbc / add / bl 0x94580），
+//     各自记一点，然后从 0x713898（mov w1,#0）继续。
+//   B 覆盖 0x7138a0..0x7138b0（mov x20,x0 / mov w8,#0xf4ad），
+//     记下 open 的返回值，然后从 0x7138ac 继续。
+// 注意：不能再往 0x713890 或 0x7138a4 单独打桩——那两个地址分别落在
+// 上面两个桩自己的 8 字节字面量里，正是 0.0.272 修过的那类错误。
+__attribute__((naked)) static void mark_a2_stub(void);
+
+__attribute__((noinline, used)) void mark_b(uint64_t fd) { mark(6, fd); }
+
+__attribute__((naked)) static void mark_b_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x50\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "bl _mark_b\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x50\n"
+        "mov x20, x0\n"
+        "mov w8, #0xf4ad\n"
+        "movk w8, #0x31bb, lsl #16\n"
+        "adrp x16, _g_mk_loop@PAGE\n"
+        "ldr x16, [x16, _g_mk_loop@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+// 0.0.275：0.0.274 证明 MARK1 之后就不动了——停在 bl 0x2f5fbc 或 bl 0x94580 上。
+// 这一次只打一个桩，放在 0x713894（第一个调用之后的 add），覆盖
+//   713894 add x0, sp, #0x8
+//   713898 mov w1, #0
+//   71389c bl open
+//   7138a0 mov x20, x0
+// 桩里逐段记录，最后跳到 0x7138ac。
+// 结果解读：
+//   MARK7 没出现 → bl 0x2f5fbc 就没返回，问题在它
+//   MARK7 有、MARK8 没有 → 卡在 bl 0x94580 或 open
+//   MARK8 有 → 三个调用都正常，问题在后面
+uint64_t g_fn_94580, g_fn_open;
+__attribute__((noinline, used)) void mark7(void) { mark(7, 0); }
+__attribute__((noinline, used)) void mark8(uint64_t fd) { mark(8, fd); }
+
+__attribute__((naked)) static void mark_c2_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x70\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "stp x19, x20, [sp, #0x30]\n"
+        "add x19, sp, #0x70\n"
+        "bl _mark7\n"                    // MARK7：第一个调用回来了
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "add x0, x19, #0x8\n"            // 重放 add x0, sp, #0x8
+        // 0.0.276：不能写成 bl 0x94580。我们的库和盾相距两百多 MB，
+        // 汇编器无法把绝对地址编成 b/b 指令的 ±128MB 相对偏移，
+        // 落到的是垃圾目标——0.0.275 的"卡住"就是它造成的。
+        // 改成运行期取地址再 blr。
+        "adrp x16, _g_fn_94580@PAGE\n"
+        "ldr x16, [x16, _g_fn_94580@PAGEOFF]\n"
+        "blr x16\n"
+        "stp x0, x1, [sp, #0x40]\n"
+        "bl _mark7\n"                    // 第二个调用也回来了
+        "ldp x0, x1, [sp, #0x40]\n"
+        "mov w1, #0\n"                   // 重放 mov w1, #0
+        "adrp x16, _g_fn_open@PAGE\n"
+        "ldr x16, [x16, _g_fn_open@PAGEOFF]\n"
+        "blr x16\n"                      // 重放 bl open
+        // 0.0.277：mark8 会改 x0，这里必须先存下来再记录，
+        // 否则后面那条 mov x20, x0 拿到的就是残留值（0.0.276 里是 48），
+        // 于是 read 用错 fd、返回 -1，把"读失败"变成我们自己制造的假象。
+        "str x0, [sp, #0x50]\n"
+        "bl _mark8\n"                    // MARK8：open 返回，x0=fd
+        "ldr x0, [sp, #0x50]\n"
+        "ldp x19, x20, [sp, #0x30]\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x70\n"
+        "mov x20, x0\n"
+        "mov w8, #0xf4ad\n"
+        "movk w8, #0x31bb, lsl #16\n"
+        "adrp x16, _g_mk_loop@PAGE\n"
+        "ldr x16, [x16, _g_mk_loop@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+// 0.0.278：0.0.277 之后，流程是 open → read 4 字节（/dev/urandom 的随机数）→
+// 然后就没有下一条记录了，可进程还要活几百毫秒。在 0x713918（回到分派器的那条 b）
+// 再放一个记录点，确认它到底回不回到分派器。
+__attribute__((noinline, used)) void mark9(void) { mark(9, 0); }
+
+__attribute__((naked)) static void mark_d_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x8,  x9,  [sp, #0x10]\n"
+        "stp x0,  x1,  [sp, #0x20]\n"
+        "bl _mark9\n"
+        "ldp x0,  x1,  [sp, #0x20]\n"
+        "ldp x8,  x9,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "adrp x16, _g_mk_disp@PAGE\n"
+        "ldr x16, [x16, _g_mk_disp@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
 
 static int install_marks(void) {
     if (!g_base) return 0;
-    g_mk_next = g_base + 0x71388cULL;   // bl 0x2f5fbc
-    g_mk_loop = g_base + 0x7138acULL;   // 状态比较环
-    patch_entry_stub(g_base + 0x713888ULL, (void *)&mark_a_stub);
-    patch_entry_stub(g_base + 0x7138a4ULL, (void *)&mark_c_stub);
-    say("记录点：已装（0x713888 / 0x7138a4）\n");
+    g_mk_next = g_base + 0x7138acULL;
+    g_mk_loop = g_base + 0x7138acULL;   // 状态比较环（mark_c2_stub 用）
+    g_mk_disp = g_base + 0x71378cULL;   // 分派器入口（mark_d_stub 用）
+    g_fn_94580 = g_base + 0x94580ULL;
+    g_fn_open  = g_base + 0x774df4ULL;
+    patch_entry_stub(g_base + 0x713894ULL, (void *)&mark_c2_stub);
+    patch_entry_stub(g_base + 0x713918ULL, (void *)&mark_d_stub);
+    say("记录点：已装到 0x713894 / 0x713918\n");
+    return 1;
+}
+
+#define DO_DEEP_MARK 0
+#define OFF_DEEP 0x713890ULL
+uint64_t g_deep_next;
+
+__attribute__((noinline, used)) void deep_mark(uint32_t tag, uint64_t v) { mark(tag, v); }
+__attribute__((noinline, used)) void deep_mark3(uint64_t x0, uint64_t x1) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6] = { 0x4D41524B00000007ULL, x0, x1, up_ms() - g_t0, 0, (uint64_t)g_base };
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void deep_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x60\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x19, x20, [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "mov x19, sp\n"                  // 记录桩里的 sp
+        "mov w0, #4\n"
+        "mov x1, #0\n"
+        "bl _deep_mark\n"                // MARK4：进入本块
+        "mov x0, x19\n"
+        "add x0, x0, #0x60\n"            // 还原原始 sp
+        "mov x20, x0\n"
+        "mov x0, x20\n"
+        "add x0, x0, #0x8\n"             // add x0, sp, #0x8
+        "bl 0x94580\n"
+        "mov x0, x20\n"
+        "add x0, x0, #0x8\n"
+        "stp x0, x1, [sp, #0x30]\n"
+        "mov w0, #5\n"
+        "mov x1, #0\n"
+        "bl _deep_mark\n"                // MARK5：第一个调用返回了
+        "ldp x0, x1, [sp, #0x30]\n"
+        "mov w1, #0\n"
+        "mov x0, x20\n"
+        "add x0, x0, #0x8\n"
+        "ldr x16, [sp, #0x38]\n"
+        "adrp x16, _g_deep_next@PAGE\n"
+        "ldr x16, [x16, _g_deep_next@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_deep_mark(void) {
+    if (!g_base) return 0;
+    g_deep_next = g_base + 0x7138a0ULL;   // mov x20, x0
+    patch_entry_stub(g_base + OFF_DEEP, (void *)&deep_stub);
+    say_hex("深层记录点：已装到 ", g_base + OFF_DEEP);
     return 1;
 }
 
@@ -5813,7 +6027,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.272 启动（修正桩覆盖自身跳转目标的问题）=====\n");
+    say("===== 0.0.281 启动（干净对照：只留自检旁路 + 判定强制通过）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -5844,6 +6058,9 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_MARKS
     install_marks();
+#endif
+#if DO_DEEP_MARK
+    install_deep_mark();
 #endif
 #if DO_GATE_RET_ZERO
     patch_word(g_base + OFF_GATE713720,     0x52800000U);   // mov w0, #0
