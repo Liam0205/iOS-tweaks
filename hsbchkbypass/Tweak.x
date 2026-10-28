@@ -53,7 +53,8 @@
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
 #define DO_QUIET    1   // 安静模式：不做密集线程快照
-#define DO_BLKIMMAP 1   // 让"映射整份共享缓存"这次调用失败
+#define DO_BLKEXIT  1   // 不把 exit 发出去，让调用返回 0
+#define DO_BLKIMMAP 0   // 让"映射整份共享缓存"这次调用失败
 #define DO_HOOKCHK  0   // 检查 libc 函数序言有没有被注入器改成跳板
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
 #define DO_SENTINEL 0   // 哨兵：会被 dyld 自己的校验搞崩，只留作记录
@@ -335,6 +336,7 @@ static volatile int64_t g_fake_rw;
 static uint64_t g_flag_last;
 static volatile uint64_t g_ret_override;   // 非零时用它替换系统调用的返回值
 static volatile int g_blk_mmap;
+static volatile int g_skip_svc;    // 置位时这次系统调用不发出去，直接返回 0
 // 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
 // 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
 static uint64_t g_late_base, g_late_hi;
@@ -606,6 +608,11 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     // 这次实验让它失败，看判定是否变化。只通过网关改返回值，不碰任何代码或数据。
     if (DO_BLKIMMAP && nr == 197 && a1 > 0x10000000ULL) g_blk_mmap = 1;
 
+    // 第 1 号是 exit。拦截系统调用 ≠ 拦截函数：这里只是不把它发出去、让调用返回 0，
+    // 调用方会以为处理完了继续跑。Round 4 做过这件事，但当时的存活测量被
+    // "系统重新拉起"污染过，所以现在用绑定 pid 的测量重做一次。
+    if (nr == 1) g_skip_svc = 1;
+
     // 盾把每个已加载镜像的头读出来看。落在注入库上的那些读，改指到一个真正的系统
     // dylib 上，相对偏移保持不变：它读到的就是一份结构完全正常的库头。
     //
@@ -735,6 +742,16 @@ __attribute__((naked)) static void gw_entry(void) {
         "ldp x4,  x5,  [sp, #0x30]\n"
         "ldp x2,  x3,  [sp, #0x20]\n"
         "ldp x0,  x1,  [sp, #0x10]\n"
+        "adrp x9, _g_skip_svc@PAGE\n"
+        "ldr x9, [x9, _g_skip_svc@PAGEOFF]\n"
+        "cbz x9, 2f\n"
+        "mov x10, #0\n"
+        "adrp x11, _g_skip_svc@PAGE\n"
+        "str x10, [x11, _g_skip_svc@PAGEOFF]\n"
+        "ldp x29, x30, [sp], #0x100\n"
+        "mov x0, #0\n"
+        "ret\n"
+        "2:\n"
         "svc #0x80\n"
         // 返回值先落回帧里，别被下面那次 bl 冲掉
         "stp x0, x1, [sp, #0x98]\n"
@@ -2458,7 +2475,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.166 启动（退出记录带 pid，用于区分重新拉起）=====\n");
+    say("===== 0.0.167 启动（拦住 exit 系统调用，用绑定 pid 的测量重测）=====\n");
 
     try_takeover();
     {
