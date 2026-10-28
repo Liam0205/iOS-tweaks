@@ -234,7 +234,10 @@ static void emit_ts(const char *s, size_t n);
 #define WORD_B_REPORT_FROM_NULL 0x14000011U   // → 0x40e848
 #define OFF_GATE_EMPTY 0x40e80cULL
 #define WORD_B_REPORT_FROM_EMPTY 0x1400000fU  // → 0x40e848
-#define DO_REPORT_PROBE 0
+// 0.0.250：把"每一次上报"都记下来：原因码、说明指针、说明前 8 字节、调用者，
+// 以及当时 SIGILL 的处置函数是不是还是我们的。探针每次都会把我们的处理器重装一遍，
+// 所以它同时也是"盾换完处理器之后我们补装回去"的唯一时机。
+#define DO_REPORT_PROBE 1
 // 0.0.214：5d8758 这个函数的形状是
 //   5d87a0  bl  0x712668        ; 判定，结果在 w0
 //   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
@@ -4634,6 +4637,32 @@ static int install_report_probe(void) {
 #define DO_EXITFN_GUARD 1
 static volatile uint64_t g_guard_hits;
 
+// 0.0.251：0.0.250 证明上报那一刻 SIGILL 的处置函数还是我们的，可致命的那次
+// 依然没进来。先弄清楚一件事：这个时刻新建的线程还跑不跑。如果跑，我们就有了
+// 一个能在最后 200ms 里持续重装处理器的位置；如果不跑，问题就不在处理器上，
+// 而在信号的投递层（线程掩码或异常端口）。
+static void *late_guard_thread(void *arg) {
+    (void)arg;
+    if (g_gwfd >= 0) {
+        uint64_t r[6] = { 0x4C41544500000009ULL, 0xFFFFFFFFULL, 0, 0, 0,
+                          (uint64_t)g_base };
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+    // 0.0.254：带上时刻，并把循环拉长。要看的是"它到底在哪一刻停住"，
+    // 以及停住之后还会不会恢复。
+    for (int i = 0; i < 4000; i++) {
+        arm_fault_probe();
+        if (g_gwfd >= 0) {
+            uint64_t r[6] = { 0x4C41544500000001ULL, (uint64_t)i, up_ms() - g_t0,
+                              (uint64_t)(uintptr_t)pthread_self(), 0,
+                              (uint64_t)g_base };
+            raw_write(g_gwfd, r, sizeof(r));
+        }
+        usleep(2000);
+    }
+    return NULL;
+}
+
 static void usr1_probe(int sig, siginfo_t *si, void *ucv) {
     (void)si; (void)ucv;
     if (g_gwfd >= 0) {
@@ -4659,7 +4688,7 @@ __attribute__((noinline, used)) void exitfn_guard(uint64_t reason, uint64_t desc
     // 0.0.245：自检。此刻发一个 SIGUSR1 给自己，看装上去的处理器到底还在不在。
     // 在的话会写一条 USR1 记录；不在的话进程应该当场被 SIGUSR1 结束——而我们现在
     // 看到的是活到了 SIGILL，说明这里的处理器是被盾用它自己的裸系统调用换掉的。
-    if (g_guard_hits == 1) {
+    if (0) {
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = usr1_probe;
@@ -4680,12 +4709,28 @@ __attribute__((noinline, used)) void exitfn_guard(uint64_t reason, uint64_t desc
             raw_write(g_gwfd, r, sizeof(r));
         }
     }
+    // 0.0.253：0.0.251 那次替换没匹配上，线程根本没创建，"晚建线程不跑"作废。
+    // 这里真正起一个：记录创建返回码，然后立刻写一条心跳，再每 2ms 写一条。
+    if (0) {
+        static int started_lt;
+        if (!started_lt) {
+            started_lt = 1;
+            pthread_t t;
+            int rc = pthread_create(&t, NULL, late_guard_thread, NULL);
+            if (g_gwfd >= 0) {
+                uint64_t r[6] = { 0x4C43524500000001ULL, (uint64_t)(int64_t)rc,
+                                  (uint64_t)(uintptr_t)t, up_ms() - g_t0, 0,
+                                  (uint64_t)g_base };
+                raw_write(g_gwfd, r, sizeof(r));
+            }
+        }
+    }
     // 0.0.247：第二次退出调用处停 300ms，每 10ms 写一条心跳。
     // 如果进程在这 300ms 里就没了，说明凶手是另一条线程，与"退出调用返回之后
     // 继续往下走"无关；如果心跳写满 300ms、进程在返回之后才死，那问题就在续行路径上。
     // 0.0.248：0.0.247 证明致命 SIGILL 发生在退出调用返回之后，也就是续行路径上。
     // 那就把调用栈抓出来，好顺着去找那一层的 udf。
-    if (g_guard_hits <= 2) {
+    if (0) {
         uint64_t fp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
         for (int i = 0; i < 14 && fp; i++) {
             uint64_t nfp = 0, lr = 0;
@@ -4732,6 +4777,242 @@ static int install_exitfn_guard(void) {
     mach_vm_protect(mach_task_self(), page, 0x4000, 0,
                     VM_PROT_READ | VM_PROT_EXECUTE);
     say_hex("退出守护：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.249：看清"原因码 5 是哪个检查对象报的"。
+//
+// 离线把 0x712668 的比较树摊平之后，只有一条路通向 0x7133d0：
+//   状态 == 0x1c4ee66b  →  0x7133d0
+// 而进入这个状态的是 0x713348，它前面（0x71332c）刚从对象 [sp+0x48] 的虚表里
+// 取出一项存进 [sp+0x90]。也就是说，这里做的是"调一个检查对象的方法，拿到说明，
+// 然后上报原因码 5"。说明文字为空就是致命，非空只上报。
+//
+// 在 0x7133d0 开头插桩，把这四件事记下来：对象指针、虚表项、说明指针、
+// 以及两者开头几十个字节。这四行指令正好 16 字节，续行点 0x7133e0
+// （mov w0,#5）完好，桩里原样重放即可。
+#define DO_VM_DESC_LOG 1
+static uint64_t g_vm_join;
+static volatile uint64_t g_vm_hits;
+
+static void vm_rec(uint64_t kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x564D524500000000ULL | (kind & 0xff);   // 魔数 "VMRE"
+    r[1] = a; r[2] = b; r[3] = c; r[4] = d; r[5] = (uint64_t)g_base;
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+static void dump_got(void);
+
+__attribute__((noinline, used)) void vm_report_log(uint64_t obj, uint64_t fn) {
+    // 0.0.258：构造函数里读这些槽太早，那时还是密文。探针在 71ms 才跑，
+    // 那时 GOT 已经被填好，重新读一次才能反解出真实符号。
+    { static int once; if (!once) { once = 1; dump_got(); } }
+    g_vm_hits = g_vm_hits + 1;
+    uint64_t vt = 0;
+    safe_read(obj, &vt, 8);
+    vm_rec(1, obj, fn, vt, g_vm_hits);
+    // 0.0.252：多打一些。上一版只看到前 8 个字（大多是 0），
+    // 而 +0x18=0x19a40a000、+0x20=0x69ecee1e 这两个不像 0 的值没对上用途。
+    for (int i = 0; i < 40; i++) {
+        uint64_t w = 0;
+        if (!safe_read(obj + (uint64_t)i * 8, &w, 8)) break;
+        vm_rec(0x11, (uint64_t)i, w, obj, 0);
+    }
+}
+
+__attribute__((noinline, used)) void vm_desc_log(uint64_t desc) {
+    vm_rec(2, desc, 0, 0, 0);
+    if (!desc) return;
+    for (int i = 0; i < 6; i++) {
+        uint64_t w = 0;
+        if (!safe_read(desc + (uint64_t)i * 8, &w, 8)) break;
+        vm_rec(0x12, (uint64_t)i, w, desc, 0);
+    }
+}
+
+__attribute__((naked)) static void vm_desc_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x60\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x2,  x3,  [sp, #0x20]\n"
+        "stp x8,  x9,  [sp, #0x30]\n"
+        "str x10,      [sp, #0x40]\n"
+        "add x10, sp, #0x60\n"          // 原始的 sp
+        "ldr x0, [x10, #0x48]\n"        // 检查对象
+        "ldr x1, [x10, #0x90]\n"        // 虚表项
+        "bl _vm_report_log\n"
+        "ldr x10,      [sp, #0x40]\n"
+        "ldp x8,  x9,  [sp, #0x30]\n"
+        "ldp x2,  x3,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x60\n"
+        // 重放被覆盖的四条
+        "ldr x0, [sp, #0x48]\n"
+        "ldr x8, [sp, #0x90]\n"
+        "blr x8\n"                      // → x0 = 说明文字
+        "sub sp, sp, #0x20\n"
+        "stp x0, x1, [sp, #0x00]\n"
+        "bl _vm_desc_log\n"
+        "ldp x0, x1, [sp, #0x00]\n"
+        "add sp, sp, #0x20\n"
+        "mov x1, x0\n"
+        "adrp x16, _g_vm_join@PAGE\n"
+        "ldr x16, [x16, _g_vm_join@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+// 0.0.255：把虚拟机的分派器插上桩。
+//
+// 141ms 上报原因码 5、两次退出调用被挡下，然后进程又活了 1.1 秒才死于 SIGILL。
+// 那一秒里盾在干什么，只有它自己的线程知道——而分派器 0x7126e4 正是所有状态
+// 的必经之路。把每次跳转的状态值记下来，事后用离线摊平的分派器还原成代码块序列，
+// 就能看到最后一刀是从哪个状态发出的。
+//
+// 0x7126e4 起被覆盖的四条是：
+//   7126e4  mov x9, x8
+//   7126e8  cmp w8, w25
+//   7126ec  b.gt 0x712788
+//   7126f0  mov w8, #0x12ec
+// 桩里按分支结果分别重放到 0x7126f4 或 0x712788。
+#define DO_VM_STATE_LOG 1
+uint64_t g_vm_gt, g_vm_fall;   // 只在桩的内联汇编里引用，必须非 static
+static volatile uint64_t g_vm_states;
+#define VM_STATE_CAP 60000
+
+__attribute__((noinline, used)) void vm_state_log(uint32_t st) {
+    uint64_t n = g_vm_states;
+    if (n >= VM_STATE_CAP) return;
+    g_vm_states = n + 1;
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x564D535400000001ULL;    // 魔数 "VMST"
+    r[1] = n;
+    r[2] = (uint64_t)st;
+    r[3] = up_ms() - g_t0;
+    r[4] = 0;
+    r[5] = (uint64_t)g_base;
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
+__attribute__((naked)) static void vm_state_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x40\n"
+        "stp x29, x30, [sp, #0x00]\n"
+        "stp x0,  x1,  [sp, #0x10]\n"
+        "stp x8,  x9,  [sp, #0x20]\n"
+        "mov w0, w8\n"
+        "bl _vm_state_log\n"
+        "ldp x8,  x9,  [sp, #0x20]\n"
+        "ldp x0,  x1,  [sp, #0x10]\n"
+        "ldp x29, x30, [sp, #0x00]\n"
+        "add sp, sp, #0x40\n"
+        "mov x9, x8\n"
+        "cmp w8, w25\n"
+        "b.le 1f\n"
+        "adrp x16, _g_vm_gt@PAGE\n"
+        "ldr x16, [x16, _g_vm_gt@PAGEOFF]\n"
+        "br x16\n"
+        "1:\n"
+        "mov w8, #0x12ec\n"
+        "adrp x16, _g_vm_fall@PAGE\n"
+        "ldr x16, [x16, _g_vm_fall@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_vm_state_probe(void) {
+    if (!g_base) return 0;
+    g_vm_gt   = g_base + 0x712788ULL;
+    g_vm_fall = g_base + 0x7126f4ULL;
+    uintptr_t addr = g_base + 0x7126e4ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("分派桩：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;
+    w[1] = 0xd61f0200;
+    *lit = (uint64_t)(uintptr_t)&vm_state_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("分派桩：已装到 ", addr);
+    return 1;
+}
+
+// 0.0.256：0x774xxx 这一片是盾的导入桩，静态反汇编里没有。
+// 虚拟机在几处检查里正是通过它们调外部函数（0x774f68 / 0x774ec0 / 0x774f74），
+// 而它们的真实去向只有运行期才看得到。把桩的头几条指令打出来，
+// 就能读出它用的是 0x84c000 那张表里的哪一格。
+static void dump_thunks(void) {
+    static const uint32_t offs[] = {
+        0x774770, 0x774638, 0x774644, 0x774650, 0x774dd0, 0x774d58,
+        0x774db8, 0x774ec0, 0x774f60, 0x774f68, 0x774f74, 0x774f88,
+    };
+    if (!g_base || g_gwfd < 0) return;
+    for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+        const volatile uint32_t *p = (const volatile uint32_t *)(g_base + offs[i]);
+        uint64_t r[6];
+        r[0] = 0x54484E4B00000001ULL;    // 魔数 "THNK"
+        r[1] = offs[i];
+        r[2] = p[0]; r[3] = p[1]; r[4] = p[2]; r[5] = p[3];
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+}
+
+// 0.0.257：把上面这些桩在运行期用的 GOT 槽读出来，再用 dladdr 反解符号名。
+// 静态文件里这些槽还是待绑定的占位值，只有进程起来之后才看得出真实去向。
+static const uint32_t g_got_slots[] = {
+    0x84c098, 0x80c2f8, 0x80c300, 0x80c308, 0x84c948,
+    0x84c8a8, 0x84c700, 0x84c768, 0x84c580, 0x84c8f0,
+};
+
+static void dump_got(void) {
+    if (!g_base || g_gwfd < 0) return;
+    for (unsigned i = 0; i < sizeof(g_got_slots) / sizeof(g_got_slots[0]); i++) {
+        uint64_t p = 0;
+        if (!safe_read(g_base + g_got_slots[i], &p, 8)) continue;
+        uint64_t n0 = 0, n1 = 0;
+        Dl_info di;
+        for (unsigned k = 0; k < sizeof(di); k++) ((char *)&di)[k] = 0;
+        if (p && dladdr((void *)(uintptr_t)p, &di) && di.dli_sname) {
+            const char *nm = di.dli_sname;
+            for (int k = 0; k < 8 && nm[k]; k++) n0 |= ((uint64_t)(unsigned char)nm[k]) << (8 * k);
+            for (int k = 0; k < 8 && nm[8 + k]; k++) n1 |= ((uint64_t)(unsigned char)nm[8 + k]) << (8 * k);
+        }
+        uint64_t r[6];
+        r[0] = 0x474F545300000001ULL;    // 魔数 "GOTS"
+        r[1] = g_got_slots[i];
+        r[2] = p;
+        r[3] = n0; r[4] = n1; r[5] = (uint64_t)g_base;
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+}
+
+static int install_vm_desc_probe(void) {
+    if (!g_base) return 0;
+    g_vm_join = g_base + 0x7133e0ULL;
+    uintptr_t addr = g_base + 0x7133d0ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("说明探针：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;                  // ldr x16, #8
+    w[1] = 0xd61f0200;                  // br  x16
+    *lit = (uint64_t)(uintptr_t)&vm_desc_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("说明探针：已装到 ", addr);
+    say_hex("  续行地址=", g_vm_join);
     return 1;
 }
 
@@ -4990,7 +5271,7 @@ __attribute__((constructor)) static void ctor(void) {
     }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.248 启动（抓退出调用的调用栈）=====\n");
+    say("===== 0.0.258 启动（延后读 GOT）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -4998,6 +5279,14 @@ __attribute__((constructor)) static void ctor(void) {
 #if DO_EXITFN_GUARD
     install_exitfn_guard();
 #endif
+#if DO_VM_DESC_LOG
+    install_vm_desc_probe();
+#endif
+#if DO_VM_STATE_LOG
+    install_vm_state_probe();
+#endif
+    dump_thunks();
+    dump_got();
 #endif
 #if DO_SIGSAMPLE
     arm_sig_sample();
