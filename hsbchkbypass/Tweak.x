@@ -48,8 +48,13 @@
 // 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
 // 现在分开关，一次只上一个。
 #define DO_TAKEOVER 1   // 接管网关（0 = 完全不干预，只留着当对照）
+#define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
+#define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
+#define DO_QUIET    1   // 安静模式：不做密集线程快照
+#define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
+#define DO_SENTINEL 0   // 哨兵：会被 dyld 自己的校验搞崩，只留作记录
 #define DO_DISKCHECK 0  // 逐镜像比对内存与磁盘（实验用，平时关掉）
 
 #define ZERO_PAGE 0x4000
@@ -129,6 +134,7 @@ static volatile uint64_t g_ts0;
 extern kern_return_t mach_vm_protect(vm_map_t, uint64_t, uint64_t, boolean_t, vm_prot_t);
 static void say(const char *s);
 static void say_hex(const char *label, unsigned long long v);
+static void emit_ts(const char *s, size_t n);
 
 // 把一段代码改成"直接返回 0"。必须把页临时改成可写，写完立刻恢复可读可执行，
 // 否则代码签名会以 SIGBUS 收场（0.0.51 踩过）。
@@ -152,12 +158,73 @@ static volatile int g_total;
 static uint64_t g_inj_lo[MAX_INJ];
 static uint64_t g_inj_hi[MAX_INJ];
 static volatile int g_inj_n;
+static volatile int g_sent_hit;      // 盾有没有来读我们插进去的哨兵镜像
+static uint64_t g_sent_addr;         // 哨兵镜像头地址
+static uint64_t g_sent_hdr[0x200] __attribute__((aligned(0x1000)));
 
 // 构造函数里抄下来的镜像基址表（升序）。哈希阶段 x1 每跨进一张镜像就是一个基址，
 // 用它来回答"盾到底哈希了哪几张"。
+// 把注入库在 dyld 里登记的名字改掉。盾如果按"已加载库的路径"判断越狱
+// （/private/preboot、TweakInject、ellekit、systemhook 这些字眼），
+// 那么最简单有效的做法就是把名字换成普通系统库——只改数据，不碰任何代码页。
+// 名字长度必须不超过原来那段缓冲区，短了就用 NUL 收尾。
+static int g_disguised;
+static void disguise_paths(void) {
+    static const char *mask[4] = {
+        "/usr/lib/libobjc.A.dylib",
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/system/libcache.dylib",
+        "/usr/lib/libc++.1.dylib",
+    };
+    uint32_t n = _dyld_image_count();
+    int k = 0;
+    for (uint32_t i = 0; i < n && k < 4; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        int bad = 0;
+        if (strstr(nm, "/private/preboot/")) bad = 1;
+        else if (strstr(nm, "systemhook")) bad = 1;
+        else if (strstr(nm, "TweakInject")) bad = 1;
+        else if (strstr(nm, "ellekit")) bad = 1;
+        if (!bad) continue;
+
+        size_t len = strlen(nm);
+        size_t wl = strlen(mask[k]);
+        if (wl > len) { say_hex("伪装：缓冲不够，跳过 长度=", len); continue; }
+
+        uintptr_t page = (uintptr_t)nm & ~(uintptr_t)0xfff;
+        kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) { say_hex("伪装：改页权限失败 kr=", (unsigned long long)kr); continue; }
+        volatile char *dst = (volatile char *)(uintptr_t)nm;
+        for (size_t j = 0; j < len; j++) dst[j] = 0;
+        for (size_t j = 0; j < wl; j++) dst[j] = mask[k][j];
+        dst[wl] = 0;
+        k++;
+        g_disguised++;
+        char lb[160];
+        out_t o = { lb, lb + sizeof(lb) - 1 };
+        o_s(&o, "伪装："); o_h(&o, (unsigned long long)(uintptr_t)nm);
+        o_s(&o, " → ");
+        for (size_t j = 0; j < wl; j++) o_ch(&o, mask[k - 1][j]);
+        o_ch(&o, '\n');
+        emit_ts(lb, (size_t)(o.p - lb));
+    }
+    say_hex("伪装：改掉了几个=", g_disguised);
+}
+
 static uint64_t g_img_tab[1200];
 static int g_img_tab_n;
 static uint64_t g_last_hash_base;
+
+static int img_index_of(uint64_t a) {
+    int lo = 0, hi = g_img_tab_n - 1, best = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (g_img_tab[mid] <= a) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return best;
+}
 static volatile uint64_t g_decoys[MAX_INJ];  // 每个注入库对应的系统库替身
 static volatile int g_decoys_n;
 static volatile int g_redirects;
@@ -211,6 +278,12 @@ static void ring_push(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64
     if (snr == -31 && a0 > 0x1000) { src = (const volatile uint64_t *)(uintptr_t)a0; words = PAY; }
     else if ((snr == 5 || snr == 33) && a0 > 0x1000) { src = (const volatile uint64_t *)(uintptr_t)a0; words = PAY; }
     else if (snr == 202 && a0 > 0x1000) { src = (const volatile uint64_t *)(uintptr_t)a0; words = PAY; }
+    // 116 疑似 syslog：报告原因时盾会写字到系统日志，如果能抄下来就直接读到判定理由。
+    else if (snr == 116) {
+        if (a0 > 0x1000) src = (const volatile uint64_t *)(uintptr_t)a0;
+        else if (a1 > 0x1000) src = (const volatile uint64_t *)(uintptr_t)a1;
+        if (src) words = PAY;
+    }
     for (int i = 0; i < PAY; i++) {
         r->pay[i] = (src && i < words) ? src[i] : 0;
     }
@@ -256,7 +329,13 @@ static uint64_t rec_ms(uint64_t ts) {
     return (ts - g_ts0) / (g_pct_per_ms ? g_pct_per_ms : 24000);
 }
 
-static volatile int64_t g_fake_rw;       // 检查项一共被改写过几次
+static volatile int64_t g_fake_rw;
+static uint64_t g_flag_last;
+// 枚举之后才加载的镜像。若盾的清单是靠 dyld 的 add-image 回调累积的，
+// 它会在下一次处理时读到这个新库；若是一次性枚举，就什么都看不到。
+static uint64_t g_late_base, g_late_hi;
+static volatile int g_late_hit;
+static int g_late_tried;       // 检查项一共被改写过几次
 
 static void emit_rec(const rec_t *r, uint64_t now) {
     char buf[768];
@@ -290,6 +369,18 @@ static void emit_rec(const rec_t *r, uint64_t now) {
         o_s(&o, "] 长度="); o_u(&o, r->a1);
         o_s(&o, " 值0="); o_h(&o, r->pay[12]);
         o_s(&o, " 值1="); o_h(&o, r->pay[13]);
+    } else if (nr == 116) {
+        o_s(&o, "syslog a0="); o_h(&o, r->a0);
+        o_s(&o, " a1="); o_h(&o, r->a1);
+        o_s(&o, " 文本=");
+        const char *t = (const char *)r->pay;
+        int cnt = 0;
+        for (int i = 0; i < PAY * 8 && cnt < 150; i++) {
+            char c = t[i];
+            if (!c) break;
+            o_ch(&o, (c >= 0x20 && c < 0x7f) ? c : '.');
+            cnt++;
+        }
     } else if (nr == -77) {
         o_s(&o, "假判定被调用 项="); o_h(&o, r->a0);
         o_s(&o, " 返回点=");
@@ -396,6 +487,8 @@ static void emit_rec(const rec_t *r, uint64_t now) {
 // ---------------------------------------------------------------- 网关入口
 
 // 从网关处理函数里直接落地的一行：纯算术 + 裸 write。
+static void flush_ring(void);
+
 static void emergency_line(const rec_t *r) {
     char buf[640];
     out_t o = { buf, buf + sizeof(buf) - 1 };
@@ -404,18 +497,28 @@ static void emergency_line(const rec_t *r) {
     o_s(&o, " tid=");         o_u(&o, r->tid);
     o_s(&o, " 时刻=");         o_u(&o, g_ts0 && r->ts > g_ts0 ? (r->ts - g_ts0) / 24000 : 0);
     o_s(&o, "ms 已重定向=");   o_u(&o, (unsigned long long)g_redirects);
-    // 谁下的判定：沿着帧指针往上走，每一层只认落在盾自己镜像里的返回地址。
+    // 谁下的判定：沿着帧指针往上走。除了盾自己的地址，也认其它镜像里的地址——
+    // "到底是谁调的"往往要到盾外面才看得清。走不深就说明这段代码不维护帧指针。
     uint64_t fp = r->fp;
-    for (int k = 0; k < 6; k++) {
+    int depth = 0;
+    for (int k = 0; k < 40; k++) {
         if (fp < 0x100000000ULL || (fp & 7) || fp > 0x800000000ULL) break;
         uint64_t fr[2];
         fr[0] = *(volatile uint64_t *)(uintptr_t)fp;
         fr[1] = *(volatile uint64_t *)(uintptr_t)(fp + 8);
         if (fr[1] > g_base && fr[1] < g_base + 0x8c0000) {
             o_s(&o, " <-"); o_h(&o, fr[1] - g_base);
+            depth++;
+        } else if (fr[1] > 0x100000000ULL) {
+            int i = img_index_of(fr[1]);
+            if (i >= 0) {
+                o_s(&o, " <~img"); o_d(&o, i); o_s(&o, "+"); o_h(&o, fr[1] - g_img_tab[i]);
+                depth++;
+            }
         }
         fp = fr[0];
     }
+    o_s(&o, " 深度="); o_d(&o, depth);
     o_ch(&o, '\n');
     emit(buf, (size_t)(o.p - buf));
 
@@ -490,6 +593,23 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     //
     // 注意不能拿盾自己当替身——它是可执行文件，第一个 load command 是 LC_SEGMENT_64，
     // 而解析器期待 LC_ID_DYLIB，会顺着垃圾偏移读崩（0.0.48 就是这么死的）。
+    if (nr == (uint64_t)-31 && a0 > 0x1000 && g_late_hi) {
+        volatile uint32_t *m = (volatile uint32_t *)(uintptr_t)a0;
+        if (m[5] == 4808) {
+            uint64_t src = *(volatile uint64_t *)(uintptr_t)(a0 + 32);
+            if (src >= g_late_base && src < g_late_hi) g_late_hit++;
+        }
+    }
+    if (nr == (uint64_t)-31 && a0 > 0x1000 && g_sent_addr) {
+        volatile uint32_t *m = (volatile uint32_t *)(uintptr_t)a0;
+        if (m[5] == 4808) {
+            uint64_t src = *(volatile uint64_t *)(uintptr_t)(a0 + 32);
+            if (src >= (uint64_t)(uintptr_t)g_sent_hdr &&
+                src < (uint64_t)(uintptr_t)g_sent_hdr + sizeof(g_sent_hdr)) {
+                g_sent_hit++;
+            }
+        }
+    }
 #if DO_REDIRECT
     if (nr == (uint64_t)-31 && a0 > 0x1000 && g_decoys_n > 0) {
         volatile uint32_t *msg = (volatile uint32_t *)(uintptr_t)a0;
@@ -526,6 +646,9 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     if (nr == 1) {
         unsigned h = (g_head + RING - 1) % RING;
         emergency_line(&g_ring[h]);
+        // 排空线程在判定前那几十毫秒里落后几百条，而进程马上就要退出，
+        // 那些还没来得及写出去的记录正是最要紧的一段。这里同步冲一遍。
+        flush_ring();
     }
 }
 
@@ -637,6 +760,16 @@ static void try_takeover(void) {
     g_taken = 1;
     say_hex("接管网关槽 原值=", cur);
     say_hex("          新值=", want);
+}
+
+// 把环形缓冲里剩下的记录全部写出去。只在即将退出时调用。
+static void flush_ring(void) {
+    for (int guard = 0; guard < RING; guard++) {
+        unsigned t = g_tail;
+        if (t == g_head) break;
+        emit_rec(&g_ring[t], 0);
+        g_tail = (t + 1) % RING;
+    }
 }
 
 static void *poller(void *arg) {
@@ -849,6 +982,55 @@ static void *disk_check(void *arg) {
     say_hex("  无文件跳过=", skipped);
     return NULL;
 }
+
+// 往 dyld 的 AllImages 数组末尾插一个"不存在的镜像"，指向我们自己的一个假头。
+// 盾如果去读这个地址，就说明它的镜像清单确实来自这份数组；不读就说明另有来源。
+static uint64_t g_fake_loader[0x10];
+
+static void plant_sentinel(uintptr_t cache_base) {
+    if (!cache_base) { say("哨兵：没有缓存基址\n"); return; }
+    uintptr_t g = cache_base + (0x202acdcd0ULL - 0x1a8ef4000ULL);
+    uint64_t obj = 0;
+    if (!safe_read(g, &obj, 8) || obj < 0x100000000ULL || obj > 0x800000000ULL) {
+        say("哨兵：读不到 AllImages 对象\n");
+        return;
+    }
+    uint64_t arr = 0, cnt = 0, cap = 0;
+    safe_read(obj + 0x28, &arr, 8);
+    safe_read(obj + 0x30, &cnt, 8);
+    safe_read(obj + 0x38, &cap, 8);
+    if (arr < 0x100000000ULL || cnt < 4) { say("哨兵：数组不可用\n"); return; }
+
+    // 0.0.147 试过"追加一条并把计数加一"，进程立刻 SIGABRT——dyld 自己在校验，
+    // 说明条目数不能动。改成**原地覆盖最后一条**，计数保持不变：
+    // 目标页先拷一份被覆盖镜像的真实头部，结构完全合法，唯一变化是地址。
+    uint64_t slot = arr + (cnt - 1) * 8;
+    uint64_t orig = 0;
+    if (!safe_read(slot, &orig, 8)) { say("哨兵：读不到末条\n"); return; }
+    uint64_t hdr = 0;
+    if (!safe_read(orig + 0x8, &hdr, 8) || hdr < 0x100000000ULL) {
+        say_hex("哨兵：末条没有镜像头=", orig);
+        return;
+    }
+    uint8_t *h = (uint8_t *)g_sent_hdr;
+    for (int i = 0; i < 0x4000; i++) h[i] = *(const volatile uint8_t *)(uintptr_t)(hdr + i);
+    g_sent_addr = (uint64_t)(uintptr_t)g_sent_hdr;
+
+    // 原 Loader 的前 0x40 字节整块抄过来（虚表和几个字段），只改 +0x8 的镜像头。
+    // 只抄虚表是不够的：dyld 的方法会读别的字段，读到 0 就崩。
+    for (int i = 0; i < 8; i++)
+        g_fake_loader[i] = *(const volatile uint64_t *)(uintptr_t)(orig + (uint64_t)i * 8);
+    g_fake_loader[1] = g_sent_addr;
+    *(volatile uint64_t *)(uintptr_t)slot = (uint64_t)(uintptr_t)g_fake_loader;
+
+    uint64_t back = 0;
+    safe_read(slot, &back, 8);
+    say_hex("哨兵：覆盖末条 原 Loader=", orig);
+    say_hex("  原镜像头=", hdr);
+    say_hex("  哨兵页=", g_sent_addr);
+    say_hex("  回读=", back);
+}
+
 
 static void dump_images(void) {
     uint32_t n = _dyld_image_count();
@@ -2079,17 +2261,65 @@ static void *heartbeat(void *arg) {
     static int g_snap_at[200];
     static int g_snap_n;
     if (!g_snap_n) {
-        for (int t = 360; t <= 620; t += 2) g_snap_at[g_snap_n++] = t;
-        g_snap_at[g_snap_n++] = 10000;
+        if (DO_QUIET) {
+            g_snap_at[g_snap_n++] = 10000;
+        } else {
+            for (int t = 360; t <= 620; t += 2) g_snap_at[g_snap_n++] = t;
+            g_snap_at[g_snap_n++] = 10000;
+        }
     }
     int g_snap_i = 0;
     uint64_t last_hb = 0;
     for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
+        uint64_t el = rec_ms(read_pct());
+#if DO_LATEDL
+        if (!g_late_tried && el >= 45) {
+            g_late_base = 1;   // 只试一次
+            static const char *cand[] = {
+                "/System/Library/Frameworks/GLKit.framework/GLKit",
+                "/System/Library/Frameworks/Speech.framework/Speech",
+                "/System/Library/PrivateFrameworks/GameCenterFoundation.framework/GameCenterFoundation",
+                "/System/Library/PrivateFrameworks/OnBoardingKit.framework/OnBoardingKit",
+                "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
+                "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote",
+            };
+            g_late_tried = 1;
+            for (unsigned ci = 0; ci < sizeof(cand)/sizeof(cand[0]); ci++) {
+                uint32_t n0 = _dyld_image_count();
+                void *h = dlopen(cand[ci], RTLD_LAZY | RTLD_LOCAL);
+                uint32_t n1 = _dyld_image_count();
+                if (h && n1 > n0) {
+                    g_late_base = (uint64_t)(uintptr_t)_dyld_get_image_header(n1 - 1);
+                    g_late_hi = g_late_base + 0x400000;
+                    say("迟到的镜像："); say(cand[ci]); say("\n");
+                    say_hex("  基址=", g_late_base);
+                    say_hex("  镜像数 ", n0); say_hex("  → ", n1);
+                    break;
+                }
+            }
+            if (!g_late_base) say("迟到：一个都没加载成功\n");
+        }
+#endif
+#if DO_FAKE
 #if DO_FAKE
         install_fake_checks();
 #endif
-        uint64_t el = rec_ms(read_pct());
+        // 0x43ce74 之后紧接着读全局 +0x866fc8，非零就报告原因码 4 并退出。
+        // 先看清它到底是什么值：像小整数的当标志处理，像指针的只记录不动。
+        if (g_base) {
+            volatile uint64_t *fl = (volatile uint64_t *)(g_base + 0x866fc8);
+            uint64_t v = *fl;
+            if (v != g_flag_last) {
+                g_flag_last = v;
+                say_hex("标志 +0x866fc8=", v);
+                if (DO_ZEROFLAG && v && v < 0x1000) {
+                    *fl = 0;
+                    say("  已清零\n");
+                }
+            }
+        }
+#endif
         if (el > 12000) break;
         if (g_snap_i < g_snap_n && (int)(el * 10) >= g_snap_at[g_snap_i]) {
             dump_threads(g_snap_at[g_snap_i]);
@@ -2105,6 +2335,7 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 已重定向="); o_u(&o, (unsigned long long)g_redirects);
             o_s(&o, " 排空轮次="); o_d(&o, g_drain_loops);
             o_s(&o, " 改动次数="); o_d(&o, g_fake_rw);
+            o_s(&o, " 哨兵被读="); o_d(&o, g_sent_hit);
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
         }
@@ -2127,7 +2358,7 @@ __attribute__((constructor)) static void ctor(void) {
     if (g_fd < 0) return;
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.146 启动（安静观察：只记录网关与判定时刻）=====\n");
+    say("===== 0.0.160 启动（退出前同步冲环形缓冲）=====\n");
 
     try_takeover();
     {
@@ -2175,8 +2406,9 @@ __attribute__((constructor)) static void ctor(void) {
             say("注入库 "); say(nm); say("\n");
             say_hex("  范围 起点=", b);
         }
-        g_inj_n = k;
+            g_inj_n = k;
         say_hex("注入库个数=", k);
+        if (DO_DISGUISE) disguise_paths();
     }
 
     // 摘除 dyld 镜像数组里的注入条目：实测无效（盾不用这份数组），
@@ -2206,6 +2438,10 @@ __attribute__((constructor)) static void ctor(void) {
     }
 
 
+
+    // 哨兵必须放在我们自己的 _dyld_* 枚举之后：覆盖条目之后 dyld 再走那条数组
+    // 就会崩在自己的字段上，那种崩溃是我们的探针造成的，会把结论带偏。
+    if (DO_SENTINEL) plant_sentinel(find_cache_base());
 
     pthread_t a, b, c;
     pthread_create(&a, NULL, poller, NULL);
