@@ -26,8 +26,12 @@
 #import <stdlib.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <pthread.h>
 #import <signal.h>
+#import <sys/time.h>
+#define _XOPEN_SOURCE 700
+#import <ucontext.h>
 #import <setjmp.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
@@ -48,7 +52,8 @@
 // 两个干预开关。0.0.130 之前把"让盾对注入库的读取失败"留在了代码里，
 // 之后又叠了"改写检查项"，多个变量同时在场，退出链路对不上任何单一原因。
 // 现在分开关，一次只上一个。
-#define DO_TAKEOVER 1   // 接管网关（只为拿到盾基址并观察）
+#define DO_TAKEOVER 0   // 0.0.186：不接管网关。0.0.183 之后每次都在 20ms 停写日志、
+                        // 约 600ms SIGSEGV；0.0.182 却能活 5.9s。先确认接管本身是不是元凶。
 #define DO_LATEDL   0   // 枚举之后 dlopen 一个新库，看盾会不会读到它
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
@@ -71,6 +76,23 @@
 #define DO_DISGUISE 0   // 改写注入库在 dyld 里登记的名字
 #define DO_SENTINEL 0   // 哨兵：会被 dyld 自己的校验搞崩，只留作记录
 #define DO_DISKCHECK 0  // 逐镜像比对内存与磁盘（实验用，平时关掉）
+// 0.0.182：盾自检的第 3 条是对共享缓存里 0x1e0dac000 那一页算 SHA-256，
+// 而 kill 就住在同一页的 0x1e0dae27c。MSHookFunction 改了这一页，
+// 摘要自然对不上——这很可能就是原因码 5 的真正来源。先不挂，验一次。
+#define DO_KILLHOOK 0
+// 0.0.184：自检结构的扫描要读 9MB 再用 115 万次 vm_read 试探，
+// 在盾已经动手的时刻跑它，会把自己的观测结果搅乱（0.0.183 两次都 SIGSEGV）。
+// 这个问题已经有结论了，先关掉。
+#define DO_SELFSCAN 0
+// 0.0.185：检查表/完整性表的读表探针会周期性读几百 KB 并算 SHA-256，
+// 在盾动手的那几十毫秒里它是额外负载。要回答"exit 到底生不生效"时先关掉。
+#define DO_TABLEPROBE 0
+#define DO_SYMCHK 0
+// 0.0.194：心跳在 130-160ms 停住，而 0.0.187 起每次都在 catch_selfcheck 在场时发生。
+// 关掉它，看心跳能不能一路走到进程结束——这是观察 150-700ms 那一段的前提。
+#define DO_CATCH 0     // 打印关键 libc 符号的头 4 条指令，看注入器有没有打补丁
+// 0.0.195：清点盾对 App 暴露的 ObjC 接口。只读，不 hook、不改任何代码字节。
+#define DO_OBJC 0
 
 #define ZERO_PAGE 0x4000
 static char g_zero_page[ZERO_PAGE] __attribute__((aligned(ZERO_PAGE)));
@@ -90,6 +112,23 @@ static long raw_write(int fd, const void *buf, size_t n) {
 }
 
 extern uint64_t clock_gettime_nsec_np(unsigned clk);
+
+// 纯系统调用的 open，不经过 libc。故障处理函数里必须用它：如果盾把 libc 内部的
+// 锁弄成了死锁，处理函数里任何一次 libc 调用都会永远等下去，现场就永远写不出来。
+static long raw_open(const char *path, int flags, int mode) {
+    register long x16 __asm__("x16") = 5;   // SYS_open
+    register long x0  __asm__("x0")  = (long)path;
+    register long x1  __asm__("x1")  = flags;
+    register long x2  __asm__("x2")  = mode;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x16), "r"(x1), "r"(x2) : "memory", "cc");
+    return x0;
+}
+static long raw_close(int fd) {
+    register long x16 __asm__("x16") = 6;   // SYS_close
+    register long x0  __asm__("x0")  = fd;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x16) : "memory", "cc");
+    return x0;
+}
 
 static uint64_t up_ms(void) {
     return clock_gettime_nsec_np(4 /* CLOCK_UPTIME_RAW */) / 1000000ULL;
@@ -153,6 +192,125 @@ static void emit_ts(const char *s, size_t n);
 
 // 把一段代码改成"直接返回 0"。必须把页临时改成可写，写完立刻恢复可读可执行，
 // 否则代码签名会以 SIGBUS 收场（0.0.51 踩过）。
+// 0.0.204：把自检的比较点本身改成"永远相等"。
+//
+// 自检的形状是 0x43ccdc 处的 cmp x21, x20，随后由虚拟机在后面按条件码分支。
+// 把这条 cmp 换成 subs xzr, x21, x21（自己减自己），条件码就永远是"相等"，
+// 而它不修改任何寄存器的值，后面的虚拟机逻辑照常读到它期望的条件码。
+// 这一条改完之后，改动盾的其它代码不会再被自检抓到——前十九轮卡住的那道墙就打开了。
+//
+// 注意：这条补丁本身也落在被哈希的 __text 里，所以必须在第一次自检之前写好；
+// 构造函数在 3ms 左右运行，自检在 44ms 之后才开始。
+#define DO_HASHBYPASS 1
+// 0.0.205：改成只改退出闸门本身。
+// 0x40e804 处是 `cbz x19, 0x40e810`——说明文字为空才走退出。把它换成一条
+// 无条件跳往"只上报"分支（0x40e848）的 b，两条退出链就都变成"记一笔然后正常返回"。
+// 这样调用方拿到的是正常的返回路径，而不是被我们硬拦下来之后的垃圾状态。
+#define DO_FAIL_EXIT_NOP 0
+#define DO_GATE_RET 0
+// 0.0.207：闸门改成 ret 之后进程照样以退出码 1 结束，说明 exit 不是从闸门发的。
+// 盾自己的退出函数是 0x5d842c（除了闸门里那处间接调用，还有四个直接调用点）。
+// 把它整个换成 ret，如果进程仍然退出，那 exit 就不是盾发的。
+#define DO_EXITFN_RET 0
+#define DO_EXITPROBE 1
+#define DO_REPORT_PROBE 1
+// 0.0.214：5d8758 这个函数的形状是
+//   5d87a0  bl  0x712668        ; 判定，结果在 w0
+//   5d87a4  tbnz w0, #0, 5d87e0 ; bit0 置位就正常返回
+//   5d87d4  blr x8              ; 否则调退出
+// 把 tbnz 换成无条件跳往"正常返回"，这一次判定就等于永远通过。
+#define DO_VERDICT_OK 1
+#define DO_FAULTPROBE 1
+#define OFF_VERDICT_TBNZ 0x5d87a4ULL
+#define WORD_B_RETURN    0x1400000fU   // b 0x5d87e0
+// 闸门里那条"无说明就走退出"的分支，单独开关，避免多变量同时在场。
+#define DO_GATE_PATCH 1
+// 0.0.210：退出是从 0x43e0f8 那条 `blr x8` 发起的（探针实测），而它后面
+// 紧跟的就是这个函数正常的收尾（add sp / ret）。把这条换成 nop，等于让这一步
+// "当作已经做完、正常返回"——比让退出函数返回干净得多。
+#define DO_SKIP_EXIT_CALL 0
+#define OFF_EXIT_CALL 0x43e0f8ULL
+#define OFF_EXITFN 0x5d842cULL
+#define WORD_NOP_RET 0xd65f03c0U   // ret
+#define OFF_GATE_EXIT      0x40e804ULL
+#define WORD_B_TO_REPORT   0x14000011U   // b 0x40e848
+#define OFF_SELFCHECK_CMP  0x43ccdcULL   // cmp x21, x20
+#define WORD_SUBS_SELF     0xeb1502bfU   // subs xzr, x21, x21  → 永远相等
+#define OFF_FAIL_EXIT_BL   0x7133e4ULL   // 失败块里那次 bl 0x40e7e4
+#define WORD_NOP           0xd503201fU
+
+// 盾是不是会把自己被改过的代码页改回去？在几个时刻重读一次就知道。
+static void verify_patches(void) {
+    if (!g_base) return;
+    uint32_t a = *(volatile uint32_t *)(g_base + OFF_SELFCHECK_CMP);
+    uint32_t b = *(volatile uint32_t *)(g_base + OFF_GATE_EXIT);
+    uint32_t c = *(volatile uint32_t *)(g_base + OFF_EXITFN);
+    char lb[192];
+    out_t o = { lb, lb + sizeof(lb) - 1 };
+    o_s(&o, "核对补丁 t="); o_u(&o, up_ms() - g_t0);
+    o_s(&o, " 比较点="); o_h(&o, a);
+    o_s(&o, " 闸门分支="); o_h(&o, b);
+    o_s(&o, " 退出函数="); o_h(&o, c);
+    o_ch(&o, '\n');
+    emit_ts(lb, (size_t)(o.p - lb));
+}
+
+static void *ver(void *arg);
+static void *busy_probe(void *arg);
+
+static int install_exit_probe(void);
+static int install_report_probe(void);
+static void arm_fault_probe(void);
+
+
+static int patch_word(uintptr_t addr, uint32_t word) {
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("补丁：改页权限失败 kr=", (unsigned long long)kr); return 0; }
+    uint32_t before = *(volatile uint32_t *)addr;
+    ((volatile uint32_t *)addr)[0] = word;
+    sys_icache_invalidate((void *)addr, 4);
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("补丁：地址=", addr);
+    say_hex("  原=", before);
+    say_hex("  新=", word);
+    return 1;
+}
+
+
+static void install_hash_bypass(void) {
+    if (!g_base) { say("补丁：没有盾基址，放弃\n"); return; }
+    patch_word(g_base + OFF_SELFCHECK_CMP, WORD_SUBS_SELF);
+#if DO_FAIL_EXIT_NOP
+    patch_word(g_base + OFF_FAIL_EXIT_BL, WORD_NOP);
+#endif
+#if DO_GATE_PATCH
+    patch_word(g_base + OFF_GATE_EXIT, WORD_B_TO_REPORT);
+#endif
+#if DO_VERDICT_OK
+    patch_word(g_base + OFF_VERDICT_TBNZ, WORD_B_RETURN);
+#endif
+#if DO_EXITFN_RET
+    patch_word(g_base + OFF_EXITFN, WORD_NOP_RET);
+#endif
+#if DO_EXITPROBE
+    install_exit_probe();
+#endif
+#if DO_REPORT_PROBE
+    install_report_probe();
+#endif
+#if DO_SKIP_EXIT_CALL
+    patch_word(g_base + OFF_EXIT_CALL, WORD_NOP);
+#endif
+#if DO_GATE_RET
+    // 更彻底的一步：把闸门函数本身改成一条 ret。这样它既不上报也不退出。
+    // 如果进程仍然以退出码 1 结束，就说明 exit 根本不是从这道闸门发出的。
+    patch_word(g_base + 0x40e7e4ULL, WORD_NOP_RET);
+#endif
+}
+
 static int patch_ret0(uintptr_t addr) {
     uintptr_t page = addr & ~(uintptr_t)0xfff;
     kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
@@ -323,7 +481,15 @@ static void ring_push(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64
 
 // ---------------------------------------------------------------- 排空线程侧
 
-static void emit(const char *s, size_t n) { if (g_fd >= 0) raw_write(g_fd, s, n); }
+static volatile int g_write_err;
+static char g_logpath[512];
+// 0.0.192：日志在 110-150ms 之后突然什么都没有，而进程还活到 600-700ms。
+// 怀疑盾在判定后把进程里不属于它的文件描述符关掉了。这里记下写失败，
+// 由心跳线程（跑在 libc 就绪的线程上）重新打开，顺便把这件事本身写进日志。
+static void emit(const char *s, size_t n) {
+    if (g_fd < 0) { g_write_err = 1; return; }
+    if (raw_write(g_fd, s, n) < 0) g_write_err = 1;
+}
 
 static uint64_t g_pct_per_ms = 24000;
 
@@ -523,6 +689,7 @@ static void emit_rec(const rec_t *r, uint64_t now) {
 // 从网关处理函数里直接落地的一行：纯算术 + 裸 write。
 static void flush_ring(void);
 static void dump_mem(const char *label, uint64_t addr, int n);
+static void dump_mem_safe(const char *label, uint64_t addr, int n);
 
 // 退出那一刻，把失败函数（0x712668）的局部变量原样读出来。
 // 它的帧是 sp+0x1a0（x29 = sp+0x1a0），所以 [sp+X] 就是 [x29 - 0x1a0 + X]。
@@ -553,6 +720,22 @@ static void dump_exit_frames(uint64_t fp0) {
             }
             if (fld > g_base && fld < g_base + 0x8c0000)
                 dump_mem("    取值函数前 0x30 字节 @", fld, 0x30);
+            // 0x713160 调 0x5e7aa4([0x850e48])：那个函数只有两种返回 1 的路径——
+            // 对象首字节是 0，或者它列出的某一条自检没过。调用方把 bit0 当"中止"。
+            uint64_t st = *(volatile uint64_t *)(uintptr_t)(g_base + 0x850e48);
+            say_hex("  [0x850e48] 对象=", st);
+            if (st > 0x100000000ULL && st < 0x800000000ULL) {
+                dump_mem("    对象 0x40 @", st, 0x40);
+                uint64_t s28 = *(volatile uint64_t *)(uintptr_t)(st + 0x28);
+                uint64_t s30 = *(volatile uint64_t *)(uintptr_t)(st + 0x30);
+                if (s30 >= s28 && s28 > 0x100000000ULL && s30 < 0x800000000ULL) {
+                    say_hex("    条目数=", (s30 - s28) / 0x28);
+                    for (int m = 0; m < 2; m++) {
+                        if (s28 + (uint64_t)(m + 1) * 0x28 > s30) break;
+                        dump_mem("    条目 0x28 @", s28 + (uint64_t)m * 0x28, 0x28);
+                    }
+                }
+            }
             return;
         }
         fp = nx;
@@ -655,6 +838,62 @@ static void emergency_line(const rec_t *r) {
 // 从网关处理函数里直接落地的一行：纯算术 + 裸 write。
 
 
+// ---------------------------------------------------------------- 信号采样
+//
+// 30ms 之后文本日志、网关直写、心跳线程同时静默，但进程还要再跑 600ms。
+// 定时器信号是投递给"进程"的，会被任意一个正在跑的线程接收，不依赖我们自己
+// 创建的任何线程。处理函数只做裸 write，不碰 libc，可以在任何上下文里跑。
+// 每条记录里带上被打断处的 pc/sp/lr，事后按镜像表换算就知道它在执行哪个库。
+#define DO_SIGSAMPLE 1
+static int g_sigfd = -1;
+static volatile uint64_t g_sigseq;
+
+static void sig_handler(int sig, siginfo_t *si, void *ucv) {
+    (void)sig; (void)si;
+    if (g_sigfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x5349475000000001ULL;
+    r[1] = ++g_sigseq;
+    r[2] = 0; r[3] = 0; r[4] = 0;
+    ucontext_t *uc = (ucontext_t *)ucv;
+    if (uc && uc->uc_mcontext) {
+        r[2] = (uint64_t)uc->uc_mcontext->__ss.__pc;
+        r[3] = (uint64_t)uc->uc_mcontext->__ss.__sp;
+        r[4] = (uint64_t)uc->uc_mcontext->__ss.__lr;
+    }
+    r[5] = (uint64_t)g_base;
+    raw_write(g_sigfd, r, sizeof(r));
+}
+
+static void arm_sig_sample(void) {
+    if (g_sigfd < 0) { say("信号采样：没有文件描述符\n"); return; }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sig_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    int r1 = sigaction(SIGALRM, &sa, NULL);
+    // 每条记录都从一次"从头"开始，附上本次构造的序号和盾基址，便于切段。
+    {
+        static uint32_t ctor_n;
+        uint64_t h[6];
+        h[0] = 0x5349474800000000ULL;   // 魔数 "SIGH"
+        h[1] = ++ctor_n;
+        h[2] = (uint64_t)g_base;
+        h[3] = up_ms() - g_t0;
+        h[4] = 0; h[5] = 0;
+        raw_write(g_sigfd, h, sizeof(h));
+    }
+    struct itimerval it;
+    it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 2000;
+    it.it_value = it.it_interval;
+    int r2 = setitimer(ITIMER_REAL, &it, NULL);
+    say_hex("信号采样：sigaction=", (unsigned long long)(int64_t)r1);
+    say_hex("信号采样：setitimer=", (unsigned long long)(int64_t)r2);
+    // 立刻验证一次处理函数确实能写：如果下面这条记录没出现，问题在处理函数本身。
+    raise(SIGALRM);
+}
+
 // 由 gw_entry 调用，6 个参数：x0..x5（x5 是返回地址）。
 // 调用返回之后再看一眼回复。0.0.160 之前只记录请求，回复里有什么从来没见过——
 // 而 392 次 mach 4801 的回复正是"它枚举到了哪些内存区域"的唯一证据。
@@ -675,7 +914,61 @@ static void dump_mem(const char *label, uint64_t addr, int n) {
     emit_ts(buf, (size_t)(o.p - buf));
 }
 
+// 0.0.199：日志在 30-40ms 之后就没有任何新行，而进程活到 600-700ms。
+// 排空线程、心跳线程、ObjC 线程同时静默，但网关处理函数是跑在盾自己的线程上的，
+// 不受这件事影响。所以这里加一条"绕过环形缓冲、当场裸写"的通路，
+// 记录写进单独的二进制文件 gw.bin，和文本日志互不干扰。
+#define DO_GWDIRECT 1
+static int g_gwfd = -1;
+
+// 0.0.212：上一版的忙等探针在 t≈39ms 写完全部记录后停住（1245 轮 / 计划 4000 轮）。
+// 我们每个线程的循环里都调 up_ms()，也就是 clock_gettime_nsec_np。为了分清
+// "线程停了"和"取时间这一步卡住了"，这一版主循环完全不做时间调用，
+// 只写轮次；每 100 轮单独取一次时间。若轮次能跑满，问题就在取时间；
+// 若仍在 1200 轮上下停住，就是线程本身在 ~40ms 被停掉或挂起。
+#define DO_BUSYPROBE 0
+static void *busy_probe(void *arg) {
+    (void)arg;
+    if (g_gwfd < 0) return NULL;
+    for (uint64_t round = 1; round <= 6000; round++) {
+        for (volatile int i = 0; i < 20000; i++) { }
+        uint64_t r[6];
+        r[0] = 0x4255535900000002ULL;   // 魔数 "BUSY" v2
+        r[1] = round;
+        r[2] = (round % 100 == 0) ? (up_ms() - g_t0) : 0;
+        r[3] = 0; r[4] = 0; r[5] = (uint64_t)g_base;
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+    return NULL;
+}
+
+
+static volatile uint64_t g_gwseq;
+
+static void gw_direct(uint64_t kind, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x4757524543000000ULL | (kind & 0xff);   // 魔数 "GWREC"
+    r[1] = ++g_gwseq;
+    r[2] = nr;
+    r[3] = a0;
+    r[4] = a1;
+    r[5] = a2;
+    raw_write(g_gwfd, r, sizeof(r));
+}
+
 void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t caller) {
+#if DO_GWDIRECT
+    {
+        static uint32_t dn;
+        uint32_t c = ++dn;
+        // 关心的编号照常记；其余按计数抽样，用来证明"这段时间里网关一直在被人们调用"。
+        int want = (nr == 1) || (nr == 5) || (nr == 33) || (nr == 197) ||
+                   (nr == 202) || (nr == 294) || (nr > 1000);
+        if (want) gw_direct(1, nr, a0, a1, a2);
+        else if ((c % 500) == 0) gw_direct(9, nr, c, 0, 0);
+    }
+#endif
     // 盾每秒要过 6-7 万次系统调用。全部都记的话，日志几秒就涨到 25MB，
     // 探针自己成了负载：写日志抢 CPU、抢 IO，App 的启动被拖慢，存活时间也跟着飘。
     // 所以按 1/200 采样，但 exit（1）、以及负数编号（mach trap）里的关键项照常记。
@@ -785,6 +1078,13 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 }
 
 void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
+#if DO_GWDIRECT
+    {
+        int want = (nr == 1) || (nr == 5) || (nr == 33) || (nr == 197) ||
+                   (nr == 202) || (nr == 294) || (nr > 1000);
+        if (want) gw_direct(2, nr, a0, ret, 0);
+    }
+#endif
     // 文件类系统调用把结果当场记下来。盾在 50ms 内判定为"篡改"，
     // 而它启动时只 open 了 App 包内那几份文件——包里少一份（jigsaw.txt）
     // 是不是它眼里的"被拆过包"，只有看返回值才知道。
@@ -808,6 +1108,17 @@ void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
         return;
     }
 #endif
+    if (nr == 1) {
+        // 0.0.183：exit 系统调用如果真的生效，这里永远不会执行。
+        // 之前几轮都默认"盾调 exit → 进程死"，但 0.0.182 里盾在 56ms 调过一次 exit，
+        // 进程却活到 5.9 秒，之后同一个线程还在发系统调用。先把这件事钉死。
+        char buf[96];
+        out_t o = { buf, buf + sizeof(buf) - 1 };
+        o_s(&o, "退出系统调用返回了 x0=");
+        o_h(&o, ret);
+        o_ch(&o, '\n');
+        emit_ts(buf, (size_t)(o.p - buf));
+    }
     if (g_blk_mmap) {
         g_blk_mmap = 0;
         g_ret_override = (uint64_t)-1;         // EPERM
@@ -831,7 +1142,10 @@ void gw_after(uint64_t nr, uint64_t a0, uint64_t ret) {
     r->caller = 0; r->tid = raw_tid(); r->pad = 0;
     r->ts = read_pct(); r->fp = 0;
     const volatile uint64_t *src = (const volatile uint64_t *)(uintptr_t)a0;
-    for (int i = 0; i < PAY; i++) r->pay[i] = src[i];
+    // 只拷消息头 6 个字。0.0.183/0.0.184 有四次在 26ms 前后直接 SIGSEGV，
+    // 时间点正好压在这条记录之后——mach 回复缓冲区可能只有 64 字节，
+    // 照 24 个字（192 字节）读会跨进未映射页。消息头已经够判读这次系统调用了。
+    for (int i = 0; i < 6; i++) r->pay[i] = src[i];
     __atomic_store_n(&g_head, n, __ATOMIC_RELEASE);
     g_total++;
 }
@@ -967,9 +1281,6 @@ static void say_hex(const char *label, unsigned long long v) {
 }
 
 static void try_takeover(void) {
-#if !DO_TAKEOVER
-    return;
-#endif
     if (g_taken == -1) return;
     if (!g_base) {
         g_base = find_shield();
@@ -989,6 +1300,14 @@ static void try_takeover(void) {
             }
         }
     }
+#if !DO_TAKEOVER
+    // 0.0.185：只求盾基址，不动网关槽。槽在盾的 __DATA 里，如果盾的自检
+    // 也覆盖自己这块数据，"原因码 4"就可能是我们自己改槽改出来的。
+    static int said_once;
+    if (!said_once) { said_once = 1; say("本版不接管网关（只取基址）\n"); }
+    g_taken = 1;
+    return;
+#endif
     uint64_t cur = *g_slot;
     if (cur == 0) return;
     uint64_t want = (uint64_t)(uintptr_t)&gw_entry;
@@ -1311,6 +1630,9 @@ static void *poller(void *arg) {
     if (g_base) {
         // 已证实改代码会被盾的自检抓到（SIGBUS），关闭。
     }
+#if DO_TAKEOVER
+        // 0.0.187：这段复查以前不受 DO_TAKEOVER 约束。0.0.186 明明写着"不接管"，
+        // 日志里却仍然有网关记录，就是它把槽又写回去了。开关必须覆盖所有写槽的地方。
         if (g_taken == 1) {
             uint64_t want = (uint64_t)(uintptr_t)&gw_entry;
             uint64_t cur = *g_slot;
@@ -1320,6 +1642,7 @@ static void *poller(void *arg) {
                 say("已重新接管\n");
             }
         }
+#endif
         usleep(1000);
     }
     return NULL;
@@ -1562,6 +1885,217 @@ static void check_hooks(void) {
     say_hex("钩子自检：查到符号=", total);
     say_hex("  跳板形态=", hooked);
     say_hex("  找不到=", missing);
+}
+
+// 越狱的 systemhook 会给每个进程的 libSystem 函数打内联补丁。盾有没有可能正是
+// 通过"自己导入的函数序言被改过"来判断环境？这里把关键符号的头 4 条指令原样打出来，
+// 人眼一看就知道是不是跳板（ElleKit 的形态是 ldr x16,#8; br x16 或 b <trampoline>）。
+static void dump_sym_heads(void) {
+    static const char *syms[] = {
+        "open", "openat", "stat", "lstat", "fstat", "access", "readlink",
+        "sysctl", "getpid", "dlsym", "dlopen", "class_copyMethodList",
+        "method_getImplementation", "timingsafe_bcmp", "memcpy", "exit", NULL
+    };
+    for (int i = 0; syms[i]; i++) {
+        void *p = dlsym(RTLD_DEFAULT, syms[i]);
+        if (!p) { say("符号缺失 "); say(syms[i]); say("\n"); continue; }
+        char line[160];
+        out_t o = { line, line + sizeof(line) - 1 };
+        o_s(&o, "符号 "); o_s(&o, syms[i]); o_s(&o, " @"); o_h(&o, (uint64_t)(uintptr_t)p);
+        o_s(&o, " :");
+        for (int k = 0; k < 4; k++) {
+            uint32_t w = 0;
+            if (safe_read((uint64_t)(uintptr_t)p + (uint64_t)k * 4, &w, 4)) {
+                o_s(&o, " "); o_h(&o, w);
+            }
+        }
+        o_ch(&o, '\n');
+        emit_ts(line, (size_t)(o.p - line));
+    }
+}
+
+// ---------------------------------------------------------------- 盾的 ObjC 接口
+//
+// 这是唯一一块还没被碰过的东西。盾对 App 暴露的类、方法列表、协议全在可写数据段，
+// swizzle 改的是方法列表里的 IMP，不改变 __text 的任何一个字节，所以 19.3 那个
+// __text 哈希不受影响——这正是"不改盾的 dylib 也能干预"所需要的性质。
+// 这一版只做只读清点：协议叫什么、有哪些方法、谁实现了它、管理器的观察者是谁。
+
+static void dump_name(const char *tag, const char *s) {
+    say(tag); say(s ? s : "(空)"); say("\n");
+}
+
+static void dump_class_methods(const char *clsname) {
+    Class c = objc_getClass(clsname);
+    say("── 类 "); say(clsname); say(" : ");
+    if (!c) { say("未注册\n"); return; }
+    say("已注册\n");
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(c, &mc);
+    for (unsigned int j = 0; ms && j < mc; j++) {
+        char line[224];
+        out_t o = { line, line + sizeof(line) - 1 };
+        o_s(&o, "    -"); o_s(&o, sel_getName(method_getName(ms[j])));
+        o_s(&o, "  @"); o_h(&o, (uint64_t)(uintptr_t)method_getImplementation(ms[j]));
+        o_ch(&o, '\n');
+        emit_ts(line, (size_t)(o.p - line));
+    }
+    if (ms) free(ms);
+    Class meta = object_getClass((id)c);
+    mc = 0;
+    ms = class_copyMethodList(meta, &mc);
+    for (unsigned int j = 0; ms && j < mc; j++) {
+        char line[224];
+        out_t o = { line, line + sizeof(line) - 1 };
+        o_s(&o, "    +"); o_s(&o, sel_getName(method_getName(ms[j])));
+        o_s(&o, "  @"); o_h(&o, (uint64_t)(uintptr_t)method_getImplementation(ms[j]));
+        o_ch(&o, '\n');
+        emit_ts(line, (size_t)(o.p - line));
+    }
+    if (ms) free(ms);
+}
+
+static void dump_shield_objc(void) {
+    dump_class_methods("PRMShieldEventManager");
+    dump_class_methods("ShieldCallbackManager");
+    dump_class_methods("PRMShieldConfig");
+    dump_class_methods("ShieldConfig");
+
+    Protocol *p = objc_getProtocol("PRMShieldEventDelegate");
+    say("── 协议 PRMShieldEventDelegate : ");
+    if (!p) { say("未找到\n"); return; }
+    say("已找到\n");
+    for (int k = 0; k < 2; k++) {
+        unsigned int cnt = 0;
+        struct objc_method_description *d =
+            protocol_copyMethodDescriptionList(p, k == 0 ? YES : NO, YES, &cnt);
+        say_hex(k == 0 ? "  必需实例方法 数=" : "  可选实例方法 数=", cnt);
+        for (unsigned int i = 0; d && i < cnt; i++) {
+            char line[224];
+            out_t o = { line, line + sizeof(line) - 1 };
+            o_s(&o, "    "); o_s(&o, sel_getName(d[i].name));
+            o_s(&o, "  types="); o_s(&o, d[i].types ? d[i].types : "?");
+            o_ch(&o, '\n');
+            emit_ts(line, (size_t)(o.p - line));
+        }
+        if (d) free(d);
+    }
+}
+
+// 盾会在某个事件发生时回调观察者。App 那种实现我们自己挂一个进去：
+// 只要盾回调了，就等于它亲口说出"我判定的是什么"，比猜寄存器可靠得多。
+// 注册观察者走的是 ObjC 消息，不碰任何代码页。
+static void obs_log(SEL cmd, int v) {
+    char line[192];
+    out_t o = { line, line + sizeof(line) - 1 };
+    o_s(&o, "[事件] 盾回调 -"); o_s(&o, sel_getName(cmd));
+    if (v >= 0) { o_s(&o, "="); o_u(&o, (unsigned long long)v); }
+    o_s(&o, "  t="); o_u(&o, up_ms() - g_t0);
+    o_ch(&o, '\n');
+    emit_ts(line, (size_t)(o.p - line));
+}
+static void obs_plain(id self, SEL cmd) { (void)self; obs_log(cmd, -1); }
+static void obs_bool(id self, SEL cmd, BOOL v) { (void)self; obs_log(cmd, v ? 1 : 0); }
+
+static Class make_observer_class(void) {
+    static Class c;
+    if (c) return c;
+    c = objc_allocateClassPair(objc_getClass("NSObject"), "HSBCKObserver", 0);
+    if (!c) return NULL;
+    static const char *bools[] = {
+        "jailbreakStatus:", "systemIntegrityProtectionStatus:", "repackagingStatus:",
+        "debuggerStatus:", "screenRecordingStatus:", "developerModeStatus:", NULL
+    };
+    static const char *plains[] = {
+        "emulatorDetected", "screenshotDetected", "libraryInjectionPrevented",
+        "libraryInjectionDetected", "hookingFrameworksDetected", NULL
+    };
+    for (int i = 0; bools[i]; i++)
+        class_addMethod(c, sel_registerName(bools[i]), (IMP)obs_bool, "v20@0:8B16");
+    for (int i = 0; plains[i]; i++)
+        class_addMethod(c, sel_registerName(plains[i]), (IMP)obs_plain, "v16@0:8");
+    objc_registerClassPair(c);
+    return c;
+}
+
+static void register_observer(const char *clsname) {
+    Class c = objc_getClass(clsname);
+    if (!c) return;
+    id shared = ((id (*)(id, SEL))objc_msgSend)((id)c, sel_registerName("shared"));
+    if (!shared) { say("    注册观察者失败：shared 为空\n"); return; }
+    Class oc = make_observer_class();
+    if (!oc) { say("    注册观察者失败：造类失败\n"); return; }
+    id obj = ((id (*)(id, SEL))objc_msgSend)((id)oc, sel_registerName("new"));
+    ((void (*)(id, SEL, id))objc_msgSend)(shared, sel_registerName("addObserver:"), obj);
+    say("    已注册观察者 → "); say(clsname); say("\n");
+}
+
+// 逐轮读管理器当前登记了哪些观察者。观察者就是实现了上面那个协议的 App 对象，
+// 拿到它的类名，就能去找 App 那边收到 jailbreakStatus:YES 之后到底做了什么。
+static void dump_observers(const char *clsname, uint64_t tag) {
+    Class c = objc_getClass(clsname);
+    char line[256];
+    out_t o = { line, line + sizeof(line) - 1 };
+    o_s(&o, "  "); o_s(&o, clsname); o_s(&o, " 观察者 t="); o_u(&o, tag); o_ch(&o, '\n');
+    emit_ts(line, (size_t)(o.p - line));
+    if (!c) { say("    类未注册\n"); return; }
+    id shared = ((id (*)(id, SEL))objc_msgSend)((id)c, sel_registerName("shared"));
+    if (!shared) { say("    shared 为空\n"); return; }
+    id obs = ((id (*)(id, SEL))objc_msgSend)(shared, sel_registerName("observers"));
+    if (!obs) { say("    observers 为空\n"); return; }
+    unsigned long n = (unsigned long)((unsigned long (*)(id, SEL))objc_msgSend)
+                        (obs, sel_registerName("count"));
+    say_hex("    观察者个数=", n);
+    for (unsigned long i = 0; i < n && i < 8; i++) {
+        id it = ((id (*)(id, SEL, unsigned long))objc_msgSend)
+                    (obs, sel_registerName("objectAtIndex:"), i);
+        if (!it) continue;
+        const char *nm = class_getName(object_getClass(it));
+        say("    ["); say(nm ? nm : "?"); say("] 实现了:\n");
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(object_getClass(it), &mc);
+        for (unsigned int j = 0; ms && j < mc; j++) {
+            const char *sn = sel_getName(method_getName(ms[j]));
+            if (!sn) continue;
+            if (!strstr(sn, "Status:") && !strstr(sn, "Detected") &&
+                !strstr(sn, "Prevented") && !strstr(sn, "hookingFrameworks")) continue;
+            char l2[224];
+            out_t o2 = { l2, l2 + sizeof(l2) - 1 };
+            o_s(&o2, "      -"); o_s(&o2, sn);
+            o_s(&o2, "  @"); o_h(&o2, (uint64_t)(uintptr_t)method_getImplementation(ms[j]));
+            o_ch(&o2, '\n');
+            emit_ts(l2, (size_t)(o2.p - l2));
+        }
+        if (ms) free(ms);
+    }
+}
+
+// ObjC 运行时必须已经初始化，所以在独立线程里等一小会儿再动手。
+static void *objc_dump_thread(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 200; i++) {
+        if (objc_getClass("NSObject")) break;
+        usleep(500);
+    }
+    usleep(4000);
+    say_hex("[ObjC] 清点开始 t=", up_ms() - g_t0);
+    dump_shield_objc();
+    say_hex("[ObjC] 清点结束 t=", up_ms() - g_t0);
+    // 观察者是在 App 启动过程中才登记进来的，所以在判定之前多读几次。
+    static const uint64_t probes[] = { 18, 26, 34, 42, 50, 58, 66 };
+    for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        uint64_t now = up_ms() - g_t0;
+        if (probes[i] > now) usleep((useconds_t)((probes[i] - now) * 1000));
+        uint64_t t = up_ms() - g_t0;
+        if (i == 2) {
+            register_observer("PRMShieldEventManager");
+            register_observer("ShieldCallbackManager");
+        }
+        dump_observers("PRMShieldEventManager", t);
+        dump_observers("ShieldCallbackManager", t);
+    }
+    say_hex("[ObjC] 观察者清点结束 t=", up_ms() - g_t0);
+    return NULL;
 }
 
 static void dump_images(void) {
@@ -2991,6 +3525,106 @@ static void dump_threads(int tag_ms) {
 }
 
 
+// ---------------------------------------------------------------- 抓自检现场
+//
+// 0x43cc08 那一段做的是：S = [0x848fb8] - k，从 S 的 7 个 64 位字段算出
+// 期望哈希（x21 = a4 - a3*a6）与哈希函数地址（x9 = S + a6*a0 - a1 + a5 - a4*a6），
+// 输入指针 x1 = a3 - a2*a6，输出 x0 = S + a6*a0 - a1 + a2 - a6*a1，然后
+//   0x43cccc  blr x9
+//   0x43ccdc  cmp x21, x20        ← 期望 vs 实算
+// 两者不等的后果是原因码 4。
+//
+// 这段代码不调任何系统调用，网关看不见，只能靠外部线程快照。
+// 哈希主循环在 +0x65bfa8，处理 3MB 左右的数据要几毫秒，足够抓到。
+static int g_sc_caught;
+static int g_rep_caught;
+static int g_cmp_caught;
+
+// 0.0.189：0.0.188 的反推证明自检是过的——磁盘文件 __text 段的 xxHash64
+// （seed=0x9fca7ba5c41b2cec）正好等于盾的期望值 0x8d2fe35465f18925。
+// 那么"原因码 4"就不是这段自检报的。接下来要看两件事：
+//   1. 0x43ccdc 之后实算和期望到底相不相等（内存与磁盘可能不同）；
+//   2. 报告函数拿到的原因码与说明字符串是什么。
+// 这三段窗口都很短，只能靠提高采样次数去撞。
+static void catch_selfcheck(void) {
+    if (!g_base || (g_sc_caught >= 3 && g_cmp_caught >= 4 && g_rep_caught >= 6)) return;
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t i = 0; i < cnt && i < 48; i++) {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64,
+                             (thread_state_t)&st, &sc) == KERN_SUCCESS) {
+            uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(st);
+            if (pc >= g_base) {
+                uint64_t off = pc - g_base;
+                const uint64_t *rv = (const uint64_t *)&st;
+                if (off >= 0x65bfa8ULL && off < 0x65c600ULL && g_sc_caught < 3) {
+                    g_sc_caught++;
+                    say_hex("自检现场 pc=+", off);
+                    say_hex("  x21 期望=", rv[21]);
+                    say_hex("  x20 全局0x848fb8=", rv[20]);
+                    say_hex("  x1 当前指针=", rv[1]);
+                    say_hex("  x8 长度=", rv[8]);
+                    say_hex("  x11 终点前缀=", rv[11]);
+                } else if (off >= 0x43ccc4ULL && off < 0x43cd10ULL && g_cmp_caught < 4) {
+                    g_cmp_caught++;
+                    say_hex("比较现场 pc=+", off);
+                    say_hex("  x21 期望=", rv[21]);
+                    say_hex("  x20 实算=", rv[20]);
+                    say_hex("  相等=", (uint64_t)(rv[21] == rv[20]));
+                } else if (off >= 0x37ca78ULL && off < 0x37cae8ULL && g_rep_caught < 6) {
+                    // 报告函数的入口。它的参数是 x0,x1,x10,x11,x12,x13，
+                    // 进来后分别落到 x21,x25,x27,x20,x28,x22。
+                    g_rep_caught++;
+                    say_hex("报告入口 pc=+", off);
+                    say_hex("  x21 参数0=", rv[21]);
+                    say_hex("  x25 参数1=", rv[25]);
+                    say_hex("  x27 参数2=", rv[27]);
+                    say_hex("  x20 参数3=", rv[20]);
+                    say_hex("  x28 参数4=", rv[28]);
+                    say_hex("  x22 参数5=", rv[22]);
+                } else if (off >= 0x37d480ULL && off < 0x37d500ULL && g_rep_caught < 6) {
+                    g_rep_caught++;
+                    say_hex("报告构造 pc=+", off);
+                    dump_mem_safe("  x0 @", rv[0], 0x20);
+                    say_hex("  x1=", rv[1]);
+                    say_hex("  x2=", rv[2]);
+                    say_hex("  x19=", rv[19]);
+                    say_hex("  x20=", rv[20]);
+                } else if (off >= 0x40e7e4ULL && off < 0x40f000ULL && g_rep_caught < 6) {
+                    g_rep_caught++;
+                    // 0x40e7e4 一进来就把参数存进 x20(reason)/x19(desc)，
+                    // 它们在整个函数体内都是 callee-saved，采样在任意位置都能读到。
+                    say_hex("上报现场 pc=+", off);
+                    say_hex("  原因码 x20=", rv[20]);
+                    say_hex("  说明 x19=", rv[19]);
+                    uint64_t descp = rv[19];
+                    if (descp > 0x100000000ULL) {
+                        char tmp[160];
+                        int n2 = 0;
+                        if (safe_read(descp, tmp, 128)) {
+                            tmp[127] = 0;
+                            say("  说明文本="); say(tmp); say("\n");
+                            n2 = 1;
+                        }
+                        (void)n2;
+                    }
+                }
+            }
+        }
+    }
+    // 0.0.195：以前只释放了循环里查过的那几十个端口，cnt 更大的时候每一轮都在泄漏
+    // send right，端口表迟早耗尽，task_threads 就会一直失败或卡住。
+    // 现在不管查了几个，全部还回去。
+    for (mach_msg_type_number_t i = 0; i < cnt; i++)
+        mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (mach_vm_address_t)list,
+                  (mach_vm_size_t)(cnt * sizeof(thread_t)));
+}
+
+
 // 进程实际占用的物理内存。盾把整份共享缓存（约 1.42GB）映射进了进程，
 // 而"启动几秒后被 SIGKILL、没有任何崩溃报告"正是被系统按内存压力收走的典型样子。
 // 把这条曲线打出来，就不用再猜。
@@ -3284,8 +3918,201 @@ static void probe_selfcheck(uint64_t el) {
     free(buf);
 }
 
+// ---------------------------------------------------------------- 完整性表
+//
+// 0x713160 调 0x5e7aa4([0x850e48])，那个函数只有两种返回 1（=中止）的路径：
+// 对象首字节是 0，或者它那 16 条自检里有一条对不上。实测首字节是 1，
+// 所以中止来自某一条比对失败。
+//
+// 每条 0x28 字节：{目标地址, 期望块指针, 长度, 比对长度, 标志}。
+// 第一条是共享缓存里的 0x1e0da0000、长度 0x4000、比对长度 0x20 —— 也就是
+// 对 16KB 内存算 32 字节摘要（SHA-256）再和一块堆上的期望值比。
+// 这里用 CommonCrypto 自己算一遍，把"哪一条对不上"直接指出来。
+static int (*g_sha256)(const void *, unsigned int, unsigned char *);
+
+static void probe_integrity(uint64_t el) {
+    static int done;
+    if (done || !g_base || el < 45) return;
+    uint64_t st = 0;
+    if (!safe_read(g_base + 0x850e48, &st, 8)) return;
+    if (st < 0x100000000ULL || st > 0x800000000ULL) return;   // 还没建出来
+    done = 1;
+
+    if (!g_sha256) g_sha256 = (int (*)(const void *, unsigned int, unsigned char *))
+        dlsym(RTLD_DEFAULT, "CC_SHA256");
+
+    uint64_t b = 0, e = 0;
+    if (!safe_read(st + 0x28, &b, 8) || !safe_read(st + 0x30, &e, 8)) return;
+    if (e < b || b < 0x100000000ULL) return;
+    uint64_t n = (e - b) / 0x28;
+    say_hex("完整性表 条目数=", n);
+    say_hex("  CC_SHA256=", (uint64_t)(uintptr_t)g_sha256);
+
+    for (uint64_t i = 0; i < n && i < 20; i++) {
+        uint64_t ent = b + i * 0x28;
+        uint64_t addr = 0, obj = 0, len = 0, l2 = 0;
+        if (!safe_read(ent, &addr, 8) || !safe_read(ent + 8, &obj, 8)) continue;
+        safe_read(ent + 0x10, &len, 8);
+        safe_read(ent + 0x18, &l2, 8);
+        say_hex(" 条目 目标=", addr);
+        say_hex("   期望块=", obj);
+        say_hex("   长度=", len);
+        say_hex("   比对长度=", l2);
+        int ii = img_index_of(addr);
+        if (ii >= 0 && ii < g_img_tab_n && g_img_names[ii]) {
+            say("   所在镜像=");
+            say(g_img_names[ii]);
+            say("\n");
+        } else {
+            say_hex("   不在已加载镜像里，相对盾=", addr - g_base);
+        }
+        if (l2 == 32 && obj && len && len <= 0x100000 && g_sha256) {
+            unsigned char *buf = (unsigned char *)malloc((size_t)len);
+            unsigned char exp[32], dig[32];
+            if (buf && safe_read(addr, buf, (size_t)len) && safe_read(obj, exp, 32)) {
+                g_sha256(buf, (unsigned int)len, dig);
+                int same = memcmp(dig, exp, 32) == 0;
+                say_hex("   摘要一致=", (uint64_t)same);
+                dump_mem("   实算=", (uint64_t)(uintptr_t)dig, 32);
+                dump_mem("   期望=", obj, 32);
+            }
+            if (buf) free(buf);
+        }
+    }
+}
+
+// 16 条里只有一条对不上：共享缓存 0x1e0dac000 那一页（libsystem_kernel 里）。
+// 也就是说盾中止的原因不是"发现越狱痕迹"，而是"系统库里有一页的摘要变了"。
+// 期望摘要是堆上的一块 32 字节拷贝，属于可写数据——把实算值写进去，
+// 这条自检就过了。整个过程不碰任何代码页，也不碰盾的文件。
+static int g_fixint_done;
+static void report_fix_count(void) { if (g_fixint_done) say_hex("完整性表 已改条数=", (uint64_t)g_fixint_done); }
+
+static void fix_integrity(uint64_t el) {
+    static uint64_t next_at, last_st;
+    if (!g_base || el < next_at) return;
+    next_at = el + 30;                       // 每 3ms 最多算一遍
+    uint64_t st = 0;
+    if (!safe_read(g_base + 0x850e48, &st, 8)) return;
+    if (st < 0x100000000ULL || st > 0x800000000ULL) return;
+    if (st != last_st) {
+        last_st = st;
+        say_hex("完整性表 对象首次/变化=", st);
+        uint64_t t0 = 0, b0 = 0;
+        if (safe_read(st + 0x28, &b0, 8) && b0 > 0x100000000ULL && safe_read(b0, &t0, 8))
+            say_hex("  首条目标=", t0);
+    }
+    if (!g_sha256) g_sha256 = (int (*)(const void *, unsigned int, unsigned char *))
+        dlsym(RTLD_DEFAULT, "CC_SHA256");
+    if (!g_sha256) return;
+    uint64_t b = 0, e = 0;
+    if (!safe_read(st + 0x28, &b, 8) || !safe_read(st + 0x30, &e, 8)) return;
+    if (e < b || b < 0x100000000ULL) return;
+
+    for (uint64_t i = 0; i < (e - b) / 0x28 && i < 32; i++) {
+        uint64_t ent = b + i * 0x28;
+        uint64_t addr = 0, obj = 0, len = 0, l2 = 0;
+        if (!safe_read(ent, &addr, 8) || !safe_read(ent + 8, &obj, 8)) continue;
+        safe_read(ent + 0x10, &len, 8);
+        safe_read(ent + 0x18, &l2, 8);
+        if (l2 != 32 || !obj || !len || len > 0x100000) continue;
+        unsigned char *buf = (unsigned char *)malloc((size_t)len);
+        unsigned char exp[32], dig[32];
+        if (!buf) return;
+        if (safe_read(addr, buf, (size_t)len) && safe_read(obj, exp, 32)) {
+            g_sha256(buf, (unsigned int)len, dig);
+            if (memcmp(dig, exp, 32) != 0) {
+                // 期望块在堆上，直接写；写完回读确认，写不进去就如实报出来
+                memcpy((void *)(uintptr_t)obj, dig, 32);
+                unsigned char back[32];
+                int ok = safe_read(obj, back, 32) && memcmp(back, dig, 32) == 0;
+                say_hex("完整性表 第", i);
+                say_hex("  目标=", addr);
+                say_hex("  已把期望摘要改成实算值，写回成功=", (uint64_t)ok);
+                g_fixint_done++;
+            }
+        }
+        free(buf);
+    }
+}
+
+
+// ---------------------------------------------------------------- 抓上报参数
+//
+// 0x40e7e4(reason, desc) 是盾所有"上报问题"的唯一出口：desc 为空时它直接走退出，
+// desc 非空时只上报、继续跑。所以"哪一项检查失败、失败理由是什么"全在这里。
+// 它不经过网关（普通 bl 调用），采样窗口又只有几条指令，只能挂钩子。
+//
+// 注意：改 0x40e7e4 会改到盾的 __text，而 __text 的 xxHash64 自检在 75-130ms 之间跑，
+// 所以挂上之后自检必然失败。这次实验只为了拿到上报参数，接受这个副作用。
+static void (*o_report)(uint64_t, const char *);
+static int g_rp_n;
+
+static void my_report(uint64_t reason, const char *desc) {
+    if (g_rp_n < 24) {
+        g_rp_n++;
+        char buf[256];
+        out_t o = { buf, buf + sizeof(buf) - 1 };
+        o_s(&o, "上报 原因码="); o_h(&o, reason);
+        o_s(&o, " 说明="); o_h(&o, (uint64_t)(uintptr_t)desc);
+        o_ch(&o, '\n');
+        emit_ts(buf, (size_t)(o.p - buf));
+        if (desc) {
+            char txt[129];
+            if (safe_read((uint64_t)(uintptr_t)desc, txt, 128)) {
+                txt[128] = 0;
+                char line[200];
+                out_t o2 = { line, line + sizeof(line) - 1 };
+                o_s(&o2, "  文字=");
+                for (int i = 0; i < 128 && txt[i]; i++) o_ch(&o2, txt[i]);
+                o_ch(&o2, '\n');
+                emit_ts(line, (size_t)(o2.p - line));
+            }
+        }
+    }
+    if (o_report) o_report(reason, desc);
+}
+
+static void install_report_hook(void) {
+    if (!g_base || o_report) return;
+    MSHookFunction((void *)(g_base + 0x40e7e4), (void *)my_report, (void **)&o_report);
+    say_hex("已挂上报钩子 原函数=", (uint64_t)(uintptr_t)o_report);
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
+    // 0.0.218：心跳在 40-70ms 之后不再输出。这里在最前面加一条完全独立的通路：
+    // 不调任何取时间的函数，每一轮重新 open 一次文件再写。只要它还在增长，
+    // 就说明线程本身没停，之前看到的"静默"是取时间或旧文件描述符的问题。
+    {
+        static char hbloop_path[256];
+        static int hb_path_ready;
+        static uint64_t hb_round;
+        if (!hb_path_ready) {
+            hb_path_ready = 1;
+            const char *lb = g_logpath;
+            size_t k = 0;
+            while (lb[k] && k < sizeof(hbloop_path) - 12) { hbloop_path[k] = lb[k]; k++; }
+            const char *suf = "-hb.bin";
+            for (size_t j = 0; suf[j]; j++) hbloop_path[k++] = suf[j];
+            hbloop_path[k] = 0;
+        }
+        if (hbloop_path[0]) {
+            for (;;) {
+                hb_round++;
+                int fd = open(hbloop_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd >= 0) {
+                    uint64_t r[2];
+                    r[0] = 0x48422d4c4f4f5000ULL;   // 魔数 "HB-LOOP"
+                    r[1] = hb_round;
+                    raw_write((int)fd, r, sizeof(r));
+                    close(fd);
+                }
+                __asm__ volatile("" ::: "memory");
+                if (hb_round >= 200000) break;
+            }
+        }
+    }
     // 36-62ms 每 0.2ms 采样：哈希阶段每张镜像只花 1-3ms，粗采样会整张漏掉。
     static int g_snap_at[200];
     static int g_snap_n;
@@ -3300,7 +4127,13 @@ static void *heartbeat(void *arg) {
     uint64_t last_hb = 0;
     for (;;) {
         if (g_probe_len && !g_probe_done) { g_probe_done = 1; dump_probe(); }
-        uint64_t el = rec_ms(read_pct());
+        // 0.0.193：0.0.192 的证据说明 cntpct_el0 在 ~110ms 之后不再前进——
+        // 日志里最后几条的时间戳全停在同一个数，而线程明明还在跑（自检现场还在写）。
+        // 于是 `el - last_hb >= 50` 永远不成立，心跳整体静默。
+        // 心跳线程上 libc 已就绪，改用 clock_gettime 做时间基准。
+        // 无条件用 clock_gettime：cntpct 一旦停滞，这个循环就会永久静默，
+        // 而"看起来像进程已经死了"。心跳线程上 libc 早就就绪，这个调用是安全的。
+        uint64_t el = g_t0 ? (up_ms() - g_t0) : 0;
         {
             static int said_cls;
             {
@@ -3414,9 +4247,27 @@ static void *heartbeat(void *arg) {
             dump_threads(g_snap_at[g_snap_i]);
             g_snap_i++;
         }
+#if DO_SELFSCAN
         probe_selfcheck(el);
+#endif
+#if DO_TABLEPROBE
         probe_checks(el);
+        probe_integrity(el);
+        fix_integrity(el);
+#endif
         patch_exit_after_selfcheck(el);
+        // 0.0.193：0.0.189/0.191 在 20-130ms 窗口里一次都没撞到 0x40e7e4，
+        // 说明真正的上报发生在 150ms 之后。窗口延长到 1 秒，150ms 以后降频。
+#if DO_CATCH
+        if (el >= 20 && el <= 1200) {
+            static uint32_t g_cc_n;
+            if (++g_cc_n < 400 || (g_cc_n % 8) == 0) catch_selfcheck();
+        }
+#endif
+        if (g_write_err && g_logpath[0]) {
+            int f = open(g_logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (f >= 0) { g_fd = f; g_write_err = 0; say("[日志描述符已重开]\n"); }
+        }
         if (el - last_hb >= 50) {
             last_hb = el;
             char buf[192];
@@ -3436,6 +4287,8 @@ static void *heartbeat(void *arg) {
             o_s(&o, " 见过kill="); o_d(&o, (long long)g_kill_seen);
             o_s(&o, " 退出函数="); o_d(&o, (long long)g_exitfn_hits);
             o_s(&o, " 判定调用="); o_d(&o, (long long)g_verdict_calls);
+            o_s(&o, " fd="); o_d(&o, g_fd);
+            o_s(&o, " 写错="); o_d(&o, g_write_err);
             o_s(&o, " 内存MB="); o_d(&o, (long long)(footprint_kb() / 1024));
             o_ch(&o, '\n');
             emit_ts(buf, (size_t)(o.p - buf));
@@ -3451,17 +4304,309 @@ static void *heartbeat(void *arg) {
     return NULL;
 }
 
+// 0.0.208：退出探针。
+//
+// 之前所有观测都死在 40ms 左右：心跳线程、排空线程、定时器信号同时静默，
+// 而进程要到 500 多毫秒才结束。唯一能在盾自己的线程上跑起来的代码，
+// 是打进去的补丁本身。所以把退出函数 0x5d842c 的入口改成一条跳转，
+// 跳到下面这个探针：它先把调用者的返回地址、原因码、说明指针和帧指针
+// 原样写进 gw.bin，再执行真正的 exit(1)。这样 40–500ms 那段就有了唯一的观测点。
+__attribute__((noinline, used)) void exit_probe_log(uint64_t *f) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x4558495400000001ULL;   // 魔数 "EXIT"
+    r[1] = f[11];                   // 调用者返回地址（x30 存在 #0x58）
+    r[2] = f[0];                    // x0（原因码）
+    r[3] = f[1];                    // x1（说明文字指针）
+    r[4] = f[9];                    // x29（帧指针）
+    r[5] = (uint64_t)g_base;
+    raw_write(g_gwfd, r, sizeof(r));
+    // 顺着帧链再往上走几层，每层记返回地址，够看清是谁发起的退出。
+    uint64_t fp = f[9];
+    for (int i = 0; i < 6 && fp; i++) {
+        uint64_t *p = (uint64_t *)(uintptr_t)fp;
+        uint64_t nfp = 0, lr = 0;
+        if (!safe_read((uint64_t)(uintptr_t)p, &nfp, 8)) break;
+        if (!safe_read((uint64_t)(uintptr_t)p + 8, &lr, 8)) break;
+        uint64_t q[6];
+        q[0] = 0x4558495400000002ULL;
+        q[1] = (uint64_t)(i + 1);
+        q[2] = lr;
+        q[3] = nfp;
+        q[4] = 0; q[5] = (uint64_t)g_base;
+        raw_write(g_gwfd, q, sizeof(q));
+        if (nfp <= fp) break;
+        fp = nfp;
+    }
+}
+
+__attribute__((naked)) static void exit_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x80\n"
+        "stp x0, x1, [sp, #0x00]\n"
+        "stp x2, x3, [sp, #0x10]\n"
+        "stp x4, x5, [sp, #0x20]\n"
+        "stp x6, x7, [sp, #0x30]\n"
+        "stp x8, x9, [sp, #0x40]\n"
+        "str x10,     [sp, #0x50]\n"
+        "str x29,     [sp, #0x48]\n"
+        "str x30,     [sp, #0x58]\n"
+        "mov x0, sp\n"
+        "bl _exit_probe_log\n"
+        "mov x0, #1\n"
+        "mov x16, #1\n"
+        "svc #0x80\n"
+        "brk #1\n"
+    );
+}
+
+// 把 0x5d842c 的头 12 字节改写成 ldr x16,#8; br x16; .quad 探针地址。
+static int install_exit_probe(void) {
+    if (!g_base) return 0;
+    uintptr_t addr = g_base + 0x5d842cULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x8000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("退出探针：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;                        // ldr x16, #8
+    w[1] = 0xd61f0200;                        // br  x16
+    *lit = (uint64_t)(uintptr_t)&exit_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x8000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("退出探针：已装到 ", addr);
+    say_hex("  探针地址=", (uint64_t)(uintptr_t)&exit_stub);
+    return 1;
+}
+
+// 0.0.213：上报函数探针。
+//
+// 之前只知道"某次上报没带说明文字就退出"，看不到到底上报了几次、每次的原因码
+// 和说明是什么。0x40e7e4 是唯一的上报出口，在它入口插一个记录桩：
+// 把原因码、说明文字前 96 字节、以及调用者返回地址写进 gw.bin，然后原样继续执行。
+//
+// 桩必须把被替换掉的四条序言指令重放一遍（sub sp / 三次 stp），再跳到原函数
+// 第 5 条指令，所以函数行为完全不变，只是多了一条记录。
+static uint64_t g_report_resume;
+
+__attribute__((used)) static void report_probe_log(uint64_t reason, const char *desc, uint64_t caller) {
+    if (g_gwfd < 0) return;
+    uint64_t r[6];
+    r[0] = 0x5245505200000001ULL;   // 魔数 "REPR"
+    r[1] = reason & 0xffffffffULL;
+    r[2] = caller;
+    r[3] = (uint64_t)(uintptr_t)desc;
+    // 说明文字前 8 个字节原样带走，够看出是不是空串、以及前缀是什么。
+    uint64_t head = 0;
+    if (desc && safe_read((uint64_t)(uintptr_t)desc, &head, 8)) { }
+    r[4] = head;
+    // 顺便看一眼 SIGILL 的处置函数还是不是我们自己装的那个。
+    // 盾是防调试库，重新装信号处理器是它的常规操作；若是被换掉，
+    // 那故障信号就永远到不了我们的处理函数。
+    // 0.0.220：既然盾会换掉处理函数，那就在它换完之后再装回来。
+    // 这个函数跑在盾自己的线程上，不受我们线程被停住的影响，时机正好。
+    struct sigaction cur;
+    memset(&cur, 0, sizeof(cur));
+    if (sigaction(SIGILL, NULL, &cur) == 0)
+        r[5] = (uint64_t)(uintptr_t)cur.__sigaction_u.__sa_sigaction;
+    else
+        r[5] = 0;
+    raw_write(g_gwfd, r, sizeof(r));
+    extern void arm_fault_probe(void);
+    arm_fault_probe();
+}
+
+__attribute__((naked)) static void report_stub(void) {
+    __asm__ volatile(
+        "sub sp, sp, #0x100\n"
+        "stp x0, x1, [sp, #0x00]\n"
+        "stp x2, x3, [sp, #0x10]\n"
+        "stp x4, x5, [sp, #0x20]\n"
+        "stp x6, x7, [sp, #0x30]\n"
+        "stp x8, x9, [sp, #0x40]\n"
+        "stp x10, x11, [sp, #0x50]\n"
+        "stp x12, x13, [sp, #0x60]\n"
+        "stp x14, x15, [sp, #0x70]\n"
+        "stp x16, x17, [sp, #0x80]\n"
+        "stp x18, x19, [sp, #0x90]\n"
+        "stp x20, x21, [sp, #0xa0]\n"
+        "stp x22, x23, [sp, #0xb0]\n"
+        "stp x24, x25, [sp, #0xc0]\n"
+        "stp x26, x27, [sp, #0xd0]\n"
+        "stp x28, x29, [sp, #0xe0]\n"
+        "str x30,      [sp, #0xf0]\n"
+        "ldr x0, [sp, #0x00]\n"
+        "ldr x1, [sp, #0x08]\n"
+        "ldr x2, [sp, #0xf0]\n"
+        "bl _report_probe_log\n"
+        "ldr x30,      [sp, #0xf0]\n"
+        "ldp x28, x29, [sp, #0xe0]\n"
+        "ldp x26, x27, [sp, #0xd0]\n"
+        "ldp x24, x25, [sp, #0xc0]\n"
+        "ldp x22, x23, [sp, #0xb0]\n"
+        "ldp x20, x21, [sp, #0xa0]\n"
+        "ldp x18, x19, [sp, #0x90]\n"
+        "ldp x16, x17, [sp, #0x80]\n"
+        "ldp x14, x15, [sp, #0x70]\n"
+        "ldp x12, x13, [sp, #0x60]\n"
+        "ldp x10, x11, [sp, #0x50]\n"
+        "ldp x8,  x9,  [sp, #0x40]\n"
+        "ldp x6,  x7,  [sp, #0x30]\n"
+        "ldp x4,  x5,  [sp, #0x20]\n"
+        "ldp x2,  x3,  [sp, #0x10]\n"
+        "ldp x0,  x1,  [sp, #0x00]\n"
+        "add sp, sp, #0x100\n"
+        // 被替换掉的原序言，原样重放
+        "sub sp, sp, #0x80\n"
+        "stp x22, x21, [sp, #0x50]\n"
+        "stp x20, x19, [sp, #0x60]\n"
+        "stp x29, x30, [sp, #0x70]\n"
+        "adrp x16, _g_report_resume@PAGE\n"
+        "ldr x16, [x16, _g_report_resume@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static int install_report_probe(void) {
+    if (!g_base) return 0;
+    g_report_resume = g_base + 0x40e7f4ULL;   // 原函数第 5 条指令 add x29, sp, #0x70
+    uintptr_t addr = g_base + 0x40e7e4ULL;
+    uintptr_t page = addr & ~(uintptr_t)0xfff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x8000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { say_hex("上报探针：改页失败 kr=", (unsigned long long)kr); return 0; }
+    volatile uint32_t *w = (volatile uint32_t *)addr;
+    volatile uint64_t *lit = (volatile uint64_t *)(addr + 8);
+    w[0] = 0x58000050;                        // ldr x16, #8
+    w[1] = 0xd61f0200;                        // br  x16
+    *lit = (uint64_t)(uintptr_t)&report_stub;
+    sys_icache_invalidate((void *)addr, 16);
+    mach_vm_protect(mach_task_self(), page, 0x8000, 0,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    say_hex("上报探针：已装到 ", addr);
+    say_hex("  续行地址=", g_report_resume);
+    return 1;
+}
+
+// 0.0.215：把退出跳过去之后，进程改在 ~613ms 死于 SIGILL。非法指令在用户态
+// 只有几种来源：故意写进去的 brk/未定义指令、被关掉使能位的 mrs cntpct_el0、
+// 或者我们自己的补丁写坏了。装一个故障处理函数，把出事那一刻的 pc/lr/sp
+// 和故障地址原样记下来，一次性看清是哪一种。
+#define DO_FAULTPROBE 1
+static char g_faultpath[256];
+
+static void fault_handler(int sig, siginfo_t *si, void *ucv) {
+    {
+        // 40ms 之后原有的文件描述符再也写不出东西，所以这里当场重新打开一个。
+        long fd = g_faultpath[0] ? raw_open(g_faultpath, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
+        if (fd < 0) fd = g_gwfd;
+        if (fd >= 0) {
+            uint64_t r[6];
+            r[0] = 0x4641554c00000001ULL;   // 魔数 "FAUL"
+            r[1] = (uint64_t)sig;
+            r[2] = 0; r[3] = 0; r[4] = (uint64_t)(uintptr_t)si->si_addr;
+            ucontext_t *uc = (ucontext_t *)ucv;
+            if (uc && uc->uc_mcontext) {
+                r[2] = (uint64_t)uc->uc_mcontext->__ss.__pc;
+                r[3] = (uint64_t)uc->uc_mcontext->__ss.__lr;
+            }
+            r[5] = (uint64_t)g_base;
+            raw_write(fd, r, sizeof(r));
+            if (fd != g_gwfd) raw_close((int)fd);
+        }
+    }
+    if (g_gwfd >= 0) {
+        uint64_t r[6];
+        r[0] = 0x4641554c00000001ULL;   // 魔数 "FAUL"
+        r[1] = (uint64_t)sig;
+        r[2] = 0; r[3] = 0; r[4] = (uint64_t)(uintptr_t)si->si_addr;
+        ucontext_t *uc = (ucontext_t *)ucv;
+        if (uc && uc->uc_mcontext) {
+            r[2] = (uint64_t)uc->uc_mcontext->__ss.__pc;
+            r[3] = (uint64_t)uc->uc_mcontext->__ss.__lr;
+        }
+        r[5] = (uint64_t)g_base;
+        raw_write(g_gwfd, r, sizeof(r));
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void arm_fault_probe(void) {
+    static const int sigs[] = { SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+
+static void *ver(void *arg) {
+    (void)arg;
+    static const uint64_t ts[] = { 12, 25, 40, 55, 70, 90, 120 };
+    for (unsigned i = 0; i < sizeof(ts) / sizeof(ts[0]); i++) {
+        uint64_t now = up_ms() - g_t0;
+        if (ts[i] > now) usleep((useconds_t)((ts[i] - now) * 1000));
+        verify_patches();
+    }
+    return NULL;
+}
+
 __attribute__((constructor)) static void ctor(void) {
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
     if (!caches) return;
     NSString *lp = [caches stringByAppendingPathComponent:@"hsbchkbypass.log"];
+    {
+        const char *rp = [lp fileSystemRepresentation];
+        size_t k = 0;
+        while (rp[k] && k + 1 < sizeof(g_logpath)) { g_logpath[k] = rp[k]; k++; }
+        g_logpath[k] = 0;
+    }
     g_fd = open([lp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_fd < 0) return;
+    {
+        // 网关直写用的二进制记录单独一个文件，和文本日志混在一起会没法解析。
+        NSString *gp = [caches stringByAppendingPathComponent:@"hsbchkbypass-gw.bin"];
+        g_gwfd = open([gp fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        NSString *fp = [caches stringByAppendingPathComponent:@"hsbchkbypass-fault.bin"];
+        {
+            const char *rp2 = [fp fileSystemRepresentation];
+            size_t k2 = 0;
+            while (rp2[k2] && k2 + 1 < sizeof(g_faultpath)) { g_faultpath[k2] = rp2[k2]; k2++; }
+            g_faultpath[k2] = 0;
+        }
+        NSString *sp = [caches stringByAppendingPathComponent:@"hsbchkbypass-sig.bin"];
+        // 0.0.202：不截断。这个 App 的构造函数在一次启动里会被调用好几次，
+        // 每次截断都会把前面已经写下的采样冲掉。
+        g_sigfd = open([sp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
     g_t0 = up_ms();
     g_ts0 = read_pct();
-    say("===== 0.0.170 启动（让退出函数的下一站正常返回）=====\n");
+    say("===== 0.0.220 启动（上报时把故障处理装回来）=====\n");
 
     try_takeover();
+#if DO_HASHBYPASS
+    install_hash_bypass();
+#endif
+#if DO_SIGSAMPLE
+    arm_sig_sample();
+#endif
+#if DO_FAULTPROBE
+    arm_fault_probe();
+    { if (g_gwfd >= 0) { uint64_t r[6] = { 0x4641554c00000002ULL, 0, 0, 0, 0, (uint64_t)g_base }; raw_write(g_gwfd, r, sizeof(r)); } }
+#endif
+#if DO_BUSYPROBE
+    { pthread_t bt; pthread_create(&bt, NULL, busy_probe, NULL); }
+#endif
+    {
+        pthread_t vt;
+        pthread_create(&vt, NULL, ver, NULL);
+    }
     {
         // 观测线程必须最早起来：下面枚举镜像要几十毫秒，而盾的判定就发生在那段时间里。
         static int started;
@@ -3472,7 +4617,18 @@ __attribute__((constructor)) static void ctor(void) {
         }
     }
     fill_img_tab();
+#if DO_OBJC
+    {
+        pthread_t ot;
+        pthread_create(&ot, NULL, objc_dump_thread, NULL);
+    }
+#endif
+    if (DO_SYMCHK) dump_sym_heads();
+#if DO_KILLHOOK
     install_kill_hooks();
+#else
+    say("本版不挂 kill/raise/abort（避开 0x1e0dac000 那一页）\n");
+#endif
 #if DO_ENVHOOK
     install_env_hooks();
 #endif
