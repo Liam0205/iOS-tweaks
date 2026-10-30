@@ -38,6 +38,8 @@
 
 #import <substrate.h>
 #import <dispatch/dispatch.h>
+#import <stdio.h>
+#import <dirent.h>
 
 // 这一版只保留"改数据"的干预。下面这些函数是把 libc hook、dyld 枚举 hook、代码 patch
 // 等已经验证无效或会自曝的手段留下来备查的，暂时不调用，所以关掉未使用告警。
@@ -65,6 +67,7 @@
 #define DO_REDIRECT 0   // 0=不改 1=改指替身库 2=返回全零页
 #define DO_FAKE     0   // 把检查项换成恒返回 0 的假对象
 #define DO_DUMPIMG  0   // 0.0.300：构造函数里不写镜像清单，测主线程占用时长的影响
+#define DO_SLOT_FORCE 1 // 0.0.304：nop 掉槽的安装指令，自己把网关入口写进槽
 #define DO_REPATCH_AT 9999
 #define DO_VTPATCH  0   // 换检查项虚表（实测会让盾在 458ms 直接 raise(SIGSEGV)）   // 保留真实检查项，只换它们的判定函数
 #define DO_ZEROFLAG 0   // 把 0x866fc8 处的标志清零（非零就走原因码 4）
@@ -274,7 +277,7 @@ static void emit_ts(const char *s, size_t n);
 #define DO_EXIT_RECORD 1
 #define OFF_EXITFN_REC 0x5d842cULL
 // 盾的两条击杀出口，改空操作（本轮先关着，等拿到调用者再开）。
-#define DO_REPORT_NOP 1
+#define DO_REPORT_NOP 0   // 0.0.302：打开它会覆盖 MSHookFunction 的跳转
 #define OFF_REPORT_GATE 0x40e7e4ULL
 #define DO_KILLHELPER_NOP 1
 #define OFF_KILLHELPER 0x40ff8cULL
@@ -402,6 +405,7 @@ static void *ver(void *arg);
 static void *busy_probe(void *arg);
 
 static int install_exit_probe(void);
+static void gw_entry(void);
 static int install_exit_record(void);
 static void patch_entry_stub(uintptr_t addr, void *stub);
 static void arm_fault_probe(void);
@@ -442,6 +446,25 @@ static void install_hash_bypass(void) {
 #endif
 #if DO_VERDICT_OK
     patch_word(g_base + OFF_VERDICT_TBNZ, WORD_B_RETURN);
+#endif
+#if DO_SLOT_FORCE
+    // 0.0.304：把网关槽的安装者废掉，槽由我们自己写。
+    //
+    // 静态上这个槽是这样装上的（只有一个调用点，在一段启动初始化里）：
+    //   346c68  adrp x8, 0x851000
+    //   346c6c  adrp x9, 0x78b000
+    //   346c70  add  x9, x9, #0xefc      ; x9 = 0x78befc，盾的总网关
+    //   346c74  str  x9, [x8, #0xc8]     ; ← 无条件写 0x8510c8
+    //   346c78  ret
+    // 我们在构造期读到这个槽一直是 0，而且自己的线程活不到它被安装的时刻，
+    // 所以轮询接管根本来不及。把这条 str 换成 nop，再在构造期自己把槽写好，
+    // 那 83 个"ldr x17,[槽]; blr x17"的调用点就都会走进我们的入口——不管
+    // 盾什么时候才跑到那段初始化。
+    //
+    // 风险：如果盾校验这个槽的值，会当成篡改。所以这一版单独看结果。
+    patch_word(g_base + 0x346c74ULL, WORD_NOP);
+    *g_slot = (uint64_t)(uintptr_t)&gw_entry;
+    say_hex("网关槽已强制写入=", *g_slot);
 #endif
 #if DO_EXIT_RECORD
     install_exit_record();
@@ -1158,10 +1181,14 @@ void gw_record(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
         // 0.0.240：只关心"盾怎么处置信号"和"谁在结束进程"。
         // 1=exit 37=kill 46=sigaction 48=sigprocmask 53=sigaltstack
         // 95=sigsuspend 116=sigwait 169=csops 202=sysctl 336=proc_info
+        // 0.0.305：前 200 次无条件记录。0.0.304 接管了网关槽之后仍然一条
+        // GWREC 都没有，但按 1/500 抽样的话，晚期只有几十次调用也照样是零——
+        // 分不清"没走这条槽"和"走了但没被采到"。
         int want = (nr == 1) || (nr == 37) || (nr == 46) || (nr == 48) ||
                    (nr == 53) || (nr == 95) || (nr == 116) || (nr == 169) ||
                    (nr == 202) || (nr == 336);
         if (want) gw_direct(1, nr, a0, a1, a2);
+        else if (c <= 200) gw_direct(2, nr, a0, a1, a2);
         else if ((c % 500) == 0) gw_direct(9, nr, c, 0, 0);
     }
 #endif
@@ -3560,22 +3587,29 @@ static int (*o_kill)(int, int);
 static int (*o_raise)(int);
 static void (*o_abort)(void);
 
+// 0.0.303：这一层以前用 emit_ts 记，而排空线程 79ms 就停了，晚期的记录全部丢失。
+// 和上报钩子一样，改成直写 gw.bin。这三个是盾唯一导入的进程终止入口。
+static void note_term(const char *tag, uint64_t a, uint64_t b) {
+    uint64_t h[6];
+    h[0] = 0x5445524d00000001ULL | (uint64_t)((unsigned char)tag[0]);   // 魔数 "TERM"
+    h[1] = a;
+    h[2] = b;
+    h[3] = now_ms_raw();
+    h[4] = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    h[5] = (uint64_t)g_base;
+    gw_write(h, sizeof(h));
+}
+
 static int my_kill(int pid, int sig) {
-    char lb[96];
-    out_t o = { lb, lb + sizeof(lb) - 1 };
-    o_s(&o, "libc kill: 目标="); o_d(&o, pid);
-    o_s(&o, " 信号="); o_d(&o, sig);
-    o_s(&o, " 自己="); o_d(&o, getpid());
-    o_ch(&o, '\n');
-    emit_ts(lb, (size_t)(o.p - lb));
+    note_term("k", (uint64_t)(int64_t)pid, (uint64_t)(int64_t)sig);
     return o_kill ? o_kill(pid, sig) : -1;
 }
 static int my_raise(int sig) {
-    say_hex("libc raise: 信号=", (unsigned long long)sig);
+    note_term("r", (uint64_t)(int64_t)sig, 0);
     return o_raise ? o_raise(sig) : -1;
 }
 static void my_abort(void) {
-    say("libc abort 被调用\n");
+    note_term("a", 0, 0);
     if (o_abort) o_abort();
 }
 
@@ -4310,6 +4344,32 @@ static void (*o_report)(uint64_t, const char *);
 static int g_rp_n;
 
 static void my_report(uint64_t reason, const char *desc) {
+    // 0.0.302：以前这一版同时做了 patch_word(+0x40e7e4, ret)。MSHookFunction 也是在
+    // 函数首部写跳转，patch_word 写进去的 ret 直接把钩子覆盖掉了——所以上报钩子
+    // 一次都没有被调用过，我们从来没看到过原因码，一直在盲打。
+    // 现在只保留钩子：记录原因码，然后直接返回，等于"上报了但什么都不做"。
+    {
+        uint64_t h[6];
+        h[0] = 0x5245505200000001ULL;      // 魔数 "REPR"
+        h[1] = reason;
+        h[2] = (uint64_t)(uintptr_t)desc;
+        h[3] = (uint64_t)++g_rp_n;
+        h[4] = now_ms_raw();
+        h[5] = (uint64_t)(uintptr_t)__builtin_return_address(0);
+        gw_write(h, sizeof(h));
+        if (desc) {
+            char t2[64];
+            if (safe_read((uint64_t)(uintptr_t)desc, t2, 63)) {
+                t2[63] = 0;
+                uint64_t d[4];
+                d[0] = 0x5245505200000002ULL;   // 魔数 "REPR" v2：描述原文
+                d[1] = h[3];
+                d[2] = 0; d[3] = 0;
+                gw_write(t2, 63);
+                gw_write(d, sizeof(d));
+            }
+        }
+    }
     if (g_rp_n < 24) {
         g_rp_n++;
         char buf[256];
@@ -4331,7 +4391,7 @@ static void my_report(uint64_t reason, const char *desc) {
             }
         }
     }
-    if (o_report) o_report(reason, desc);
+    // 不再转发给原函数：转发就等于真的上报并退出。这里只记录。
 }
 
 static void install_report_hook(void) {
@@ -6149,6 +6209,72 @@ static kern_return_t my_mpd(mach_port_name_t name) {
     return g_orig_mpd(name);
 }
 
+// 0.0.306：盾不走自己的网关（83 个调用点一次都没执行），整个文件里也只有
+// 一处 svc #0x80。但它导入了 fopen / opendir / readlink / realpath / getenv——
+// 这几个正是越狱检测最常见的入口。挂上它们、只在调用者落在盾里时记录，
+// 就能看到它到底在查哪些路径。之前所有观测都是"从盾内部猜"，这是第一条
+// 从外部把盾的检测项直接读出来的路。
+#define DO_PATH_HOOK 1
+#if DO_PATH_HOOK
+static FILE *(*o_fopen2)(const char *, const char *);
+static DIR *(*o_opendir2)(const char *);
+static ssize_t (*o_readlink2)(const char *, char *, size_t);
+static char *(*o_realpath2)(const char *, char *);
+static char *(*o_getenv2)(const char *);
+static volatile uint64_t g_pathhits;
+
+static void note_path(uint64_t kind, const char *p, uint64_t ra) {
+    if (!p) return;
+    // 0.0.307：先不按调用者过滤。上一版过滤之后一条都没有，分不清是
+    // "盾真的没调这几个函数"还是"我们的调用者判定写错了"。这里全部记下来，
+    // 记录里带上调用者是否落在盾内，事后自己分。
+    if (++g_pathhits > 300) return;
+    uint64_t h[6];
+    h[0] = 0x5041544800000001ULL | (kind & 0xff);   // 魔数 "PATH"
+    h[1] = g_pathhits;
+    h[2] = ra;
+    h[3] = (uint64_t)sh_caller_is_shield((void *)ra);
+    h[4] = (uint64_t)g_base;
+    h[5] = now_ms_raw();
+    gw_write(h, sizeof(h));
+    char buf[160];
+    int n = 0;
+    while (p[n] && n < 159) { buf[n] = p[n]; n++; }
+    buf[n] = 0;
+    gw_write(buf, (size_t)(n + 1));
+}
+
+static FILE *my_fopen2(const char *p, const char *m) {
+    note_path(1, p, (uintptr_t)__builtin_return_address(0));
+    return o_fopen2(p, m);
+}
+static DIR *my_opendir2(const char *p) {
+    note_path(2, p, (uintptr_t)__builtin_return_address(0));
+    return o_opendir2(p);
+}
+static ssize_t my_readlink2(const char *p, char *b, size_t n) {
+    note_path(3, p, (uintptr_t)__builtin_return_address(0));
+    return o_readlink2(p, b, n);
+}
+static char *my_realpath2(const char *p, char *out) {
+    note_path(4, p, (uintptr_t)__builtin_return_address(0));
+    return o_realpath2(p, out);
+}
+static char *my_getenv2(const char *p) {
+    note_path(5, p, (uintptr_t)__builtin_return_address(0));
+    return o_getenv2(p);
+}
+
+static void install_path_hooks(void) {
+    MSHookFunction((void *)fopen,    (void *)my_fopen2,    (void **)&o_fopen2);
+    MSHookFunction((void *)opendir,  (void *)my_opendir2,  (void **)&o_opendir2);
+    MSHookFunction((void *)readlink, (void *)my_readlink2, (void **)&o_readlink2);
+    MSHookFunction((void *)realpath, (void *)my_realpath2, (void **)&o_realpath2);
+    MSHookFunction((void *)getenv,   (void *)my_getenv2,   (void **)&o_getenv2);
+    say("路径钩子：已装（fopen/opendir/readlink/realpath/getenv）\n");
+}
+#endif
+
 static void install_mpd_hook(void) {
     // 直接按地址取，绕开头文件里的 deprecated 标记：我们要拦的正是盾
     // 从 libSystem 拿到的那个符号。
@@ -6411,7 +6537,7 @@ __attribute__((constructor)) static void ctor(void) {
     g_t0 = up_ms();
     g_ts0 = read_pct();
     g_wf_ts0 = g_ts0;
-    say("===== 0.0.301 启动（挂 mach_port_destroy，找盾的晚期活动）=====\n");
+    say("===== 0.0.307 启动（路径钩子不再按调用者过滤）=====\n");
 
     try_takeover();
 #if DO_HASHBYPASS
@@ -6478,6 +6604,9 @@ __attribute__((constructor)) static void ctor(void) {
 #endif
 #if DO_MPD_PROBE
     install_mpd_hook();
+#endif
+#if DO_PATH_HOOK
+    install_path_hooks();
 #endif
 #if DO_MAINTICK
     start_main_tick();
