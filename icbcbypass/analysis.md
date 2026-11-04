@@ -997,7 +997,7 @@ freeze 循环中 `dispatch_semaphore_wait(FOREVER)` 被直接返回 0，将原�
 
 2. **semaphore 忙循环缓解**：在直接返回 0 时插入 `usleep()` 降低空转频率，释放 CPU 给 UI 处理
 
-3. **setUserInteractionEnabled hook 收窄**：仅在 freeze 窗口期内阻断，之后放行
+3. **setUserInteractionEnabled 缩小 hook 范围**：仅在 freeze 窗口期内阻断，之后放行
 
 4. **添加 ICBC 版本号日志**：在 `[INIT]` 日志中记录 `CFBundleShortVersionString`，方便用户反馈版本信息
 

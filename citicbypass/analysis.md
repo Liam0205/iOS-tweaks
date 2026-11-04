@@ -48,7 +48,7 @@ reportNotes: SP register contains suspicious bits (0x21915ECDDEAD52FC)
 ```
 
 `0xb5a98000` 落在 App 的 `__PAGEZERO` 区间（0 到 0x100000000）内，永远无法映射。
-SP 里那个含 `DEAD` 的常量是典型的哨兵值，意思很明确：检测方主动破坏栈指针再跳飞。
+SP 里那个含 `DEAD` 的常量是典型的哨兵值，意思很明确：检测方主动破坏栈指针再跳到无效地址。
 whbypass 记录过同一个手法，毒地址是 `0xb5a01000`，两者只差一个页表项。
 
 崩溃的触发条件至今没有查清。0.0.4 之后的探针改用 `method_setImplementation`，崩溃消失，

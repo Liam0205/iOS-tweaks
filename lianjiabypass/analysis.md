@@ -69,7 +69,7 @@
 ### 验证方法
 探测版 tweak：`%ctor` 打点确认注入；fishhook rebind `exit`/`_exit`/`abort`/`kill`（observe-only，打回溯栈）；记录 JGBSDK/du/a/senseid 模块加载、`LJBRProtectManager`/`JGBProtect` 类是否存在。
 
-**踩坑（已沉淀记忆 [[feedback_tweak_log_path]]）：** 日志先写 `/var/jb/tmp/` 再写 `/tmp/` 都失败——普通 App 沙箱两者都无写权限，日志静默为空，误判为“没注入”。改用 `NSTemporaryDirectory()`（沙箱内 Data 容器 tmp/）后正常。链家 Data 容器：`/var/mobile/Containers/Data/Application/FF131465-0653-49BB-AAC5-AE54C31453D0/`。
+**踩坑（已写进记忆 [[feedback_tweak_log_path]]）：** 日志先写 `/var/jb/tmp/` 再写 `/tmp/` 都失败——普通 App 沙箱两者都无写权限，日志静默为空，误判为“没注入”。改用 `NSTemporaryDirectory()`（沙箱内 Data 容器 tmp/）后正常。链家 Data 容器：`/var/mobile/Containers/Data/Application/FF131465-0653-49BB-AAC5-AE54C31453D0/`。
 
 ### 观察结果
 - **注入成功**：`%ctor` 在 0.00s 执行，日志正常写入沙箱内。
@@ -168,11 +168,11 @@ JGBSDK @0xbc4c 的 `_exit` 是越狱检测命中后的退出点，hook 它或其
 **下一轮单一假设（待验证）：**
 两条并行：(1) 对抗侧——用 tweak hook `contentsOfDirectoryAtPath:error:` / `NSDirectoryEnumerator`，过滤掉含我方 dylib/plist 的结果（参考 mybankbypass 的“保留 NSFileManager 目录结果过滤”成功经验），看能否消除这一检测；(2) 定位侧——找该扫描函数入口 + 调用者，追 `w20=1` 到退出决策，确认真实退出原语。
 
-**决策（用户拍板）：先做 A = 闭环验证。** 针对已确认的 `DynamicLibraries` 目录扫描检测写对抗（过滤 `contentsOfDirectoryAtPath:error:` 结果，隐藏我方 dylib/plist 及常见越狱文件），装机跑一次，观察秒退时间是否变化/消除，以此判断该扫描是否秒退主因。若有效则继续逐项；若无效说明秒退主因在别的检测，再回到定位侧。逐项静态摸清（B）暂缓。
+**决策（用户决定）：先做 A = 验证对抗是否有效。** 针对已确认的 `DynamicLibraries` 目录扫描检测写对抗（过滤 `contentsOfDirectoryAtPath:error:` 结果，隐藏我方 dylib/plist 及常见越狱文件），装机跑一次，观察秒退时间是否变化/消除，以此判断该扫描是否秒退主因。若有效则继续逐项；若无效说明秒退主因在别的检测，再回到定位侧。逐项静态摸清（B）暂缓。
 
 ---
 
-## 第 4 轮：A 闭环验证 — tweak 对抗（2026-08-20）
+## 第 4 轮：验证 A 的对抗效果 — tweak 对抗（2026-08-20）
 
 ### 假设
 过滤 `contentsOfDirectoryAtPath:` 目录枚举结果隐藏 tweak，能消除/推迟秒退。
@@ -234,7 +234,7 @@ v0.0.4：最小 4 hook + 全路径 stat 打点。v0.0.5：+ `_dyld_image_count`/
 - 主线程阻塞在哪个调用（等锁/等信号/等网络/死循环 sleep）？
 
 **下一轮单一假设（待验证）：**
-先区分冻结成因：(a) 用 simtouch 确认是否任何检测项残留触发；(b) 抓主线程调用栈（lldb/frida 受 anti-frida 限制，可用 tweak 装 SIGSTOP 观察 or 定时 dump 主线程 backtrace）定位阻塞点；(c) 对照实验——临时收窄 dyld 隐藏范围（只藏自己 dylib 不藏 ellekit），排除 hook 副作用导致镜像索引错乱。
+先区分冻结成因：(a) 用 simtouch 确认是否任何检测项残留触发；(b) 抓主线程调用栈（lldb/frida 受 anti-frida 限制，可用 tweak 装 SIGSTOP 观察 or 定时 dump 主线程 backtrace）定位阻塞点；(c) 对照实验——临时缩小范围 dyld 隐藏范围（只藏自己 dylib 不藏 ellekit），排除 hook 副作用导致镜像索引错乱。
 
 ---
 
@@ -478,7 +478,7 @@ v0.0.17：ctor 扫描 JGBSDK __text，匹配 svc(0xd4001001)+前置 mov w16,#1(0
 
 ---
 
-## 第 14 轮：闭环达成 —— 链家进入主界面稳定运行（2026-08-20）✅
+## 第 14 轮：问题解决 —— 链家进入主界面稳定运行（2026-08-20）✅
 
 ### 假设
 修正 W^X 权限流程后消除 KERN_PROTECTION_FAILURE，App 稳定运行。
@@ -498,7 +498,7 @@ v0.0.19：patch 流程改为标准 W^X —— `vm_protect RW(优先 COPY，回�
 3. **注入检测层（主线程忙循环冻结）**：MSHookFunction `a.framework` 的 `_isInjectedWithDynamicLibrary` 恒返回 0（框架内部直接调用，fishhook 无效）。
 4. **自杀退出层（直接 syscall）**：JGBSDK 内联 29 处 `mov w16,#1; svc #0x80`(exit)，libc/信号 hook 全部无效 → **运行时 patch**：扫描 JGBSDK __text 将 exit 的 svc 就地改 `ret`（标准 W^X 权限流程 + icache 失效）。
 
-### 关键经验（已沉淀）
+### 关键经验（已写进）
 - 冻结 ≠ 检测惩罚：先怀疑自己的 hook 是否 O(n²)/慢路径拖死主线程（看门狗 fp 回溯定位）。
 - 框架内部直接调用只能 MSHookFunction，fishhook 仅改跨镜像 GOT。
 - 检测框架惯用直接 svc（exit/sysctl/stat）绕过 libc hook → 需静态扫描 svc + 运行时 patch。

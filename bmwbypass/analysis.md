@@ -23,7 +23,7 @@
     - `_$s...29amIJailbrokenWithFailedChecks...` = `amIJailbrokenWithFailedChecks() -> (jailbroken: Bool, failedChecks: [...])` @ `0x93e8`
   - 内部 `JailbreakChecker` 私有方法（带混淆后缀 `LL`，仍导出符号）：`checkSymbolicLinks`、`checkExistenceOfSuspiciousFiles`、`checkSuspiciousFilesCanBeOpened`、`checkRestrictedDirectoriesWriteable`、`checkDYLD`、`performChecks`。
   - `checkDYLD` 黑名单精确命中当前 rootless 越狱注入库：`systemhook.dylib`、`TweakInject.dylib`、`libhooker`、`Substitute`、`roothideinit.dylib`、`CydiaSubstrate` 等。
-- 裸跑现象：`uiopen` 启动后主 App 进程存活 ≥10s **不自杀**。→ 弹窗是「等用户点按钮才退」型（App 层 UIAlert），不是自动 kill 进程。
+- 原样运行现象：`uiopen` 启动后主 App 进程存活 ≥10s **不自杀**。→ 弹窗是「等用户点按钮才退」型（App 层 UIAlert），不是自动 kill 进程。
 - 主 binary strings **不直接命中** `IOSSecuritySuite`/`amIJailbroken`（=0）。符合 Flutter 应用：调用方在某 framework 或 Flutter plugin，非主 binary 明文。
 
 ### 推论
@@ -48,7 +48,7 @@ BMW 通过 `IOSSecuritySuite.amIJailbroken() -> Bool` 判定越狱，hook 它返
 [BMWBypass] amIJailbroken() called -> forcing false
 ```
 - `%ctor` 执行、符号找到并 hook 成功、`amIJailbroken()` 被 BMW **实际调用一次**并被强制返回 false。
-- 进程存活 ≥10s（与裸跑一致，本就不自杀）。
+- 进程存活 ≥10s（与原样运行一致，本就不自杀）。
 
 ### 推论
 - **已确认**：BMW 的越狱判定入口就是 `amIJailbroken()`（单 Bool 版），启动时调用一次。hook 命中。

@@ -37,7 +37,7 @@ theos 的 debug 构建会加 `-DDEBUG`，`make package` 默认就是这种；`ma
 
 主检测引擎是**梆梆安全 Everisk**（`everisk_ZDAX iOS5.1.2.SP2-250207`），编译期静态链入主二进制，没有独立 framework 镜像。同一二进制里还有一套 `SecureUtilityPlus` Swift 类，但在这个 App 里 27 个类全部 `baseMethods = 0x0`，运行期取不到任何入口——它只贡献了库名，不是检测主力。
 
-App 层入口的名字是明文的（`setupEverisk()`、`setupEveriskAndUMService()`、`initBangcleEverisk:`、`runEveriskWithKey:`），但真正做判定的是主二进制里那套混淆虚拟机。27 个 everisk checker 的 `-(check)` 在 467ms 之后才被调用，而跳飞发生在 320～440ms，**判定早于 checker**。这是本节最重要的一条：短路 `-(check)` 对闪退没有任何作用，对照实验里开与关都是 4 次跳飞。
+App 层入口的名字是明文的（`setupEverisk()`、`setupEveriskAndUMService()`、`initBangcleEverisk:`、`runEveriskWithKey:`），但真正做判定的是主二进制里那套混淆虚拟机。27 个 everisk checker 的 `-(check)` 在 467ms 之后才被调用，而跳到无效地址发生在 320～440ms，**判定早于 checker**。这是本节最重要的一条：短路 `-(check)` 对闪退没有任何作用，对照实验里开与关都是 4 次跳到无效地址。
 
 ## 闪退机制：毒地址 0xb5a01000
 
@@ -107,10 +107,10 @@ block 的 `invoke` 字段（`WHClient+0x144334`、`+0x144638`、`+0x1455f0`、`+
 1001406d4  bl   0x100134730         ; 混淆虚拟机
 ```
 
-把入口两条指令改成 `mov x0,#0` / `ret` 之后，启动期跳飞从 4 次降到 1 次。这里有两个
+把入口两条指令改成 `mov x0,#0` / `ret` 之后，启动期跳到无效地址从 4 次降到 1 次。这里有两个
 必须知道的细节：
 
-- 只把 `b.lt` 改成无条件跳转（保留计数自增）**反而更糟**：跳飞 5 次，6～8 秒后进程消失。
+- 只把 `b.lt` 改成无条件跳转（保留计数自增）**反而更糟**：跳到无效地址 5 次，6～8 秒后进程消失。
   计数器的自增本身是被观察的。
 - 整段只写 `ret` 会让 `x0` 保留调用方的垃圾值，返回约定被破坏。必须显式 `mov x0,#0`。
 
@@ -131,7 +131,7 @@ block 的 `invoke` 字段（`WHClient+0x144334`、`+0x144638`、`+0x1455f0`、`+
 
 ## 三条固化约束
 
-1. **不要周期性重设异常端口。** 每 250ms 调一次 `thread_set_exception_ports` 会打断主线程，制造出"每 6.1 秒一次跳飞"的假象。这一个假象花掉了整轮排查时间。
+1. **不要周期性重设异常端口。** 每 250ms 调一次 `thread_set_exception_ports` 会打断主线程，制造出"每 6.1 秒一次跳到无效地址"的假象。这一个假象花掉了整轮排查时间。
 2. **日志不能写 `Documents`。** 加固壳会把那里的非常规文件删掉（实测整份日志消失）。现在写 `Library/Caches/gtcfg.log`。
 3. **镜像 0 不一定是主程序。** 这台设备上 `_dyld_get_image_header(0)` 返回的是 `IQKeyboardManagerSwift`，给 `__TEXT` 打补丁必须按可执行路径逐个比对镜像名。
 
@@ -146,6 +146,6 @@ block 的 `invoke` 字段（`WHClient+0x144334`、`+0x144638`、`+0x1455f0`、`+
 
 ## 与同族 tweak 的关系
 
-检测库名与 icbcbypass / abcbypass 相同（都是 SecureUtilityPlus），但本 App 里那套 Swift 类没有方法，所以 icbc 那种"遍历 13 个 checker 类、把返回 BOOL 的安全方法改成 NO"的做法在这里无效。这里能落地的是主二进制的指令补丁。
+检测库名与 icbcbypass / abcbypass 相同（都是 SecureUtilityPlus），但本 App 里那套 Swift 类没有方法，所以 icbc 那种"遍历 13 个 checker 类、把返回 BOOL 的安全方法改成 NO"的做法在这里无效。这里能用的是主二进制的指令补丁。
 
 与 aiabypass 的差别在于：友邦是"判定没绕过、只接住后果"，这里是把两处会跳向毒地址的代码直接改掉，异常根本不发生。

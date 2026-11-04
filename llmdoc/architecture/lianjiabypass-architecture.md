@@ -70,7 +70,7 @@ svc #0x80     编码 0xd4001001
 3. `vm_protect` **恢复** 该页为 `VM_PROT_READ|VM_PROT_EXECUTE`
 4. `sys_icache_invalidate()` 刷新指令缓存
 
-**关键教训（v0.0.18 曾踩坑）**：第 3 步的恢复不能省略。若用 `VM_PROT_COPY` 改权限后没有恢复回 `R+X`，页会停留在 `rw-`（可写不可执行）状态；之后 dyld 执行 JGBSDK 自身的模块初始化代码（该代码恰好落在同一页）时会触发 `KERN_PROTECTION_FAILURE` 崩溃。修复方式是严格执行"改 RW → 写 → 恢复 R+X → 刷 icache"的完整闭环，不能只做前两步。
+**关键教训（v0.0.18 曾踩坑）**：第 3 步的恢复不能省略。若用 `VM_PROT_COPY` 改权限后没有恢复回 `R+X`，页会停留在 `rw-`（可写不可执行）状态；之后 dyld 执行 JGBSDK 自身的模块初始化代码（该代码恰好落在同一页）时会触发 `KERN_PROTECTION_FAILURE` 崩溃。修复方式是严格执行"改 RW → 写 → 恢复 R+X → 刷 icache"的完整流程，不能只做前两步。
 
 ## ctor 加载顺序
 

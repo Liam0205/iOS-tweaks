@@ -74,5 +74,5 @@ aiabypass 的反思里已经记过"hook 装上了但没被调用，和没装上�
 - 一套能复用的探针骨架：`hsbchkbypass/Tweak.x`（自检 + 心跳 + 终止原语 hook + 带时间戳日志）
 - 部署验证脚本 `hsbchkbypass/verify.sh`（换文件名避 `CODESIGNING`、关掉其它 tweak、冷启动观测）
 - 静态结论写进 `llmdoc/reference/hsbc-hk-detection-vectors.md`
-- 方法论沉淀进 `llmdoc/guides/reverse-engineering-methodology.md`
+- 方法论写进 `llmdoc/guides/reverse-engineering-methodology.md`
   （零命中先自检、加密段不能静态扫、日志必须带时间戳、zsh 通配在无匹配时会中断命令）

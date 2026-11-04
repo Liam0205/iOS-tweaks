@@ -42,7 +42,7 @@ Round 1-3 的文档里写着「汇丰香港既没有 ZDefend 也没有 Promon」
 第一版（0.0.41）一次成功。**这是这一轮唯一真正建立起新能力的一步**——
 在此之前，对这个 App 的内部行为是完全看不见的。
 
-## 两次自己打崩自己
+## 两次自己弄崩自己
 
 **第一次**：网关入口里用 `snprintf` 写日志。崩溃报告直接给了答案——
 `hsbchkmobilebankingx +0x448da0 → gw_entry → gw_log → snprintf → SIGSEGV@0x50`。

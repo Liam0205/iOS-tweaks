@@ -92,7 +92,7 @@ fork/dlopen/dlsym` 及 `_dyld_*` 后，启动 ~1s 就在后台 GCD 线程跳到*
 
 1. `-[DTFrameworkInterface initRiskManage]` 是否仍是检测 block 宿主（改名/重构则用
    `objcparse.py` 重新定位）
-2. 是否新增独立 exit 路径（用 `abctest.sh` 裸跑对照，先区分「检测」vs「自伤」）
+2. 是否新增独立 exit 路径（用 `abctest.sh` 原样运行对照，先区分「检测」vs「自己造成的崩溃」）
 3. SecureUtilityPlus / SmAntiFraud 是否新增检测类或方法
 4. mPaaS 框架大版本升级引入新检测模块
 
@@ -101,6 +101,6 @@ fork/dlopen/dlsym` 及 `_dyld_*` 后，启动 ~1s 就在后台 GCD 线程跳到*
 - **存活检测必须精确匹配主 App 进程**：`ps -eo args | grep -E
   'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。曾用 `grep MbapMPaaS` 误匹配
   后台扩展 `group.abc.toolExtension`，导致大批"存活成功"结论失效、在假信号上反复打补丁。
-- **崩溃先问"是不是自伤"**：卸载 tweak 裸跑对照 + 二分编译开关，快速区分 ABC 检测与
-  自身 hook 副作用。此前大量"检测"其实是 libc inline-hook 触发完整性自检的自伤。
+- **崩溃先问"是不是自己造成的崩溃"**：卸载 tweak 原样运行对照 + 二分编译开关，快速区分 ABC 检测与
+  自身 hook 副作用。此前大量"检测"其实是 libc inline-hook 触发完整性自检造成的崩溃。
 - 详见 `memory/reflections/abcbypass-round13-16.md` 与 `reference/abc-detection-vectors.md`。

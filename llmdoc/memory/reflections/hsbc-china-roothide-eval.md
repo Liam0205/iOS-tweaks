@@ -1,6 +1,6 @@
 # 汇丰中国：roothide Dopamine 评估 —— 内核隐藏是对的层，但被"不能动本体"约束排除
 
-> 衔接 [[hsbc-china-unject-round77.md]]。Round 77 结论是"用户态二律背反，唯一自洽方向=内核层"。
+> 衔接 [[hsbc-china-unject-round77.md]]。Round 77 结论是"用户态两难，唯一自洽方向=内核层"。
 > 本次评估 roothide Dopamine（`github.com/roothide/Dopamine2-roothide`，分支 2.x）作为现成的
 > 内核层参考实现，并在"不能动越狱本体"这一用户约束下重新判定汇丰的可行性。
 
@@ -24,24 +24,24 @@ roothide 也是 opa334 Dopamine 的 fork，BaseBin 结构与我们的越狱**完
 
 **为什么这对汇丰是对的层**：Promon 用 `mach_vm_read` 读库头找 systemhook → all_image_info
 改写让它枚举不到；查 `/var/jb` 固定路径 → 随机 jbroot 查不到。且这些**不需要往汇丰注入我们的
-tweak**，故不触发注入检测——精确破解了 Round 77 的二律背反。
+tweak**，故不触发注入检测——正好解开了 Round 77 的两难。
 
 ## 判决：被"不能动越狱本体"约束排除
 
 用户明确约束：**不能动越狱本体**（不改 basebin、不 rebuild、不刷定制/roothide Dopamine）。
 
-- roothide 的四支柱**全部落地在越狱本体**（systemhook/launchdhook/dyldhook/jailbreakd/内核）。
+- roothide 的四支柱**全部实现在越狱本体里**（systemhook/launchdhook/dyldhook/jailbreakd/内核）。
 - 方案 A（换 roothide 越狱）、B（移植到本体）被此约束直接排除。
 - 方案 C（自研内核隐藏）与 B **卡在同一禁区**：隐藏机制没有本体之外的落脚点。C 不是"工作量大"，
   是**可落脚位置为空**。若强行约束回进程内 tweak，就退化成 Round 74-76 已证伪的用户态伪装。
-- 唯一可动区 = 注入进 App 的用户态 tweak = Round 77 的二律背反区。
+- 唯一可动区 = 注入进 App 的用户态 tweak = Round 77 的两难区。
 
 **⇒ 在此约束下，汇丰 Promon SHIELD 可行域为空（非难度问题，是可行域问题）。**
 
 ## 教训
 
 1. **"正确的层"和"可动的层"是两回事**。我们花了 20+ 轮把检测追到 mach_vm_read 读库头，又通过
-   roothide 确认了内核隐藏是正解——但如果那一层是禁区，再正确也无法落地。评估方案前应先问清
+   roothide 确认了内核隐藏是正解——但如果那一层是禁区，再正确也无法实现。评估方案前应先问清
    **可动区边界**，否则会像本次一样把 C 估成"2000-4000 行移植"，实则可行域为空。
 2. **同源是把双刃剑**。我们和 roothide 同为 Dopamine fork，代码可直接借鉴（利好 B）；但只要
    "不能动本体"，同源也用不上。

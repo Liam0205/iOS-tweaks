@@ -13,7 +13,7 @@ My BMW（`de.bmw.connected.mobile20.cn`）越狱检测弹窗绕过，一次会�
 
 1. **先静态识别 SDK 身份**。Frameworks 目录直接看到 `IOSSecuritySuite.framework`，省去大量盲猜。开源库的检测手法已知、符号可读，是最有利的起点。llvm-nm（不是 GNU nm，后者不认 Mach-O）列出导出的 `amI*` 入口全集。
 2. **运行时探针定位根因，不靠猜**。第 2 轮凭「checkDYLD 检测已加载库名」的合理推断去 hook `_dyld_get_image_name`，mask 掉所有越狱库名，弹窗照旧——合理推断也可能错。改成 hook 全部单-Bool 入口 + 记日志，让 App 自己告诉我它调了 `amIJailbroken` + `amIReverseEngineered`，一轮定位。
-3. **SimTouch 截图闭环**。宿主看不到屏幕，靠 `simtouch screenshot` + `tap` 直接确认弹窗有无、并驱动进入下一界面复验。这是判断「绕过是否成功」的唯一可靠手段，比看进程存活/日志更直接（本目标进程本就不自杀）。
+3. **SimTouch 截图确认**。宿主看不到屏幕，靠 `simtouch screenshot` + `tap` 直接确认弹窗有无、并驱动进入下一界面复验。这是判断「绕过是否成功」的唯一可靠手段，比看进程存活/日志更直接（本目标进程本就不自杀）。
 4. **弹窗文案反查检测语义**。Flutter 应用文案在 `flutter_assets/.../*.arb`，key=`attestationPreCheckFailureDescriptionCn` 直接点出「attestation pre-check」，结合 Frameworks 里的 Approov 锁定了检测性质。
 
 ## 踩过的坑

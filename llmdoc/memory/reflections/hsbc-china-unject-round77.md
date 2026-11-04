@@ -35,7 +35,7 @@ Pro / iOS 15.4.1），汇丰中国 3.72.15。
 
 ## Root Cause（为什么用户态走不通）
 
-**二律背反**：要 Promon 检测不到注入 ⇒ 不能注入 systemhook ⇒ 我们也无法用 tweak 在进程内
+**两难**：要 Promon 检测不到注入 ⇒ 不能注入 systemhook ⇒ 我们也无法用 tweak 在进程内
 干预 Promon；要用 tweak 干预 ⇒ 必须注入 systemhook ⇒ Promon 又能检测到。纯用户态无法同时
 满足"不被检测"与"能干预"。这个矛盾是结构性的，不是调参能解的。
 

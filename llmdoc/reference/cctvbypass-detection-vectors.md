@@ -49,7 +49,7 @@ svc  #0x80          ; exit(0)
 - **无二进制完整性自检**（inline-hook 与 `__text` patch 安全，不触发校验崩溃）。
 - **无私有 svc 网关**。二进制内的 `integrity` / `HMAC` / `checksum` 字符串均来自 Bugly/QAPM 崩溃上报的 SQLite `integrity_check` 与 HMAC，非 text 段自检。
 
-## 排查方法闭环
+## 排查方法
 
 定位内联 svc exit 根因的完整链路：
 

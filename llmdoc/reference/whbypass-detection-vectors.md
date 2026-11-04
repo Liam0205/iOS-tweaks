@@ -95,7 +95,7 @@ application:didFinishLaunching
 `0x134730` 是表驱动的混淆虚拟机（常量分裂、`cmp w8,#0x1` 状态机、`udf` 陷阱）。
 只调了 3 次，参数 `a1 = 0xb`。
 
-计数的自增本身会被观察：只改 `b.lt` 为无条件跳转、保留自增时，跳飞反而升到 5 次
+计数的自增本身会被观察：只改 `b.lt` 为无条件跳转、保留自增时，跳到无效地址反而升到 5 次
 且 6～8 秒后退出。改成 `mov x0,#0; ret` 才是有效解。
 
 ## KSCrash 于 6.5 秒掐死进程
@@ -106,22 +106,22 @@ application:didFinishLaunching
 100ce7a58  bl _thread_suspend        ; 遍历线程逐个挂起
 ```
 
-捕获到跳飞后，KSCrash 把其它线程全部挂起抓现场，再结束进程。表现为"界面卡死 →
+捕获到异常后，KSCrash 把其它线程全部挂起抓现场，再结束进程。表现为"界面卡死 →
 十几秒后进程消失、无崩溃报告"，极容易被误判成检测 SDK 的冻结机制。
 
 ## 已排除的手法（都做过实验）
 
 | 手法 | 结果 |
 |------|------|
-| 短路 27 个 everisk `-(check)` | 跳飞次数不变（开/关都是 4 次） |
-| 短路 Everisk 主控类 `initWithKey:` / `runEveriskWithKey:` / `onlineEntry` / `offlineEntry` | 无影响，调用发生在 467ms，晚于跳飞 |
+| 短路 27 个 everisk `-(check)` | 跳到无效地址的次数不变（开/关都是 4 次） |
+| 短路 Everisk 主控类 `initWithKey:` / `runEveriskWithKey:` / `onlineEntry` / `offlineEntry` | 无影响，调用发生在 467ms，晚于这次跳转 |
 | `GTCGbdDyncInfo` 的 `checkSafe` + 20 个 `setT*Enable:` 置 NO | 无影响 |
 | `ptrace` 恒返回 0 | 无影响 |
 | 哨兵地址铺停放页（`wfe` + `b .`） | 地址在 `__PAGEZONE` 之外，无法映射 |
 | 分派器 `+0x134730` 入口改 `ret` | 5 次异常，无改善 |
 | 16 处内联 `svc #0x80` | 都在 syscall 包装函数里，与退出无关 |
 | 异常回复但 pc 仍是毒地址 | 立即变成 100% 忙循环 |
-| 每 250ms 重设线程异常端口 | 打断主线程，制造假的每 6.1 秒一次跳飞 |
+| 每 250ms 重设线程异常端口 | 打断主线程，制造假的每 6.1 秒一次跳到无效地址 |
 | 覆盖 `EXC_MASK_BREAKPOINT` | App 3 秒内退出（它自己注册了这个掩码） |
 
 ## 日志位置

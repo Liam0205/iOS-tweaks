@@ -1085,16 +1085,16 @@ BT[14] dyld start + 2528
 
 ### 可信测试工具 (tmp/abctest.sh)
 - 精确匹配主 App: `ps -eo args | grep -E 'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。
-- 三模式: bare(卸载 tweak 裸跑) / tweak(带 tweak) / current。逐秒探测存活,
+- 三模式: bare(卸载 tweak 原样运行) / tweak(带 tweak) / current。逐秒探测存活,
   对比 CrashReporter 新增判定崩溃 vs 正常退出。
 
 ### 用正确方法重建的基线 (全部可信)
 | 配置 | 主 App 结果 |
 |---|---|
-| **裸跑 (无 tweak)** | ~13s **正常退出** (exit, 无崩溃) — ABC 越狱检测原始行为 |
-| **全量 hook tweak** | ~1s **崩溃** (`0xb5a06000` SIGSEGV) — 比裸跑更早死, 净负面 |
+| **原样运行 (无 tweak)** | ~13s **正常退出** (exit, 无崩溃) — ABC 越狱检测原始行为 |
+| **全量 hook tweak** | ~1s **崩溃** (`0xb5a06000` SIGSEGV) — 比原样运行更早死, 净负面 |
 | **ABC_AGGRESSIVE=0** (关 exit/dispatch/exception/CFRunLoop/drain, 留 libc+ObjC hook) | ~1s 仍崩溃 (`0xb5a06000`) |
-| **ABC_LIBC_HOOKS=0** (再关 libc inline hook, 仅留 ObjC swizzle) | ~13s **正常退出, 无崩溃** = 裸跑基线 |
+| **ABC_LIBC_HOOKS=0** (再关 libc inline hook, 仅留 ObjC swizzle) | ~13s **正常退出, 无崩溃** = 原样运行基线 |
 
 ### 关键确定结论 (二分法证实)
 1. **`0xb5a06000` 崩溃的根因 = 对 libc 函数 inline-hook (MSHookFunction)**。
@@ -1108,7 +1108,7 @@ BT[14] dyld start + 2528
    (不改函数序言字节, 改的是 objc 方法表)。当前 ObjC 越狱 hook 覆盖:
    DTNetworkAdapterUtils/GMRZUACInterface/IsJailBreak/RiskStub/SecCodeImp/
    AIPIFlySystemInfo/EESBPhoneInfo/UPWRNUtil/LuaSystem 的 isJailbroken 类方法。
-3. **但仅 ObjC swizzle 挡不住退出**: 装了以上 hook 后主 App 仍 13s 退出 (= 裸跑),
+3. **但仅 ObjC swizzle 挡不住退出**: 装了以上 hook 后主 App 仍 13s 退出 (= 原样运行),
    说明触发退出的检测**不走这些 ObjC 方法**, 而是之前定位的 native 路径
    (`MbapMPaaS+0x8db260` 的 exit(0), 由 `[receiver action]==3` 判定, 见下)。
 

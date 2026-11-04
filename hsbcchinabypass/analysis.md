@@ -48,7 +48,7 @@
 
 ### 第 0 轮：情报收集（上设备后）
 1. 确认两个 App 的 bundle id、binary 名、是否有 .appex。
-2. 裸跑对照：不装任何 tweak，观察两个 App 的原始行为——
+2. 原样运行对照：不装任何 tweak，观察两个 App 的原始行为——
    - 启动后多久退出？退回桌面还是崩溃？
    - 有无 crash report？crash 特征（signal / raw syscall / watchdog 0x8BADF00D）？
    - 有无越狱提示弹窗？文案？
@@ -61,12 +61,12 @@
 
 ## 实验记录
 
-### 第 0 轮（2026-08-21）：情报收集 + 裸跑对照（部分完成）
+### 第 0 轮（2026-08-21）：情报收集 + 原样运行对照（部分完成）
 
 - 设备通过 **22215** 端口访问（2215 端口的旧 sshd 隧道僵死占用，改用 22215，同一台
   iPhone 13 Pro / iOS 15.4.1）。
 - 两个 App 的 bundle id / binary / 版本 / 扩展已确认（见上表）。
-- **裸跑对照遇阻**：`uiopen cn.com.hsbc.hsbcchina` 返回 0，但主 App 进程**从未出现**
+- **原样运行对照遇阻**：`uiopen cn.com.hsbc.hsbcchina` 返回 0，但主 App 进程**从未出现**
   （每 0.2s 高频抓取 5s 内 0 命中），无 crash log。汇丰香港同样起不来。
   - 已排除：uiopen 本身失效（能正常拉起设置 App `com.apple.Preferences`）；签名问题
     （entitlements 正常）；bundle id 错误（已用 ldid/strings 核准）。
@@ -100,7 +100,7 @@ RASPFramework 揭示的检测→响应模型（strings）：
 ⇒ **新假设**：3.72.15 的越狱响应是"检测 → JailbrokenStrategy/ExitOnStrategy → 弹窗 →
   abort/退出"，且检测判定在 Swift/ObjC 层（`isJailbroken`、`RASPFramework` 类）。
   若成立，则可在 Swift/ObjC 层 hook 判定或策略类短路（类似 abcbypass 的 initRiskManage
-  思路），比历史的 raw-syscall 悲观结论好办得多。**待裸跑对照验证真实退出方式。**
+  思路），比历史的 raw-syscall 悲观结论好办得多。**待原样运行对照验证真实退出方式。**
 
 ## 当前阻塞
 
@@ -123,7 +123,7 @@ RASPFramework 揭示的检测→响应模型（strings）：
 - 设备装了大量全局注入 tweak：`Shadow`（filter=UIKit，注入所有 App）、`noJailbreak` 等。
 - mobile 用户**无权限**改 `/var/jb/Library/MobileSubstrate/DynamicLibraries/`（`mv` 被拒）。
 - **Choicy 里汇丰中国和汇丰香港均已设 `tweakInjectionDisabled=true`**——当前完全禁止任何
-  tweak 注入这两个 App（推测上一轮排查时手动设的）。这既意味着裸跑环境更干净，也意味着
+  tweak 注入这两个 App（推测上一轮排查时手动设的）。这既意味着原样运行环境更干净，也意味着
   **将来本项目要能注入，必须先在 Choicy 放开或加白名单**。
 
 ## Round 0 结论（2026-08-21，探针版实测）
@@ -813,7 +813,7 @@ import `_mprotect` 的只有 **RemoteSale**(29MB)和 TMX(内联 svc mprotect@wra
 子代理给出精确 patch 点:
 - Turing `+[...isJailbrokenEnvironment:]` @0x5ba10(位掩码访问器,`ubfx x0,x2,#27,#1`)
   → patch `mov w0,#0;ret`。
-- BioCatch isRooted 落地点 @0xa9ba0(`and w8,w23,#0x1`)→ patch `and w8,wzr,#0x1`。
+- BioCatch isRooted 实现点 @0xa9ba0(`and w8,w23,#0x1`)→ patch `and w8,wzr,#0x1`。
 
 patch 两个 + 重签(注意:ldid -S 要验证生成 CandidateCDHash,否则加载失败 Library not loaded)
 + rebuild_trustcache,加载成功,但 **App 仍 ~379ms 退出**(基线不变)。
@@ -862,7 +862,7 @@ Transmit/TMX/Turing/BioCatch 的越狱判定函数。它们是"检测→上报"�
 - 由某模块检测越狱后触发,该"检测→自毁"链未定位(可能在主 App China 或 RemoteSale)。
 - 子代理正在查 RemoteSale(有 mprotect,RWX 生成嫌疑)。
 
-### 交付形态判断(回答"能否用 tweak")
+### 交付方式判断(回答"能否用 tweak")
 - inline-hook tweak:❌ 被反制秒杀。
 - fishhook/GOT tweak:✅ 不被反制,但只能 hook libc 导入,抓不到内联 svc,对本检测可能不够。
 - binary patch:✅ 前置条件全通,但要先定位"检测→自毁"链的 patch 点。
@@ -878,11 +878,11 @@ Transmit/TMX/Turing/BioCatch 的越狱判定函数。它们是"检测→上报"�
   → 检测线程执行极快,采样错过;或不在预期模块。
 
 ### 关键区分:有无 tweak,退出路径不同
-- **无 tweak**:曾产生 SIGBUS 崩溃日志(143428,PC=RWX stub,LR=0xcafebabe)。但现在裸跑
+- **无 tweak**:曾产生 SIGBUS 崩溃日志(143428,PC=RWX stub,LR=0xcafebabe)。但现在原样运行
   (无 tweak)也**不再产生崩溃日志**,说明常态退出是**静默 svc exit**,那次 SIGBUS 是特例。
 - **有 tweak**:一律静默 svc exit(~380-460ms),无异常、无崩溃日志、无 libc 退出调用。
 
-### 已确认的可用/不可用手段(交付形态依据)
+### 已确认的可用/不可用手段(交付方式依据)
 - MSHookFunction(改函数头):❌ 被反 inline-hook 自检秒杀。
 - fishhook(改 GOT):✅ 不被反制,但只能 hook libc 导入,抓不到内联 svc。
 - mach 异常端口 / task_threads 采样:✅ 不被反制(不 hook),但抓不到极快的内联 svc 检测。
@@ -1243,7 +1243,7 @@ computed blr 调用存储的回调 → 调析构 0x93900 → __stack_chk 返回�
   "不存在",在**输入层**绕过,完全不碰混淆的 dispatcher/字节 patch。
 - 探针已在本地写好并编译(见 Tweak.x),等设备可用一条命令部署。
 
-### 交付形态再评估
+### 交付方式再评估
 - 之前认为 hsbcchinax 走 raw syscall 不可 hook —— 对 Promon SHIELD **可能不成立**(无 syscall
   import,走 Foundation)。若检测确在 fileExistsAtPath:/stat 层 → **ObjC swizzle / fishhook
   tweak 可能直接可行**,不必二进制 patch。这是本 session 相对历史结论的又一利好。
@@ -1365,7 +1365,7 @@ agent 建议:(a)用真正的反编译器(Ghidra/IDA CFG 恢复)离线破;(b)上�
 若成功:香港 App 同法(同 Promon SHIELD 栈)。若仍自旋:说明干净态也依赖某未满足的运行时
 副作用,需回到 live trace 0x7748d8/0x775034 解密目标。
 
-### 交付形态
+### 交付方式
 若 0x712e10 patch 成功 → **二进制 patch 方案成立**(改 1 条指令 + ldid 重签 + trustcache)。
 无 __TEXT 自检(已多轮确认),patch 稳定。仍可探索 tweak 级(hook 检测函数)作为免改 Bundle 的
 交付,但 1 指令 patch 已是最小可用方案。
@@ -2064,7 +2064,7 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
   `982ed66f 01000000`(=0x16fd62e98 运行时地址)、`0c344917`(=0x1749340c)、`f1976b5a`(=0x5a6b97f1)、
   `d893c201`、`3881c101` —— **一串 32 位哈希/校验和 + 地址**。
 - ⇒ ★ **检测机制 = 内存完整性校验**: Promon 收集内存区域描述(SKS 结构)+ 计算各区域哈希, 比对期望值。
-  ElleKit 注入/hook 改了内存 → 哈希不匹配 → 判越狱/篡改。这就是"比对 dyld cache/内存页"的具体形态。
+  ElleKit 注入/hook 改了内存 → 哈希不匹配 → 判越狱/篡改。这就是"比对 dyld cache/内存页"的具体做法。
 - 决策函数 0x7753c4 返回 0 但仍退出 ⇒ 比对结果不体现为它的返回值, 而是写入某状态(供 CFF verdict 读)。
 
 ### 现实评估(方向2 深水区)
@@ -2099,7 +2099,7 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 - 11 个注入 dylib 都在数组末尾(idx 944-954), 压缩+缩短 count 干净完成。
 - 结果: **仍 3s 退出**。⇒ Promon **不(仅)靠 dyld_all_image_infos.infoArray 枚举**发现注入。
 
-### 收窄检测向量: 排除最简单的用户态 image 列表
+### 缩小范围检测向量: 排除最简单的用户态 image 列表
 - 剩余候选: (a) mach_vm_region 遍历找非cache可执行页(经典查注入法); (b) 直接遍历 dyld 内部链表(非infoArray);
   (c) 读内核 vm_map; (d) 检测根本不是 image-based(而是别的环境特征)。
 - Round57 观测到 mach_msg_trap×13, 可能就是 mach_vm_region/task_info 系列(经 mach_msg 到内核)。
@@ -2300,11 +2300,11 @@ guarded body 崩溃点 0x5d87d4 `blr x8` 的 x8 计算:
 ### 结果
 - 汇丰 **仍然闪退**, 且比带注入的 3s **更快(<1s)**, 无 crash log(干净 exit)。
 
-### 结论(证伪 + 二律背反)
+### 结论(证伪 + 两难)
 1. systemhook.dylib 的 Mach-O 头**不是唯一判定输入**。Round 68-76"让 Promon 读不到 systemhook 就能过"
    假设被证伪。Promon 有**独立于任何用户态注入库**的检测(很可能环境层: /var/jb、trustcache、
    amfid/签名行为、内核补丁痕迹)。Round 74"改头撑过3s"=扰动众多检测之一的计时/分支, 非唯一开关。
-2. **用户态二律背反**: 要 Promon 检测不到注入⇒不能注入⇒无法用 tweak 干预; 要 tweak 干预⇒必须注入⇒
+2. **用户态两难**: 要 Promon 检测不到注入⇒不能注入⇒无法用 tweak 干预; 要 tweak 干预⇒必须注入⇒
    又被检测。纯用户态无法同时满足"不被检测"+"能干预", 结构性矛盾。
 3. **唯一自洽方向 = 内核层**(issue #1): 隐藏越狱环境, 不注入目标故不触发注入检测, 同时隐藏环境特征。
    "构造自洽合法库伪装"降级(只覆盖 systemhook 头一个向量, 已知还有环境层检测)。
@@ -2415,7 +2415,7 @@ PlatformRASP 拿不到威胁就不弹拦截页，App 正常进入首页。
 
 第一类和第二类证据（hook 被换过、dlopen 指向 systemhook）无法在"已经注入"的前提下消除：
 只要还挂着任何一个 hook，ZDefend 就能看见。要它看不见，唯一办法是不注入，
-而那就没有任何手段可以干预——Round 77 记下的那条二律背反在这里依然成立。
+而那就没有任何手段可以干预——Round 77 记下的那个两难处境在这里依然成立。
 
 本轮真正的变化不是"消除了判定"，而是**判定结果不再有人消费**：它照样认为设备不安全，
 只是既杀不掉进程，也弹不出拦截页。第三类（bindfs 挂载）理论上可以靠 hook `statfs`

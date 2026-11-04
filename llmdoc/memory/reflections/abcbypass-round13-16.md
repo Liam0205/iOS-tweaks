@@ -18,7 +18,7 @@ binary MbapMPaaS = 蚂蚁 mPaaS) 在越狱设备上正常可用。本阶段从"�
 1. **存活检测匹配错进程（致命方法论错误）**：多轮用 `grep MbapMPaaS` 判断主 App
    是否存活，实际命中的是后台扩展 `group.abc.toolExtension`（常驻）。导致
    "存活 30s/90s/3min""进入业务流程""UI 正常"等一大批结论**全是假象**，在假信号上
-   反复打补丁，越修越糟（tweak 让主 App 从裸跑的 13s 提前到 1s 崩溃）。
+   反复打补丁，越修越糟（tweak 让主 App 从原样运行时的 13s 提前到 1s 崩溃）。
    - 正确匹配：`ps -eo args | grep -E 'MbapMPaaS\.app/MbapMPaaS( |$)' | grep -v PlugIns`。
 2. **自己的 hook 是崩溃元凶而非 ABC**：反复出现的 `0xb5a06000` SIGSEGV，二分定位为
    **对 libc 函数 inline-hook（MSHookFunction）被 ABC 完整性自检发现**。地址每次固定
@@ -51,8 +51,8 @@ binary MbapMPaaS = 蚂蚁 mPaaS) 在越狱设备上正常可用。本阶段从"�
 
 1. **先验证测量工具，再信任测量结果**。进程存活判断必须精确匹配主可执行文件路径并
    排除 `PlugIns` 扩展（`.appex`）。扩展进程常驻会伪造"App 存活"。
-2. **崩溃先问"是不是我造成的"**：卸载 tweak 做裸跑对照 + 二分编译开关，能快速区分
-   "ABC 的检测" vs "我的 hook 副作用"。本例大量"检测"其实是自伤。
+2. **崩溃先问"是不是我造成的"**：卸载 tweak 做原样运行对照 + 二分编译开关，能快速区分
+   "ABC 的检测" vs "我的 hook 副作用"。本例大量"检测"其实是我们自己造成的崩溃。
 3. **对有完整性自检的 App（mPaaS/银行类）：只用 ObjC swizzle**。任何 C 函数序言
    inline-hook、GOT 改写、__text patch 都会被发现（范围覆盖 libc 广泛函数，不止
    libpthread）。
@@ -80,5 +80,5 @@ binary MbapMPaaS = 蚂蚁 mPaaS) 在越狱设备上正常可用。本阶段从"�
 - ABC 大版本升级后优先确认 `-[DTFrameworkInterface initRiskManage]` 是否仍是检测
   block 宿主；若方法改名/重构，用 `abcbypass/tmp/objcparse.py`（手动解析
   `__objc_classlist`，找 IMP ≤ block invoke 地址且最近的方法）重新定位宿主方法。
-- 若出现新的独立 exit 路径，用 `abctest.sh`（正确进程匹配）做裸跑对照，先区分
-  「ABC 检测」还是「自伤」，再定位。
+- 若出现新的独立 exit 路径，用 `abctest.sh`（正确进程匹配）做原样运行对照，先区分
+  「ABC 检测」还是「我们自己造成的崩溃」，再定位。
