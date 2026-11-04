@@ -35,19 +35,32 @@ CONT="${CONT:-/var/mobile/Containers/Data/Application/A2267FB5-8887-41EE-A5B7-BE
 echo "使用构建: $DYLIB ($(stat -c %s "$DYLIB") 字节, $(stat -c %y "$DYLIB" | cut -d. -f1))"
 
 # 恢复被本脚本改名为 .off 的 plist。部署失败、观察中断、Ctrl-C 都要走到这里。
+#
+# 0.0.308：这段以前有个会留下残局的写法——不管还原成没成功，最后都 `rm -f $REC`。
+# 只要有一次 mv 失败（SSH 掉线、权限、文件名里带空格），记录就没了，
+# 设备上 60 多个 tweak 从此一直是关闭状态，而且再没有名单可以照着还原。
+# 2026-10-27 那次误伤就是留下的这样的残局，直到 2026-10-30 才发现。
+# 现在：只有全部还原成功才删记录；否则保留记录并明确报错。
 restore_plists() {
   ssh -o BatchMode=yes -p "$PORT" "$HOST" "bash -s" <<'RESTORE' 2>/dev/null
 D=/var/jb/usr/lib/TweakInject
 REC=$D/.disabled-by-verify
 [ -f "$REC" ] || exit 0
 n=0
+fail=0
 while IFS= read -r b; do
   [ -n "$b" ] || continue
   if [ -e "$D/$b" ]; then continue; fi
-  if sudo -n mv "$D/$b.off" "$D/$b" 2>/dev/null; then n=$((n+1)); fi
+  if sudo -n mv -- "$D/$b.off" "$D/$b" 2>/dev/null; then n=$((n+1)); else fail=$((fail+1)); fi
 done < "$REC"
-sudo -n rm -f "$REC"
-echo "已恢复 $n 个 plist"
+if [ "$fail" -eq 0 ]; then
+  sudo -n rm -f "$REC"
+  echo "已恢复 $n 个 plist"
+else
+  echo "!! 仍有 $fail 个 plist 没还原，记录保留在 $REC" >&2
+  echo "!! 设备上会有 tweak 处于关闭状态，重新跑一次本脚本或手工还原" >&2
+  exit 1
+fi
 RESTORE
 }
 trap restore_plists EXIT INT TERM
