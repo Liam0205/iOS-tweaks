@@ -59,7 +59,7 @@
 
 ```
 # 命令格式
-tap <x> <y>                        # 点按（屏幕像素坐标）
+tap <x> <y>                        # 点按（像素坐标，与截图同尺寸）
 swipe <x1> <y1> <x2> <y2> [ms] [curve]  # 滑动（默认 300ms，可选曲线）
                                         #   curve: linear, easein, easeout, easeinout
                                         #   bezier:cx1,cy1,cx2,cy2 (自定义 cubic-bezier)
@@ -84,7 +84,7 @@ disable                             # 运行时禁用（CLI 直接写偏好 + Da
 
 # 响应格式
 OK                                  # 成功
-OK 390x844 @3x conn=connected hook=captured  # info 响应
+OK 1170x2532 px (390x844pt @3x) coord=pixel conn=connected hook=captured  # info 响应
 OK springboard-api                  # home/系统手势响应
 OK cc presented                     # cc 响应
 OK notif presented                  # notif 响应
@@ -139,9 +139,10 @@ SpringBoard 写命令结构体到 /var/jb/tmp/simtouch-cmd
 
 **坐标系**：
 - IOHIDEvent 使用归一化坐标 [0.0, 1.0]
-- CLI/socket 传入屏幕像素坐标
+- CLI/socket 传入屏幕像素坐标（与 `screenshot` 的图片尺寸一致，iPhone 13 Pro 上是 1170x2532）
 - TouchInjector 转换：`normalized = pixel / screen_pixels`
 - iPhone 13 Pro：1170x2532 px，390x844 pt，@3x
+- `info` 命令同时报像素与点，并把 `coord=pixel` 写在响应里；只按点坐标传会落到屏幕左上角
 
 ### 3. TouchInjector（IPC 中继层）
 

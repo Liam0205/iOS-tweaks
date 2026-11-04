@@ -152,8 +152,13 @@ static void registerCommands(void) {
         CGFloat scale = [UIScreen mainScreen].scale;
         STTouchInjector *ti = [STTouchInjector sharedInstance];
         NSString *conn = ti.isUserDeviceReady ? @"connected" : @"none";
-        return [NSString stringWithFormat:@"OK %.0fx%.0f @%.0fx conn=%@ hook=%@",
-            size.width, size.height, scale, conn, ti.bbState];
+        // tap/swipe 等命令收的是像素坐标，不是 bounds 的点尺寸。
+        // 以前这里只报 "390x844 @3x"，看着像要传点坐标，实际传点坐标会落到屏幕左上角。
+        // 现在把两套都在同一行里写清楚，并把像素值放在显眼位置。
+        return [NSString stringWithFormat:@"OK %.0fx%.0f px (%@pt @%.0fx) coord=pixel conn=%@ hook=%@",
+            size.width * scale, size.height * scale,
+            [NSString stringWithFormat:@"%.0fx%.0f", size.width, size.height],
+            scale, conn, ti.bbState];
     }];
 
     [[STSocketServer sharedInstance] registerCommand:@"bbstatus" handler:^NSString *(NSArray<NSString *> *args) {
