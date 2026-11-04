@@ -96,7 +96,7 @@ static int cb_neuter_checkers(void) {
 
 __attribute__((constructor)) static void cb_init(void) {
     @autoreleasepool {
-        cb_log("===== CITICBypass 0.0.6 载入，pid=%d =====", getpid());
+        cb_log("===== CITICBypass 1.0.0 载入，pid=%d =====", getpid());
 
         // 先短路检测项，再处理应用层的判定逻辑。
         cb_log("checker 短路 %d 个", cb_neuter_checkers());
