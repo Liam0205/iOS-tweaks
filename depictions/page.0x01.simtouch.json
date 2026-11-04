@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "Remote touch simulation and screenshot capture for jailbroken iOS"}],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\n## 0.1.1\n\n\u4fee\u6b63 `info` \u8f93\u51fa\u7684\u5750\u6807\u7ea6\u5b9a\u8bf4\u660e\uff0c\u907f\u514d\u6309\u70b9\u5750\u6807\u4f20\u53c2\u5bfc\u81f4\u89e6\u6478\u843d\u5230\u5c4f\u5e55\u5de6\u4e0a\u89d2\u3002\n\n- `tap`\u3001`swipe` \u7b49\u547d\u4ee4\u4e00\u76f4\u6536\u7684\u662f**\u50cf\u7d20\u5750\u6807**\uff08\u4e0e `screenshot` \u8f93\u51fa\u56fe\u7247\u7684\u5c3a\u5bf8\u4e00\u81f4\uff0ciPhone 13 Pro \u4e0a\u662f 1170x2532\uff09\uff0c\u4f46 `info` \u53ea\u62a5 `bounds` \u7684\u70b9\u5c3a\u5bf8 `390x844 @3x`\uff0c\u770b\u8d77\u6765\u50cf\u8981\u4f20\u70b9\u5750\u6807\u3002\u5b9e\u9645\u6309\u70b9\u5750\u6807\u4f20\u4f1a\u843d\u5230\u5c4f\u5e55\u5de6\u4e0a\u89d2\u3002\n- `info` \u73b0\u5728\u628a\u4e24\u5957\u5c3a\u5bf8\u5199\u5728\u540c\u4e00\u884c\uff0c\u50cf\u7d20\u503c\u653e\u5728\u524d\u9762\uff0c\u5e76\u52a0\u4e0a `coord=pixel`\uff1a\n\n  ```\n  OK 1170x2532 px (390x844pt @3x) coord=pixel conn=connected hook=captured\n  ```\n\n- CLI \u7684 usage \u6587\u672c\u548c `DESIGN.md` \u7684\u5750\u6807\u7cfb\u4e00\u8282\u540c\u6b65\u66f4\u65b0\u3002\n- \u5728 iPhone 13 Pro / iOS 15.4.1 \u4e0a\u9a8c\u8bc1\uff1a`killall SpringBoard` \u540e `info` \u8f93\u51fa\u65b0\u683c\u5f0f\uff1b\u7528\u50cf\u7d20\u5750\u6807 `tap 148 452` \u547d\u4e2d\u4e2d\u4fe1\u94f6\u884c\u9996\u9875\u7684\u300c\u8d26\u6237\u300d\u6309\u94ae\uff0c\u6b63\u5e38\u8fdb\u5165\u767b\u5f55\u9875\u3002\n\n## 0.1.0\n\n\u9996\u4e2a\u53d1\u5e03\u7248\u3002\u8fdc\u7a0b\u89e6\u63a7\u6ce8\u5165\u3001\u622a\u56fe\u3001\u5f55\u5236\u56de\u653e\u3001\u7cfb\u7edf\u624b\u52bf\u3002"}],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}

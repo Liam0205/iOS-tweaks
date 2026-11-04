@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#6b6b6b"/>
+  <text x="256" y="260" font-family="-apple-system, SF Pro Display, Helvetica Neue, sans-serif" font-size="160" font-weight="700" fill="#ffffff" text-anchor="middle">0x01</text>
+  <text x="256" y="370" font-family="-apple-system, SF Pro Display, Helvetica Neue, sans-serif" font-size="100" font-weight="600" fill="#ffffff" opacity="0.7" text-anchor="middle">dev</text>
+</svg>
