@@ -17,7 +17,7 @@
 | 类 | 关键方法 | 作用 |
 |---|---|---|
 | `BCESCheckerEnvironment` | `-(check)`、`+name`、`initWithCheckRoot:checkRiskFrame:checkFrida:` | 环境（越狱根、Frida）检查 |
-| `BCESCheckerInject` | `-(check)`、`+name`、`inlineHookedInfo`、`swizzleHookedInfo`、`attackFrame` | 注入检查，含 hook 自检 |
+| `BCESCheckerInject` | `-(check)`、`+name`、`inlineHookedInfo`、`swizzleHookedInfo`、`attackFrame` | 注入检查；后两个方法名指向 hook 自检，实际检查对象未经验证 |
 | `BCESRiskStub` | `+alertForEvent:withAction:` 等 30 个类方法 | SDK 对外接口 |
 | `CBAppRiskEvent` | `+jailBreakJudge`、`+riskEventJudge`、`+riskEventAlert:` | 中信自己的风控汇总 |
 | `CBAlert` | `-initOneBtnWithTitle:message:type:priority:blockType:block:` | 自绘对话框 |
@@ -38,7 +38,7 @@
 第三条最关键：**探针 A（只载入 dylib、零 hook）同样会触发它**，说明它判的是
 「有没有额外镜像被加载」，与具体 hook 了哪个方法无关。
 
-## 3. 为什么不能用 `%hook`
+## 3. 0.0.4 的崩溃
 
 0.0.4 用了 15 个 `%hook`，App 启动后主线程立刻崩溃：
 
@@ -51,9 +51,24 @@ reportNotes: SP register contains suspicious bits (0x21915ECDDEAD52FC)
 SP 里那个含 `DEAD` 的常量是典型的哨兵值，意思很明确：检测方主动破坏栈指针再跳飞。
 whbypass 记录过同一个手法，毒地址是 `0xb5a01000`，两者只差一个页表项。
 
-`%hook` 底层是 `MSHookFunction`，会改函数序言字节；而 `BCESCheckerInject`
-正好有 `inlineHookedInfo` 和 `swizzleHookedInfo` 两个方法专门查这种改动。
-改成 `method_setImplementation` 只动 ObjC 方法表、不碰指令字节后，崩溃消失。
+崩溃的触发条件至今没有查清。0.0.4 之后的探针改用 `method_setImplementation`，崩溃消失，
+但两者都在方法表层面，差别没有落在最初的猜测上。
+
+早前写的归因是「`%hook` 底层走 `MSHookFunction`，改了函数序言字节，被
+`BCESCheckerInject` 的 `inlineHookedInfo` 查出来」。这条是错的：`%hook` 由 Logos
+展开成 `MSHookMessageEx`，换的是 Method 里的 IMP，不碰指令字节。把
+`inlineHookedInfo` 当成拦截点，等于假设它查了它实际查不到的东西。
+
+目前没有证据支持任何一条解释，只有三个待验证的候选：
+
+1. `MSHookMessageEx` 在方法来自父类时会用 `class_addMethod` 往本类方法表加一条新记录，
+   而 `method_setImplementation` 只改已有条目的 IMP。类自己多出一条方法，是可观测的。
+2. 0.0.4 的 Makefile 里还留着 `substrate`，二进制因此多一条对注入框架的动态依赖；
+   1.0.0 删掉之后，动态依赖只剩系统库。
+3. 检测方看的是别的特征。具体是什么，还没有定位。
+
+要分清这三条，需要两组对照探针：一组只链 substrate、零 hook，一组只链 substrate、
+只用 `method_setImplementation`。这组实验一直没做。
 
 ## 4. 解法
 
