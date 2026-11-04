@@ -11,6 +11,7 @@ iOS 越狱 Tweak 仓库，基于 Theos 构建，面向 rootless 越狱环境（D
 | `page.0x01.icbcbypass` | 工商银行 | 3.0.80 ~ 3.0.90 | 绕过越狱检测三层防御（检测+冻结+退出弹窗） |
 | `page.0x01.abcbypass` | 农业银行 | 11.1.0 | 绕过越狱检测（开发中） |
 | `page.0x01.lianjiabypass` | 链家、贝壳找房 | 链家 9.86.91 / 贝壳 3.06.21 | 绕过越狱检测四层防御（文件检测+镜像枚举+注入检测+自杀退出） |
+| `page.0x01.citicbypass` | 中信银行 | 12.2.8 | 绕过越狱检测（Bangcle Everisk 检测项短路 + 应用层风控判定置空） |
 
 ## Tools
 

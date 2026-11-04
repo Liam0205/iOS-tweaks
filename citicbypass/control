@@ -1,0 +1,9 @@
+Package: page.0x01.citicbypass
+Name: CITICBypass-中信银行反检测-rootless
+Version: 0.0.6
+Architecture: iphoneos-arm64
+Description: 绕过中信银行（com.citic.mobile）的越狱环境检测。适用于 rootless 越狱（Dopamine 等）。在 12.2.8 版本验证。
+Maintainer: Liam
+Author: Liam
+Section: 反检测
+Depends: ellekit
