@@ -18,7 +18,7 @@ iOS 越狱 Tweak 仓库，基于 Theos 构建，面向 rootless 越狱环境（D
 | 包名 | 类型 | 说明 |
 |------|------|------|
 | `page.0x01.sshtunnel` | Application | SSH 反向隧道管理器 (v1.3.2)，用于远程调试越狱设备 |
-| `page.0x01.simtouch` | Tweak + Tool | 远程触控模拟与截屏 (v0.1.0)，用于自动化测试越狱设备 |
+| `page.0x01.simtouch` | Tweak + Tool | 远程触控模拟与截屏 (v0.1.1)，用于自动化测试越狱设备 |
 
 ## 安装
 
