@@ -13,5 +13,8 @@ TWEAK_NAME = MYBankBypass
 MYBankBypass_FILES = Tweak.x
 MYBankBypass_CFLAGS = -fobjc-arc
 MYBankBypass_FRAMEWORKS = Foundation UIKit
+ifeq ($(shell uname),Linux)
+MYBankBypass_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
+endif
 
 include $(THEOS_MAKE_PATH)/tweak.mk

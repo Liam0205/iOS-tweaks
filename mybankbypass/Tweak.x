@@ -12,6 +12,11 @@
 #import <objc/runtime.h>
 #import <string.h>
 #import <pthread.h>
+#include <mach-o/dyld.h>
+#include <mach/mach_init.h>
+#include <mach/vm_map.h>
+#include <libkern/OSCacheControl.h>
+extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
 
 // ============================================================
 // Pure C path checking (no ObjC, safe for low-level hooks)
@@ -899,10 +904,84 @@ static int hooked_raise(int sig) {
 // MARK: Constructor
 // ============================================================
 
+
+// ============================================================
+// 4.7.48 起：启动检查失败会直接 exit(0)
+// ============================================================
+//
+// 4.7.47 与 4.7.48 都有一个「检查 → 记日志 → 失败则退」的包装函数，区别在于
+// 4.7.48 的检查会给出「失败」这个结论，于是启动阶段主线程调用 exit(0)。
+// 我们原来的 exit 钩子用死循环 runloop 把它吞掉，结果是那次调用永远不返回，
+// 启动流程停在半路——界面能出来、能滚动、能切 tab，但中间内容的事件链路没接上。
+//
+// 4.7.48 里这段的形状（地址相对 Portal 的 Mach-O 头）：
+//   0x3c2ac0c  bl   <检查函数>
+//   0x3c2ac30  cbnz w19, 0x3c2ac44   ← 非零进退出块
+//   0x3c2ac40  ret                    ← 零则正常返回
+//   0x3c2ac7c  bl   _exit
+// 把 0x3c2ac30 换成 nop，失败时也走正常返回，启动流程照常走完。
+//
+// 这是按版本写死的偏移。其它版本必须先用同样的方法重新定位，不能直接沿用。
+typedef struct {
+    const char *version;   // CFBundleShortVersionString
+    uint64_t    offset;    // cbnz 相对 Mach-O 头的偏移
+} MybPatchEntry;
+
+static const MybPatchEntry kStartupExitPatches[] = {
+    { "4.7.48", 0x3c2ac30ULL },
+};
+
+// 注意：注入之后 _dyld_get_image_header(0) 不一定是主程序，必须按路径找。
+static const struct mach_header_64 *findMainExec(void) {
+    NSString *exe = [[NSBundle mainBundle] executablePath];
+    const char *want = [exe fileSystemRepresentation];
+    if (!want) return NULL;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || strcmp(nm, want) != 0) continue;
+        return (const struct mach_header_64 *)_dyld_get_image_header(i);
+    }
+    return NULL;
+}
+
+static uint64_t patchMainExec(uint64_t offset, uint32_t expected, uint32_t replacement) {
+    const struct mach_header_64 *mh = findMainExec();
+    if (!mh) return 0;
+    uintptr_t addr = (uintptr_t)mh + offset;
+    uint32_t before = *(volatile uint32_t *)addr;
+    if (before != expected) return 1;          // 与预期不符，不动
+    uintptr_t page = addr & ~(uintptr_t)0x3fff;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, 0x4000, 0,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return 2;
+    *(volatile uint32_t *)addr = replacement;
+    sys_icache_invalidate((void *)addr, 4);
+    // iOS 不允许一页同时可写可执行：请求 rwx 实际得到 rw-。
+    // 不还原成 r-x 的话，同页其它函数一执行就 SIGBUS。
+    mach_vm_protect(mach_task_self(), page, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    return 0;
+}
+
+static int applyStartupExitPatch(void) {
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    if (!ver) return -1;
+    const char *v = [ver UTF8String];
+    if (!v) return -1;
+    for (unsigned i = 0; i < sizeof(kStartupExitPatches) / sizeof(kStartupExitPatches[0]); i++) {
+        if (strcmp(v, kStartupExitPatches[i].version) != 0) continue;
+        // 0x350000b3 = cbnz w19, +0x14；0xd503201f = nop
+        return (int)patchMainExec(kStartupExitPatches[i].offset, 0x350000b3U, 0xd503201fU);
+    }
+    return -2;   // 没有对应版本
+}
+
 %ctor {
     @autoreleasepool {
         // Install Logos ObjC hooks
         %init;
+
+        applyStartupExitPatch();
 
         // Block all exit mechanisms FIRST
         MSHookFunction((void *)exit, (void *)hooked_exit, (void **)&orig_exit);
