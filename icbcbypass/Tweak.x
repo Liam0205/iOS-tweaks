@@ -748,8 +748,8 @@ static int hooked_syscall(int number, ...) {
 }
 %end
 
-static int g_send_event_count = 0;
-static int g_app_send_event_count = 0;
+static int g_send_event_count __attribute__((unused)) = 0;
+static int g_app_send_event_count __attribute__((unused)) = 0;
 
 %hook UIApplication
 - (BOOL)canOpenURL:(NSURL *)url {
@@ -875,7 +875,13 @@ static int g_app_send_event_count = 0;
     %orig;
 }
 - (void)setUserInteractionEnabled:(BOOL)enabled {
-    if (!enabled) {
+    // 只挡后台线程发起的关闭。主线程上的调用绝大多数来自 UIKit 自己：
+    // 3.1.50 的实测里，被拦到的都是 UILabel、_UIVisualEffectBackdropView、
+    // _UIBarBackgroundShadowContentImageView 这类内部子视图，调用栈全是 UIKitCore。
+    // 拦住它们会让这些子视图保持可交互，把本该交给父级 UIButton 的点击吃掉，
+    // 表现就是「点很多次才响应一次」。解冻定时器每 2s 会把窗口和根视图重新打开，
+    // 所以主线程这条路径不需要在这里挡。
+    if (!enabled && !pthread_main_np()) {
         CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - g_ctor_time;
         if (elapsed > 3.0) {
             return;

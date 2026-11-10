@@ -1008,3 +1008,70 @@ freeze 循环中 `dispatch_semaphore_wait(FOREVER)` 被直接返回 0，将原�
 NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
 fprintf(f, "[INIT] ICBCBypass v1.0.0 / ICBC %s ctor started\n", appVer.UTF8String);
 ```
+
+---
+
+## 第 33 轮：点击响应率低，根因是拦截 `setUserInteractionEnabled:NO`
+
+### 现象
+
+用户反馈：App 能打开，但「若干次点击可能才响应其中一次」，各处都这样。降级到不装插件时正常。
+
+### 测量方法
+
+装一个诊断版插件，在 `-[UIApplication sendEvent:]` 和各窗口的 `sendEvent:` 里记录每次触摸：
+落地窗口、窗口内坐标、`hitTest:` 命中的视图与父链、`touch.view`、父链上所有手势识别器的状态。
+再用 simtouch 注入点击，配合截图逐次判断界面是否真的变化。
+
+### 观察 1：触摸到达 App 且命中正确
+
+登录页点「我已阅读并同意」的方框，日志显示：
+
+```
+[TOUCH] UIApplication.sendEvent phase=0 pt=(31,342) hit=UIImageView
+        chain=UIImageView < UIButton < AuthenFirstNumberLoginView < ...
+[CTRL]  UIButton enabled=1 events=0x40
+        targets=[AuthenFirstNumberLoginView] AuthenFirstNumberLoginView->selectClickAction:
+```
+
+触摸到了、命中链对、按钮 enabled、target 也在，但 `selectClickAction:` 从不执行。
+说明触摸是在 UIKit 的控件跟踪之前就被吃掉的。
+
+### 观察 2：被拦掉的「关闭交互」全部来自 UIKit
+
+插件里有一条从 1.0.0 起就存在的规则：启动 3 秒后无条件拦掉
+`-[UIView setUserInteractionEnabled:NO]`。给这条规则加上调用栈记录后，前几次命中的是：
+
+```
+[SETUI] off main=1 cls=UILabel
+   UIKitCore +0x58eb4c / +0x4f22d4 / +0x3763f4 ...
+[SETUI] off main=1 cls=UIView
+   UIKitCore +0x316fe4 / +0x31177c / +0x26d448 ...
+[SETUI] off main=1 cls=_UIVisualEffectBackdropView
+[SETUI] off main=1 cls=_UIBarBackgroundShadowContentImageView
+```
+
+全部在**主线程**，调用栈**全是 UIKitCore**，没有一条来自 App 自己的冻结代码。
+这些子视图本该不可交互；拦成「永远可交互」之后，它们会把本该交给父级 `UIButton`
+的点击自己吃掉——这正是「点很多次才中一次」的成因。
+
+这条规则原本的依据是第 27 轮列出的假设「有第二个后台线程在循环设置
+`userInteractionEnabled=NO`」。实测没有找到这样的线程；被拦的反而是 UIKit 的正常调用。
+
+### 修复
+
+只拦后台线程发起的关闭调用，主线程放行。窗口与根视图的交互由解冻定时器每 2 秒重新打开。
+
+### 验证
+
+| 版本 | 登录页勾选框连点 3 次 | 静置 75 秒后底部 tab |
+|---|---|---|
+| 1.1.1 | 0 次生效 | 需要重试 |
+| 1.1.2 | 3 次全部生效 | 两次切换都即时响应 |
+
+### 遗留
+
+- 用户主观感受还需要本人用手指确认；本次测量用的是注入触摸。
+- `+[UIView setAnimationsEnabled:NO]` 的拦截也抓了调用栈，调用方同样全是 UIKitCore
+  与 `UIApplicationMain` 路径。它不直接导致点击丢失，但拦掉 UIKit 自己的调用仍可能让
+  动画状态与预期不一致，后续可以按同样的思路收窄。

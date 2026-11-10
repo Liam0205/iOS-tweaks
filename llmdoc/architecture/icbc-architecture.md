@@ -90,7 +90,10 @@ APP 的冻结机制是持续运行的循环（30s 内 14,000+ 次调用），不
 
 **UIView 层**（时间门控：elapsed > 3s 后拦截）：
 - `[UIView setAnimationsEnabled:NO]` → 直接 return
-- `[UIView setUserInteractionEnabled:NO]` → 直接 return
+- `[UIView setUserInteractionEnabled:NO]` → 仅当调用来自后台线程时 return；主线程放行。
+  这条规则在 1.1.2 收窄过：实测被拦到的都是主线程上 UIKit 自己的调用
+  （`UILabel`、`_UIVisualEffectBackdropView`、`_UIBarBackgroundShadowContentImageView` 等内部子视图），
+  拦掉会让这些子视图保持可交互、吃掉父级 `UIButton` 的点击，表现为「点很多次才响应一次」。
 - `[UIApplication beginIgnoringInteractionEvents]` → 直接 return
 
 **CALayer 层**（速率限制：区分冻结循环突发与正常 App 调用）：

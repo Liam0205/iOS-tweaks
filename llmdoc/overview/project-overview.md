@@ -10,7 +10,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 |------|----------|-----------|----------|------|
 | `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.48 | 已发布 |
 | `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 | 已发布 |
-| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
+| `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.1.50 | 已发布 |
 | `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-95) |
 | `page.0x01.lianjiabypass` | 链家 / 贝壳找房 | `com.exmart.HomeLink` / `com.lianjia.beike` | 链家 9.86.91 / 贝壳 3.06.21 | 已发布 0.1.0 |
 | `page.0x01.aiabypass` | 友邦友享 | `com.aia.china.YoubangHealthRelease` | 6.9.33 | 已发布 1.0.0（判定未绕过，处决被接住） |
@@ -40,7 +40,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 
 - mybankbypass 当前版本：`1.2.4`，已确认绕过网商银行 4.6.4、4.7.36 与 4.7.48 的越狱检测；1.2.4 起在代码补丁生效时撤掉 `exit` 钩子，修复正常关闭 App 被 watchdog 强杀（`0x8BADF00D`）
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
-- icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
+- icbcbypass 当前版本：`1.1.2`，已绕过工商银行 3.0.80 ~ 3.1.50 的越狱检测+主线程冻结+退出弹窗三层防御（v1.1.0 修复 3.0.90 的 CALayer 动画累积问题；v1.1.2 收窄 `setUserInteractionEnabled:NO` 的拦截范围，修复点击响应率低）
 - abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
 - simtouch 当前版本：`0.1.2`，已发布到 Sileo 源；backboardd hook 触摸注入已验证（tap/swipe/longpress），事件录制已完成，回放待调试；截图正常；屏幕尺寸改为惰性获取，修复了 SpringBoard 启动早期被 socket 命令打崩的问题（功能进展详见 `llmdoc/architecture/simtouch-architecture.md`，崩溃根因见 `llmdoc/reference/simtouch-technical-decisions.md` 第 19 节）
 - aiabypass 当前版本：`1.0.0`，友邦友享 6.9.33 不再一打开就闪退，首页加载、5 个 tab 切换、滚动、前后台往返正常，连续三次冷启动验证通过。**但这是全仓唯一一个判定没绕过的 tweak**：JM（JMCodeProtectKit）的判定发生在它自己初始化阶段，早于任何 tweak 代码，启动期仍有 2 次处决由 Mach 异常端口接住。手段与边界详见 `llmdoc/architecture/aiabypass-architecture.md`
