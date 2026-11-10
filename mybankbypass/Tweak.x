@@ -931,6 +931,30 @@ static const MybPatchEntry kStartupExitPatches[] = {
     { "4.7.48", 0x3c2ac30ULL },
 };
 
+// 版本比较：把 "x.y.z" 解析成三段，v >= (maj, min, pat) 返回 1。
+static int versionAtLeast(const char *v, int maj, int min, int pat) {
+    int a = 0, b = 0, c = 0;
+    if (!v) return 0;
+    if (sscanf(v, "%d.%d.%d", &a, &b, &c) < 1) return 0;
+    if (a != maj) return a > maj;
+    if (b != min) return b > min;
+    return c >= pat;
+}
+
+// 补丁没打上时写一行记录。插件没有别的日志通道，只在异常时留痕，正常启动不写。
+static void notePatchFailure(const char *ver, int rc, uint32_t got) {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!caches) return;
+    NSString *lp = [caches stringByAppendingPathComponent:@"mybankbypass.log"];
+    int fd = open([lp fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf), "startup-exit patch skipped: version=%s rc=%d instr=0x%08x\n",
+                     ver ? ver : "(nil)", rc, got);
+    if (n > 0) write(fd, buf, (size_t)n);
+    close(fd);
+}
+
 // 注意：注入之后 _dyld_get_image_header(0) 不一定是主程序，必须按路径找。
 static const struct mach_header_64 *findMainExec(void) {
     NSString *exe = [[NSBundle mainBundle] executablePath];
@@ -968,12 +992,24 @@ static int applyStartupExitPatch(void) {
     if (!ver) return -1;
     const char *v = [ver UTF8String];
     if (!v) return -1;
-    for (unsigned i = 0; i < sizeof(kStartupExitPatches) / sizeof(kStartupExitPatches[0]); i++) {
-        if (strcmp(v, kStartupExitPatches[i].version) != 0) continue;
+    // 从新到旧找第一条适用的：要求当前版本 >= 该条目的起始版本。
+    // 起点是 4.7.48，所以 4.7.48 及其后的版本都会按同一个偏移去试；
+    // 试之前会核对那 4 个字节是不是预期的 cbnz，不一致就不动。
+    for (int i = (int)(sizeof(kStartupExitPatches) / sizeof(kStartupExitPatches[0])) - 1; i >= 0; i--) {
+        int maj = 0, min = 0, pat = 0;
+        if (sscanf(kStartupExitPatches[i].version, "%d.%d.%d", &maj, &min, &pat) < 3) continue;
+        if (!versionAtLeast(v, maj, min, pat)) continue;
         // 0x350000b3 = cbnz w19, +0x14；0xd503201f = nop
-        return (int)patchMainExec(kStartupExitPatches[i].offset, 0x350000b3U, 0xd503201fU);
+        int rc = (int)patchMainExec(kStartupExitPatches[i].offset, 0x350000b3U, 0xd503201fU);
+        if (rc != 0) {
+            const struct mach_header_64 *mh = findMainExec();
+            uint32_t got = mh ? *(volatile uint32_t *)((uintptr_t)mh + kStartupExitPatches[i].offset) : 0;
+            notePatchFailure(v, rc, got);
+        }
+        return rc;
     }
-    return -2;   // 没有对应版本
+    notePatchFailure(v, -2, 0);
+    return -2;   // 版本低于已知起点
 }
 
 %ctor {
