@@ -185,3 +185,41 @@ IOHIDEventCreateDigitizerFingerEvent(allocator, ts, 1/*index*/, 2/*identity*/, .
 **陷阱**：`sbreload` 只重启 SpringBoard（通过 launchd 发信号），backboardd 是独立的 launchd 守护进程（`com.apple.backboardd`），不受 sbreload 影响。
 
 **解决方案**：`sudo killall backboardd`，launchd 会自动重启它（因为 backboardd 的 plist 配置了 `KeepAlive`）。注意：killall backboardd 会同时导致 SpringBoard 重启（因 SpringBoard 依赖 backboardd 的 Mach port）。
+
+## 19. 屏幕尺寸必须惰性获取，而且不能在 dispatch_once 块里碰 UIKit
+
+**问题**：2026-11-10 18:18，SpringBoard 被内存回收杀掉后重启，3.4 秒后收到一条 socket 命令，进程以 `std::terminate` 退出并进入 Safe Mode。崩溃栈落在这条链上：
+
+```
++[UIScreen mainScreen] → STTouchInjector init → dispatch_once → _dispatch_client_callout → abort
+```
+
+**原因**：`+[STTouchInjector sharedInstance]` 是在 socket 队列上被调用的，`init` 由 `dispatch_once` 的块执行。SpringBoard 刚启动、界面子系统还没就绪时，`[UIScreen mainScreen]` 会抛 ObjC 异常。`dispatch_once` 的块由 `_dispatch_client_callout` 调用，它用 `catch(...)` 接住所有异常后直接 `terminate`，所以**调用方在外面包 `@try` 也接不住** —— `SocketServer` 的 `processCommand:` 本来就有 `@try`，照样没拦住。
+
+**做法**：屏幕尺寸改成惰性获取，第一次用到时在 Main Thread 上读，套 `@try`，读失败就保持 0 并返回错误，下次再试；`info` 命令改用缓存值；截图兜底路径和 socket 读循环各加一层 `@try`。三条命令（tap/swipe/pinch）在尺寸拿不到时直接放弃，避免除以 0。
+
+**通用教训**：任何在 `dispatch_once` 块里执行的代码都不允许抛异常，包括 UIKit 调用。事件处理块同理 —— 后台队列上抛出的异常等同于进程自杀。
+
+## 20. 在 Linux 上构建 arm64e 切片
+
+**问题**：`arch64e`（`ARCHS = arm64 arm64e`）在 Linux 上链接失败，`ld64.lld` 报一串：
+
+```
+INVALID relocation has invalid width of 8 bytes at offset N of __DATA,__cfstring
+```
+
+这是 arm64e 的 `__cfstring` 使用认证指针（重定位类型 11）造成的，当前 lld 不认。
+
+**只编译 arm64 不行**：装上去以后 SpringBoard（arm64e）根本不会加载，`/var/jb/tmp/simtouch.sock` 不重建，`simtouch info` 报连接被拒。ElleKit 要求注入的 dylib 带 arm64e 切片。
+
+**做法**：改用旧工具链自带的 cctools `ld64`（`/home/safe/theos/toolchain/linux/iphone/bin/ld.orig`）。它需要 `libtinfo.so.5`、`libxml2.so.2`、ICU 74，本机没有，用一个 shim 目录给齐（`/var/tmp/ldshim`：libtinfo 指向 brew ncurses，libxml2 指向系统的 `libxml2.so.16`），然后：
+
+```
+env -u PERL5LIB THEOS=/home/safe/theos \
+  LD_LIBRARY_PATH="/var/tmp/ldshim:/home/linuxbrew/.linuxbrew/lib" \
+  make package ARCHS="arm64 arm64e" \
+  SimTouch_LDFLAGS="-B\$THEOS/toolchain/linux/iphone/bin -fuse-ld=\$THEOS/toolchain/linux/iphone/bin/ld.orig" \
+  simtouch_LDFLAGS=... SimTouchPrefs_LDFLAGS=...
+```
+
+产物 `file` 应为 `Mach-O universal binary with 2 architectures`。macOS 上直接用 Xcode 的 ld 即可，没有这个问题。
