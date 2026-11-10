@@ -8,7 +8,7 @@ DEV-iOS 是一个基于 Theos 的 iOS 越狱项目仓库，主体是多个银行
 
 | 包名 | 目标 App | Bundle ID | 支持版本 | 状态 |
 |------|----------|-----------|----------|------|
-| `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.36 | 已发布 |
+| `page.0x01.mybankbypass` | 网商银行 | `com.mybank.ios.phone` | 4.6.4 ~ 4.7.48 | 已发布 |
 | `page.0x01.bankcommbypass` | 交通银行 | `com.bankcomm.Bankcomm` | 10.3.0 | 已发布 |
 | `page.0x01.icbcbypass` | 工商银行 | `com.icbc.iphoneclient` | 3.0.80 ~ 3.0.90 | 已发布 |
 | `page.0x01.abcbypass` | 农业银行 | `com.bankabc.iphonerelease` | 11.1.0 | 开发中 (v0.1.0-95) |
@@ -38,7 +38,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 
 ## 当前状态
 
-- mybankbypass 当前版本：`1.2.0`，已确认绕过网商银行 4.6.4 与 4.7.36 的越狱检测
+- mybankbypass 当前版本：`1.2.3`，已确认绕过网商银行 4.6.4、4.7.36 与 4.7.48 的越狱检测
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
 - icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
 - abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
