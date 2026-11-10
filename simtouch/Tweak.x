@@ -148,16 +148,21 @@ static void registerCommands(void) {
         CFNotificationSuspensionBehaviorDeliverImmediately);
 
     [[STSocketServer sharedInstance] registerCommand:@"info" handler:^NSString *(NSArray<NSString *> *args) {
-        CGSize size = [UIScreen mainScreen].bounds.size;
-        CGFloat scale = [UIScreen mainScreen].scale;
         STTouchInjector *ti = [STTouchInjector sharedInstance];
+        // 不要在这里读 [UIScreen mainScreen]：这个块跑在 socket 队列上，
+        // SpringBoard 刚启动时 UIKit 会抛异常，而 dispatch_once 块里的异常会直接终止进程。
+        CGSize px = [ti screenPixelSize];
+        CGFloat scale = [ti screenScale];
+        if (px.width <= 0 || px.height <= 0 || scale <= 0) {
+            return @"ERR screen metrics not ready";
+        }
         NSString *conn = ti.isUserDeviceReady ? @"connected" : @"none";
         // tap/swipe 等命令收的是像素坐标，不是 bounds 的点尺寸。
         // 以前这里只报 "390x844 @3x"，看着像要传点坐标，实际传点坐标会落到屏幕左上角。
         // 现在把两套都在同一行里写清楚，并把像素值放在显眼位置。
         return [NSString stringWithFormat:@"OK %.0fx%.0f px (%@pt @%.0fx) coord=pixel conn=%@ hook=%@",
-            size.width * scale, size.height * scale,
-            [NSString stringWithFormat:@"%.0fx%.0f", size.width, size.height],
+            px.width, px.height,
+            [NSString stringWithFormat:@"%.0fx%.0f", px.width / scale, px.height / scale],
             scale, conn, ti.bbState];
     }];
 

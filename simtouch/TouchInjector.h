@@ -5,6 +5,10 @@
 @property (nonatomic, readonly, getter=isUserDeviceReady) BOOL userDeviceReady;
 @property (nonatomic, readonly) NSString *bbState;
 + (instancetype)sharedInstance;
+// 屏幕尺寸在 Main Thread 上惰性获取；调用方不要自己去碰 [UIScreen mainScreen]。
+- (BOOL)ensureScreenMetrics;
+- (CGSize)screenPixelSize;
+- (CGFloat)screenScale;
 - (void)captureSenderIDFromEvent:(void *)event;
 - (void)tapAtX:(CGFloat)pixelX y:(CGFloat)pixelY;
 - (void)swipeFromX:(CGFloat)x1 y:(CGFloat)y1 toX:(CGFloat)x2 y:(CGFloat)y2 durationMs:(NSInteger)ms;

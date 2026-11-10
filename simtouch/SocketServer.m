@@ -102,27 +102,32 @@
     __block NSMutableData *buffer = [NSMutableData new];
 
     dispatch_source_set_event_handler(clientSource, ^{
-        char buf[MAX_LINE];
-        ssize_t n = read(fd, buf, sizeof(buf));
-        if (n <= 0) {
-            dispatch_source_cancel(clientSource);
-            return;
-        }
-        [buffer appendBytes:buf length:n];
+        // 这条队列上抛出的异常会让 dispatch 直接终止进程，兜一层，别把 SpringBoard 带走。
+        @try {
+            char buf[MAX_LINE];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n <= 0) {
+                dispatch_source_cancel(clientSource);
+                return;
+            }
+            [buffer appendBytes:buf length:n];
 
-        NSData *newline = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
-        NSRange range;
-        while ((range = [buffer rangeOfData:newline options:0 range:NSMakeRange(0, buffer.length)]).location != NSNotFound) {
-            NSData *lineData = [buffer subdataWithRange:NSMakeRange(0, range.location)];
-            [buffer replaceBytesInRange:NSMakeRange(0, range.location + 1) withBytes:NULL length:0];
+            NSData *newline = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
+            NSRange range;
+            while ((range = [buffer rangeOfData:newline options:0 range:NSMakeRange(0, buffer.length)]).location != NSNotFound) {
+                NSData *lineData = [buffer subdataWithRange:NSMakeRange(0, range.location)];
+                [buffer replaceBytesInRange:NSMakeRange(0, range.location + 1) withBytes:NULL length:0];
 
-            NSString *line = [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
-            if (!line || line.length == 0) continue;
+                NSString *line = [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
+                if (!line || line.length == 0) continue;
 
-            NSString *response = [self processCommand:line];
-            NSString *out = [response stringByAppendingString:@"\n"];
-            NSData *outData = [out dataUsingEncoding:NSUTF8StringEncoding];
-            write(fd, outData.bytes, outData.length);
+                NSString *response = [self processCommand:line];
+                NSString *out = [response stringByAppendingString:@"\n"];
+                NSData *outData = [out dataUsingEncoding:NSUTF8StringEncoding];
+                write(fd, outData.bytes, outData.length);
+            }
+        } @catch (NSException *e) {
+            LOG(@"client handler exception: %@", e.reason);
         }
     });
 

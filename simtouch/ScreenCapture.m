@@ -31,16 +31,23 @@ extern UIImage *_UICreateScreenUIImage(void) __attribute__((weak_import));
     }
 
     if (!image) {
-        UIScreen *screen = [UIScreen mainScreen];
-        UIGraphicsBeginImageContextWithOptions(screen.bounds.size, YES, screen.scale);
+        // 兜底路径要走 UIKit。这个函数在 socket 队列上被调用，SpringBoard 刚启动时
+        // UIKit 会抛异常；如果让它抛出去，dispatch 会把整个进程终止。
+        @try {
+            UIScreen *screen = [UIScreen mainScreen];
+            UIGraphicsBeginImageContextWithOptions(screen.bounds.size, YES, screen.scale);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            for (UIWindow *window in [UIApplication sharedApplication].windows) {
 #pragma clang diagnostic pop
-            [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
+                [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
+            }
+            image = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+        } @catch (NSException *e) {
+            NSLog(@"[SimTouch] screen capture fallback failed: %@", e.reason);
+            UIGraphicsEndImageContext();
         }
-        image = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
     }
 
     if (!image) return @"ERR capture failed";

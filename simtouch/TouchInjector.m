@@ -74,8 +74,46 @@ typedef struct {
 @implementation STTouchInjector {
     CGFloat _screenWPx;
     CGFloat _screenHPx;
+    CGFloat _screenScale;
     BOOL _bbReady;
     NSString *_bbState;
+}
+
+// 屏幕尺寸推迟到第一次用到时再取，而且必须在主线程取。
+// 原因：sharedInstance 是在 socket 队列上被调用的，dispatch_once 的块里抛出的
+// 任何异常都会被 _dispatch_client_callout 接住并直接 terminate —— 调用者就算
+// 包了 @try 也轮不到。SpringBoard 刚启动、界面子系统还没就绪时，
+// [UIScreen mainScreen] 会抛异常，进程当场 abort。
+- (BOOL)ensureScreenMetrics {
+    if (_screenWPx > 0 && _screenHPx > 0) return YES;
+    void (^read)(void) = ^{
+        @try {
+            UIScreen *screen = [UIScreen mainScreen];
+            CGSize pt = screen.bounds.size;
+            CGFloat scale = screen.scale;
+            if (pt.width > 0 && pt.height > 0 && scale > 0) {
+                _screenWPx = pt.width * scale;
+                _screenHPx = pt.height * scale;
+                _screenScale = scale;
+                LOG(@"screen: %.0fx%.0f px @%.0fx", _screenWPx, _screenHPx, scale);
+            }
+        } @catch (NSException *e) {
+            LOG(@"screen metrics unavailable: %@", e.reason);
+        }
+    };
+    if ([NSThread isMainThread]) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return (_screenWPx > 0 && _screenHPx > 0);
+}
+
+- (CGSize)screenPixelSize {
+    [self ensureScreenMetrics];
+    return CGSizeMake(_screenWPx, _screenHPx);
+}
+
+- (CGFloat)screenScale {
+    [self ensureScreenMetrics];
+    return _screenScale;
 }
 
 + (instancetype)sharedInstance {
@@ -118,13 +156,9 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 - (instancetype)init {
     self = [super init];
     if (self) {
-        CGSize pt = [UIScreen mainScreen].bounds.size;
-        CGFloat scale = [UIScreen mainScreen].scale;
-        _screenWPx = pt.width * scale;
-        _screenHPx = pt.height * scale;
         _bbReady = NO;
         _bbState = @"unknown";
-        LOG(@"screen: %.0fx%.0f px", _screenWPx, _screenHPx);
+        // 这里不读 UIScreen：init 跑在 dispatch_once 的块里，见 ensureScreenMetrics 的说明。
 
         CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(nc, (__bridge const void *)self,
@@ -161,6 +195,10 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 #pragma mark - Send to Backboardd
 
 - (BOOL)_sendPhase:(uint8_t)phase pixelX:(CGFloat)px pixelY:(CGFloat)py edgeMask:(uint32_t)edgeMask {
+    if (![self ensureScreenMetrics]) {
+        LOG(@"tap skipped: screen metrics not ready");
+        return NO;
+    }
     STTouchCmd cmd = {0};
     cmd.phase = phase;
     cmd.x = (float)(px / _screenWPx);
@@ -208,6 +246,7 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
         durationMs:(NSInteger)ms curveType:(uint8_t)curve
             bz_x1:(float)bx1 bz_y1:(float)by1 bz_x2:(float)bx2 bz_y2:(float)by2 {
     if (ms <= 0) ms = 300;
+    if (![self ensureScreenMetrics]) return;
     STSwipeCmd cmd = {0};
     cmd.phase = kSTPhaseSwipe;
     cmd.x1 = (float)(x1 / _screenWPx);
@@ -284,6 +323,7 @@ static void onBBDiag(CFNotificationCenterRef center, void *observer,
 
 - (void)pinchAtX:(CGFloat)pixelX y:(CGFloat)pixelY scale:(float)scale durationMs:(NSInteger)ms {
     if (ms <= 0) ms = 300;
+    if (![self ensureScreenMetrics]) return;
     STPinchCmd cmd = {0};
     cmd.phase = kSTPhasePinch;
     cmd.cx = (float)(pixelX / _screenWPx);
