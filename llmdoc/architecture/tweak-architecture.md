@@ -170,7 +170,11 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 
 原来只靠“终止 Hook 不返回”来挡，副作用是那次调用永远不返回，调用它的启动流程停在半路，后续初始化没有完成，于是界面结构在、事件链路不在。
 
-现在的做法是把 `0x3c2ac30` 的 `cbnz` 换成 `nop`，让检查结束时正常返回；终止 Hook 继续保留，用于应付其它退出路径。
+现在的做法是把 `0x3c2ac30` 的 `cbnz` 换成 `nop`，让检查结束时正常返回。
+
+**代码补丁打上之后，终止 Hook 必须撤掉**（1.2.4 起）。原来两个钩子无条件安装，挡住检测的同时也挡住了正常退出：UIKit 的 `-[UIApplication _terminateWithStatus:]` 内部调 `exit()`，钩子在主线程用 `runMode:beforeDate:[NSDate distantFuture]` 死循环跑 runloop，`exit` 永不返回，FrontBoard 等满 5 秒发 `SIGKILL`，每次关闭 App 都留一份 `0x8BADF00D` 报告，用户看到的是关 App 卡住。「能进但点不动」和这条 watchdog 是同一个死循环的两个症状。
+
+现在的判断是：补丁函数返回成功才置 `g_startupExitPatched`；置位时不装 `exit` / `_exit` 钩子，回落到原来的行为（补丁没打上、依然依赖钩子挡退出）时照旧安装。
 
 两条施工约束（踩过才知道）：
 

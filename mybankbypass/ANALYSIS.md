@@ -179,3 +179,56 @@ EXIT exit main=1 st=0 ra=Portal+0x3c2ac80
 这条兜底只保证「不乱改」，不保证新版本仍然可用。出现新版本时按上面的方法重新定位：
 在 `__text` 里扫 `bl _exit` 的调用点，往前找跳过退出块的条件分支，确认前后上下文
 与本文记录的一致，再把新偏移加进 `kStartupExitPatches`。
+
+---
+
+## 4.7.48 及以上：正常关闭 App 被 watchdog 强杀
+
+### 现象
+
+从切换器上滑关闭 App 时卡住几秒，随后进程消失。CrashReporter 里每次关闭都多一份
+Portal 报告，终止码 `0x8BADF00D`：
+
+```
+termination: namespace=FRONTBOARD code=0x8BADF00D
+  [application<com.mybank.ios.phone>:96215] failed to terminate gracefully after 5.0s
+exception: EXC_CRASH / SIGKILL
+```
+
+栈（自下而上）：
+
+```
+FBSWorkspaceScenesClient  willTerminateWithTransitionContext:
+UIApplication             workspaceShouldExit:withTransitionContext:
+_UISceneLifecycleMultiplexer  forceExit…
+UIApplication             -[UIApplication _terminateWithStatus:]
+MYBankBypass.dylib        hooked_exit
+Foundation                -[NSRunLoop runMode:beforeDate:]
+CoreFoundation            __CFRunLoopRun → mach_msg_trap
+```
+
+### 原因
+
+UIKit 的 `-[UIApplication _terminateWithStatus:]` 内部调用 `exit()`。我们的
+`hooked_exit` 在主线程上跑 `runMode:beforeDate:[NSDate distantFuture]` 的死循环，
+`distantFuture` 意味着没有超时唤醒，只要没有别的事件投递进来就一直在 `mach_msg` 上
+阻塞。`exit` 永远不返回，进程也永不结束；FrontBoard 等满 5 秒发 `SIGKILL`。
+
+这个钩子原本是为启动检查准备的。4.7.48 起退出路径已经被代码补丁改成正常返回，
+走不到 `bl _exit`，钩子只剩副作用。「能进去但点不动」和这条 watchdog，其实是同一个
+死循环造成的两个症状。
+
+### 修复
+
+1.2.4 起，只有代码补丁**没打上**时才安装 `exit` / `_exit` 钩子。判断依据是补丁函数的
+返回值：核对机器码成功、写完并通过 `mach_vm_protect` 还原权限，才把
+`g_startupExitPatched` 置 1。
+
+补丁打上时两个钩子都不装，`_terminateWithStatus:` 调 `exit` 直接走 libc，进程按时退出。
+补丁没打上时（版本过老，或机器码与预期不符）仍然安装，保持原来的行为。
+
+### 验证
+
+4.7.48 上：冷启动正常，首页「网商贷」图标进入对应页面，底部 tab 切换正常；
+从切换器上滑关闭后进程立即消失，CrashReporter 里没有新增报告；再次冷启动正常。
+`mybankbypass.log` 全程不存在，说明补丁每次都打上了。

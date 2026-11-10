@@ -987,6 +987,9 @@ static uint64_t patchMainExec(uint64_t offset, uint32_t expected, uint32_t repla
     return 0;
 }
 
+// 启动退出补丁是否真的打上了。只有打上了，exit 钩子才可以不装。
+static int g_startupExitPatched = 0;
+
 static int applyStartupExitPatch(void) {
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
     if (!ver) return -1;
@@ -1005,6 +1008,8 @@ static int applyStartupExitPatch(void) {
             const struct mach_header_64 *mh = findMainExec();
             uint32_t got = mh ? *(volatile uint32_t *)((uintptr_t)mh + kStartupExitPatches[i].offset) : 0;
             notePatchFailure(v, rc, got);
+        } else {
+            g_startupExitPatched = 1;
         }
         return rc;
     }
@@ -1020,8 +1025,15 @@ static int applyStartupExitPatch(void) {
         applyStartupExitPatch();
 
         // Block all exit mechanisms FIRST
-        MSHookFunction((void *)exit, (void *)hooked_exit, (void **)&orig_exit);
-        MSHookFunction((void *)_exit, (void *)hooked__exit, (void **)&orig__exit);
+        // 4.7.48 起，启动检查的退出路径已经用代码补丁改成正常返回，走不到 exit/_exit。
+        // 这时如果还装着吞掉的钩子，正常关闭 App 会被 watchdog 强杀：UIKit 的
+        // _terminateWithStatus: 内部调 exit()，钩子进 runloop 死循环不返回，
+        // FrontBoard 等满 5 秒后发 SIGKILL，留下一份 0x8BADF00D。
+        // 所以只在代码补丁没打上（老版本，或者指令与预期不符）时才装这两个。
+        if (!g_startupExitPatched) {
+            MSHookFunction((void *)exit, (void *)hooked_exit, (void **)&orig_exit);
+            MSHookFunction((void *)_exit, (void *)hooked__exit, (void **)&orig__exit);
+        }
         MSHookFunction((void *)abort, (void *)hooked_abort, (void **)&orig_abort);
         MSHookFunction((void *)kill, (void *)hooked_kill, (void **)&orig_kill);
         MSHookFunction((void *)raise, (void *)hooked_raise, (void **)&orig_raise);
