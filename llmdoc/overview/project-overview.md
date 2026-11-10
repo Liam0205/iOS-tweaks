@@ -25,7 +25,7 @@ mybankbypass / bankcommbypass 从旧名 `com.liam.*` 迁移而来，通过 `Conf
 | 包名 | 类型 | 用途 |
 |------|------|------|
 | `page.0x01.sshtunnel` | Theos Application | SSH 反向隧道管理器（v1.3.2），自愈隧道：进程存活健康检查 + 指数退避自动重连 + 开机持久化 |
-| `page.0x01.simtouch` | Theos Tweak + CLI Tool + PreferenceBundle | 远程触摸模拟与截图捕获，已发布 0.1.0（触摸注入/录制回放功能进展见 `llmdoc/architecture/simtouch-architecture.md`） |
+| `page.0x01.simtouch` | Theos Tweak + CLI Tool + PreferenceBundle | 远程触摸模拟与截图捕获，已发布 0.1.2（触摸注入/录制回放功能进展见 `llmdoc/architecture/simtouch-architecture.md`） |
 
 sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安装到 `/Applications`）。v1.3.2 核心能力：(1) autossh 持久隧道（PID 文件状态管理），设备未安装 autossh 时降级为 ssh；(2) 进程存活健康检查（依赖 SSH ServerAliveInterval 检测死连接）；(3) 指数退避自动重连（3-60s）；(4) LaunchDaemon 开机持久化（PathState 激活）。依赖：`openssh-client`、`sshpass`；推荐：`autossh`。使用场景：手机在内网、Linux 构建服务器在公网时，通过反向隧道让服务器 SSH 回手机，实现远程安装和调试。
 
@@ -42,7 +42,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - bankcommbypass 当前版本：`0.2.0`，可绕过交通银行 10.3.0 的越狱检测弹窗（存在已知卡顿，进入主页后约 2 秒闪退，待优化）
 - icbcbypass 当前版本：`1.1.0`，已完全绕过工商银行 3.0.80 ~ 3.0.90 的越狱检测+主线程冻结+退出弹窗三层防御，登录和使用均正常（v1.1.0 修复了 3.0.90 的 CALayer 动画累积性能问题）
 - abcbypass 当前版本：开发中 `v0.1.0-95`，已绕过文件检测层（无越狱 alert），但第二检测路径（hook 完整性检查）仍触发 exit()，UI 无法恢复；v96（MSHookFunction 替代 fishhook 消除 GOT 指纹）待测试
-- simtouch 当前版本：`0.1.0`，已发布到 Sileo 源；backboardd hook 触摸注入已验证（tap/swipe/longpress），事件录制已完成，回放待调试；截图 MVP 正常（功能进展详见 `llmdoc/architecture/simtouch-architecture.md`）
+- simtouch 当前版本：`0.1.2`，已发布到 Sileo 源；backboardd hook 触摸注入已验证（tap/swipe/longpress），事件录制已完成，回放待调试；截图正常；屏幕尺寸改为惰性获取，修复了 SpringBoard 启动早期被 socket 命令打崩的问题（功能进展详见 `llmdoc/architecture/simtouch-architecture.md`，崩溃根因见 `llmdoc/reference/simtouch-technical-decisions.md` 第 19 节）
 - aiabypass 当前版本：`1.0.0`，友邦友享 6.9.33 不再一打开就闪退，首页加载、5 个 tab 切换、滚动、前后台往返正常，连续三次冷启动验证通过。**但这是全仓唯一一个判定没绕过的 tweak**：JM（JMCodeProtectKit）的判定发生在它自己初始化阶段，早于任何 tweak 代码，启动期仍有 2 次处决由 Mach 异常端口接住。手段与边界详见 `llmdoc/architecture/aiabypass-architecture.md`
 - whbypass 当前版本：`1.0.0`，国家网络身份认证 1.2.38 打开即闪退的问题已根治。检测引擎是梆梆安全 Everisk；闪退根因是主程序里 6 个"炸弹函数"把 `sp`/`lr` 改成上下文值后 `br` 到 `0xb5a0X000`（`__PAGEZERO` 里无法映射的地址），这些函数只通过 block 的 `invoke` 字段被调用。把这些入口改成 `ret` 之后启动期异常归零，因此不再需要接管 Mach 异常端口、关 KSCrash 或拦 `thread_suspend`。日志由 `DEBUG` 宏自动开关：`make package` 带日志，`make package FINALPACKAGE=1` 不带。三次冷启动各 40 秒、再持续 3 分钟以上稳定，首页到申领流程全程可交互。详见 `llmdoc/architecture/whbypass-architecture.md`
 - lianjiabypass 当前版本：`0.1.0`，已发布，完全绕过链家（`com.exmart.HomeLink`）与贝壳找房（`com.lianjia.beike`）共用检测栈的四层越狱检测（文件检测 + dyld 镜像枚举 + 主线程注入检测 + JGBSDK 内联 svc exit），两个 App 主界面均验证完整加载
