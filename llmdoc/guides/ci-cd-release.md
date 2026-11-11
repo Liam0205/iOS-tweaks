@@ -27,6 +27,10 @@ Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号
 
 多个 tag 同时推送时，`concurrency: release-deploy` 保证串行执行。
 
+**版本号必须以数字开头，不要写成 `<tweak>_v1.0.0`**。Release notes 的上一个版本是靠 `git tag --sort=-version:refname` 挑的，这个排序把 `icbcbypass_v1.0.0` 排在 `icbcbypass_1.1.1` 前面（字母 v 的排序位置低于数字），于是区间退回到很久以前的提交，新版本的正文里会混进大量与本次无关的历史提交。workflow 里已经加了 `grep -E "^${TWEAK}_[0-9]"` 过滤掉这类 tag 兜底，但正确做法是一开始就按 `<tweak>_<x.y.z>` 命名。2026-11-11 清理了仓库里遗留的 `icbcbypass_v1.0.0` 和孤立 tag `v1.1.0`，现在 14 个模块的 39 个 tag 全部是 `<tweak>_<x.y.z>` 形式。
+
+改动 tag 命名规则后要复核各模块解析出的上一个版本：对每个模块取当前最新 tag，确认 workflow 挑到的 PREV 就是它本身，否则说明还有 tag 排在了错误的位置。
+
 ## CI/CD 架构要点
 
 - Pages 内容在 `gh-pages` 孤儿分支，master 不含 `repo/` 目录
@@ -97,7 +101,7 @@ NSMutableDictionary *env = [orig mutableCopy];
 2. tweak 目录下存在 `CHANGELOG.md`（否则 depiction 使用 fallback 文本）
 3. `release.yml` 第 93 行的 gh-pages 清理列表包含该 tweak 目录名
 4. `build.yml` 的 `paths-ignore` 列表中不要意外排除新 tweak 的文件
-5. Release notes 范围为 `PREV_TAG..TAG`（不是 HEAD），确认 workflow 逻辑正确
+5. Release notes 范围为 `PREV_TAG..TAG`（不是 HEAD），确认 workflow 逻辑正确；PREV_TAG 只认 `<tweak>_<数字>` 形式的 tag
 6. 对应的 `llmdoc/architecture/` 文档已同步更新（版本号、行为变更）
 7. 若新 tweak/App 引用私有 framework（如继承 `PSListController`），确认 CI 的 `SYSROOT` 环境变量已锁定到带 stub 的 SDK 版本，不要依赖 theos `latest` 自动解析
 8. 确认 `build.yml` 矩阵仍设置 `strategy.fail-fast: false`，避免单个 tweak 失败掩盖其余任务结果

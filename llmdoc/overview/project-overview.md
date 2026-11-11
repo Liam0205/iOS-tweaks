@@ -55,7 +55,7 @@ sshtunnel 不是 tweak，而是独立的 iOS 应用（`APPLICATION_NAME`，安�
 - Pages 内容托管在 `gh-pages` 孤儿分支（master 不含 repo 目录）
 - Release workflow（tag 触发）自编译、更新 Packages/Release/depictions/index.html、force push 到 gh-pages
 - Build workflow（push/PR 触发）做 matrix 验证构建
-- 发版 tag 格式：`<tweak目录名>_<版本号>`（如 `bankcommbypass_0.2.0`）
+- 发版 tag 格式：`<tweak目录名>_<版本号>`（如 `bankcommbypass_0.2.0`）。版本号必须以数字开头，`_v1.0.0` 这类写法会让 CI 选错上一个版本，见 `llmdoc/guides/ci-cd-release.md`
 
 ## 项目边界
 
