@@ -1071,7 +1071,7 @@ fprintf(f, "[INIT] ICBCBypass v1.0.0 / ICBC %s ctor started\n", appVer.UTF8Strin
 
 ### 遗留
 
-- 用户主观感受还需要本人用手指确认；本次测量用的是注入触摸。
+- 上表是用注入触摸测的。用户随后用手指在实际使用中确认「很丝滑」，主观手感和测量结论一致。
 - `+[UIView setAnimationsEnabled:NO]` 的拦截也抓了调用栈，调用方同样全是 UIKitCore
   与 `UIApplicationMain` 路径。它不直接导致点击丢失，但拦掉 UIKit 自己的调用仍可能让
   动画状态与预期不一致，后续可以按同样的思路收窄。
