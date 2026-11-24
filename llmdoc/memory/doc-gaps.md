@@ -196,6 +196,18 @@
 
 ---
 
+## 支付宝：刷脸 `DEVICE_NOT_SUPPORT` 的服务端依据未定位
+
+**现象**：支付宝 12.12.56 进入北京实名的刷脸核身入口后，`POST custweb.alipay.com/certify/open/module/query` 成功（返回 `OPEN_CERTIFY_NEED_AUTHORIZE`，允许的因子是 `FA_PHOTO`/`FA`），用户同意后再 `POST …/module/auth`，服务端返回 `{"success":false,"errorCode":"DEVICE_NOT_SUPPORT"}`，页面展示「因兼容性问题，当前手机暂不能使用刷脸功能」。
+
+**现状**：请求体和请求头已经完整抓到（`alipaydiag` 0.0.3 起），可以逐字段枚举：`clientInfo` 里只有 `clientAppName`、`clientAppVersion`、`noBioAuth`、`isiOS`、`bioInfo`（`zimVer`、`appVersion`、`bioMetaInfo`、`appName`、`deviceType`、`osVersion`、`apdidToken`、`deviceModel`）、`umidToken`（为空）、`deviceType`，另有 Nebula 的 UA。**没有明文的越狱/root 标记**；本地几个越狱判定入口（`TeclaDeviceInfoAbilityImpl isJailbroken`、`SSAuthServiceImpl isJailbroken`、`RVPBridgeExtension4Jailbroken isJailbroken`、`DTCTUInfo setJailbreaked:`、SecurityGuard RootDetect/SimulatorDetect）在这条链路上零调用，ZOLOZ 从未启动。空 `umidToken` 已排除：`AccountAuthFrameworkServiceImp getUmidToken` 返回了正常 token，是 `ZimJSApiHandler getMetaInfo` 本身不返回该字段。
+
+**可能的补法（未实施）**：唯一具备设备唯一性的是 `apdidToken`（40 字节，前 32 字节像摘要），服务端可以拿它查自己的设备画像，而那份画像是否含越狱结论，客户端看不到。要区分「设备画像判定」与「能力矩阵判定」，需要对照实验：同一账号在未越狱设备上走同一入口，或换一个商户的 `FA` 订单再试。`bioMetaInfo` 第二个字段 `32774` 的含义也未查明，若它是能力位掩码，同样可能直接参与判定。抓 mtop 侧的设备信息上报（通常加密/压缩）是另一条路，本轮没做。
+
+**详见**：`alipaydiag/analysis.md`、`llmdoc/reference/alipaydiag-detection-vectors.md`。
+
+---
+
 ## 已解决，不要按旧记录重开
 
 下面这些在旧文档里仍留着「仍未知」「未解决」的字样，但后续轮次已经解决了。读到时按这里理解：

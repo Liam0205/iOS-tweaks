@@ -163,3 +163,7 @@ ssh -p <port> mobile@localhost "cat /var/mobile/Containers/Data/Application/<UUI
 注意：新装的 dylib 需要 Choicy 的按 App 允许列表放行才能注入（本项目设备上
 支付宝的允许列表在 bootstrap 侧
 `/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist`）。
+
+静态分析用到的两个脚本在 `tools/`：`findstr.py` 按 Mach-O section 定位 UTF-8 /
+UTF-16LE 字符串，`parse_objc.py` 解析 `__objc_classlist` → `class_ro_t` → 相对方法表，
+输出「类名 + 方法名」清单。
