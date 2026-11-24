@@ -6,6 +6,7 @@
 #import <unistd.h>
 #import <time.h>
 #import <string.h>
+#import <zlib.h>
 
 // 只读诊断：不改任何返回值，只把关键安全组件的行为写进 App 容器的
 // Documents/alipaydiag.log。
@@ -121,17 +122,57 @@ static NSString *jdump(id obj) {
 
 #pragma mark - 刷脸链路上报的请求体
 
+static NSString *safeURLString(NSURL *url) {
+    if (!url) {
+        return @"(nil)";
+    }
+    NSMutableString *s = [NSMutableString string];
+    if (url.scheme.length) {
+        [s appendFormat:@"%@://", url.scheme];
+    }
+    if (url.host.length) {
+        [s appendString:url.host];
+    }
+    if (url.path.length) {
+        [s appendString:url.path];
+    }
+    if (url.query.length) {
+        [s appendString:@"?<redacted>"];
+    }
+    return s;
+}
+
+static NSString *safeHeaders(NSDictionary *h) {
+    if (!h) {
+        return @"(nil)";
+    }
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *k in h) {
+        NSString *lk = k.lowercaseString;
+        if ([lk isEqualToString:@"cookie"] || [lk containsString:@"token"] ||
+            [lk containsString:@"session"] || [lk containsString:@"sign"] ||
+            [lk containsString:@"auth"]) {
+            out[k] = @"<redacted>";
+            continue;
+        }
+        NSString *v = [h[k] description];
+        out[k] = v.length > 200 ? [[v substringToIndex:200] stringByAppendingString:@"..."] : v;
+    }
+    return jdump(out);
+}
+
 static void logWebReq(NSURLRequest *req) {
     if (!req) {
         return;
     }
-    NSString *u = req.URL.absoluteString;
-    if (!u.length) {
+    NSString *u = safeURLString(req.URL);
+    if (!req.URL) {
         return;
     }
     BOOL hit = NO;
+    NSString *raw = req.URL.absoluteString ?: @"";
     for (NSString *k in @[@"custweb", @"certify", @"module/auth", @"module/query"]) {
-        if ([u rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        if ([raw rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
             hit = YES;
             break;
         }
@@ -149,7 +190,88 @@ static void logWebReq(NSURLRequest *req) {
             bs = [[bs substringToIndex:4000] stringByAppendingString:@"...[truncated]"];
         }
     }
-    dlog(@"REQ %@ %@\n  hdr=%@\n  body=%@", req.HTTPMethod, u, jdump(req.allHTTPHeaderFields), bs);
+    dlog(@"REQ %@ %@\n  hdr=%@\n  body=%@", req.HTTPMethod, u, safeHeaders(req.allHTTPHeaderFields), bs);
+}
+
+static NSData *gunzipData(NSData *in) {
+    if (in.length < 4) {
+        return nil;
+    }
+    const uint8_t *b = in.bytes;
+    if (!(b[0] == 0x1f && b[1] == 0x8b)) {
+        return in;   // 不是 gzip，原样返回
+    }
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, 15 + 16) != Z_OK) {
+        return nil;
+    }
+    NSUInteger cap = 1 << 20;
+    NSMutableData *out = [NSMutableData dataWithLength:cap];
+    zs.next_in = (Bytef *)b;
+    zs.avail_in = (uInt)in.length;
+    zs.next_out = (Bytef *)out.mutableBytes;
+    zs.avail_out = (uInt)cap;
+    int ret = inflate(&zs, Z_FINISH);
+    NSUInteger produced = cap - zs.avail_out;
+    inflateEnd(&zs);
+    if (ret != Z_STREAM_END) {
+        return nil;
+    }
+    [out setLength:produced];
+    return out;
+}
+
+// 只记摘要：命中哪些字段名、isPrisonBreak 的值；不记 body 原文、query、token
+static void mtopSummary(NSURLRequest *req) {
+    static int count = 0;
+    if (count > 80 || !req.URL) {
+        return;
+    }
+    NSString *host = req.URL.host.lowercaseString;
+    if (!host.length) {
+        return;
+    }
+    BOOL hit = [host containsString:@"mobilegw"] || [host containsString:@"mgw"] ||
+               [host containsString:@"openapi"] || [host containsString:@"mdap"] ||
+               [host containsString:@"anx"];
+    if (!hit) {
+        return;
+    }
+    NSData *body = req.HTTPBody;
+    if (!body.length) {
+        return;
+    }
+    NSData *plain = gunzipData(body);
+    NSString *s = plain ? [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding] : nil;
+    if (!s.length) {
+        count++;
+        dlog(@"MTOP %@ %@ bin len=%lu", req.HTTPMethod, safeURLString(req.URL), (unsigned long)body.length);
+        return;
+    }
+    if (s.length > 200000) {
+        s = [s substringToIndex:200000];
+    }
+    NSString *low = s.lowercaseString;
+    NSMutableArray *keys = [NSMutableArray array];
+    for (NSString *k in @[@"isprisonbreak", @"prisonbreak", @"istrojan", @"apdid",
+                          @"utdid", @"umidtoken", @"devicemodel", @"osversion", @"systemversion"]) {
+        if ([low containsString:k]) {
+            [keys addObject:k];
+        }
+    }
+    NSString *val = @"-";
+    NSRange r = [low rangeOfString:@"isprisonbreak"];
+    if (r.location != NSNotFound) {
+        NSUInteger start = NSMaxRange(r);
+        NSUInteger len = MIN((NSUInteger)40, s.length - start);
+        val = [s substringWithRange:NSMakeRange(start, len)];
+        val = [val stringByReplacingOccurrencesOfString:@"\"" withString:@"'"];
+        val = [val stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    }
+    count++;
+    dlog(@"MTOP %@ %@ keys=[%@] isPrisonBreak=%@", req.HTTPMethod,
+         safeURLString(req.URL), [keys componentsJoinedByString:@","], val);
 }
 
 static void scanJailbreak(NSData *body, NSString *where) {
@@ -164,8 +286,8 @@ static void scanJailbreak(NSData *body, NSString *where) {
     for (NSString *k in @[@"jailbreak", @"jailbroken", @"isroot", @"jail_break"]) {
         NSRange r = [low rangeOfString:k];
         if (r.location != NSNotFound) {
-            NSUInteger start = r.location > 150 ? r.location - 150 : 0;
-            NSRange ctx = NSMakeRange(start, MIN((NSUInteger)500, s.length - start));
+            NSUInteger start = r.location;
+            NSRange ctx = NSMakeRange(start, MIN((NSUInteger)60, s.length - start));
             dlog(@"JBHIT %@ %@\n  %@", where, k, [s substringWithRange:ctx]);
             return;
         }
@@ -175,17 +297,20 @@ static void scanJailbreak(NSData *body, NSString *where) {
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     logWebReq(request);
-    scanJailbreak(request.HTTPBody, request.URL.absoluteString);
+    scanJailbreak(request.HTTPBody, safeURLString(request.URL));
+    mtopSummary(request);
     return %orig;
 }
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)handler {
     logWebReq(request);
-    scanJailbreak(request.HTTPBody, request.URL.absoluteString);
+    scanJailbreak(request.HTTPBody, safeURLString(request.URL));
+    mtopSummary(request);
     return %orig;
 }
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)data {
     logWebReq(request);
-    scanJailbreak(data, request.URL.absoluteString);
+    scanJailbreak(data, safeURLString(request.URL));
+    mtopSummary(request);
     return %orig;
 }
 %end

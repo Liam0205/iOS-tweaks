@@ -60,6 +60,27 @@
   `SSAuthServiceImpl isJailbroken`、`RVPBridgeExtension4Jailbroken isJailbroken`。
 - ZOLOZ / Toyger 从未启动（`ZolozIdentityManager`、`ZolozBiometricCPServiceImpl`、
   `BioAuthFacade`、`APBToygerFacade` 全部零调用），所以改任何本地刷脸布尔值都影响不到这一步。
+- 核身的四条请求（dispatch / entrance / query / auth）都没有 Cookie 头。
+- `module/query` 与 `module/auth` 的 `clientInfo` 逐字段相同，前者被正常处理
+  （业务错误 `OPEN_CERTIFY_NEED_AUTHORIZE`），后者被拒绝。判定不是这几个字段的纯函数。
+
+## 客户端确实有越狱标记通道，但本次会话没有走
+
+方法表里存在一整族 `isPrisonBreak` / `prisonBreak`：
+
+| 类 | 类型 | 备注 |
+|---|---|---|
+| `aluDeviceInfoManager` | BOOL | 同时提供 `apdidToken`、`apdidTokenByMode:`、`setApdidTokenCookie:`、`umid`、`utdid`、`tid` |
+| `MOBILEAPPGwCommonReq`（MTOP 网关公共请求） | NSNumber | 同族还有 `apdId`、`utdid`、`tid`、`ttid`、`umidToken`、`IMEI`/`IMSI`、`userAgent`、`mobileBrand`/`mobileModel` |
+| `ANXRuntimeConfig` | NSNumber | 另有 `isTrojan` |
+| `aluSDK`、`AUGUnifyLoginReq`、`ANXBusVerifyServiceModel`、`AntUserDefaultDelegate`、`MOBILEAPPCOMMONClientUpgradeReq`、`UnifyRegisterAllReqPb` | 混合 | 登录/风控/升级通道 |
+
+`isPrisonBreak` / `prisonBreak` 也作为字符串存在于主二进制，说明是会被序列化的字段名。
+但在「已登录、直接走核身」的会话里，上述 getter/setter 全部零调用；`NSURLSession` 可见的
+出站流量里只有一条 `mobilegw.alipay.com/mgw.htm`，body 中没有任何设备字段标记。
+`setApdidTokenCookie:` 被调 7 次（同一个 APDID token），但那四条核身请求上没有 Cookie。
+
+覆盖面限制：支付宝原生 RPC 大部分不经过 `NSURLSession`，对原生传输层的结论仍然开口。
 
 ## 唯一具备设备唯一性的字段是 apdidToken
 

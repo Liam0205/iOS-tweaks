@@ -131,7 +131,7 @@ function R() {                       // ClientInfo
   但 `getMetaInfo` 的返回里根本没有 `umidToken` 键，页面按 `e.umidToken || ""` 补空。
 - **推论**：空 UMID 是这个接口的固定构造，不是环境异常。假设排除。
 
-## 7. 0.0.6：越狱标记的取值与上传（进行中）
+## 7. 0.0.6 / 0.0.7：越狱标记的取值与落点
 
 第 6 节的结论被推翻了一半：certify 的 POST 确实不带越狱标记，但**客户端另有通道**。
 静态方法表里可以看到：
@@ -147,9 +147,8 @@ function R() {                       // ClientInfo
 不是纯内部状态。也就是说：设备是否越狱，客户端会算，并且会随 MTOP 网关请求上传；
 certify 的 POST 只是没带它，服务端仍然可以在同一账号、同一 UDID/APDID 的画像里读到。
 
-另外，`setApdidTokenCookie:` 说明 APDID 也走 Cookie。`fetch(..., credentials:"include")`
-会带上 Cookie，而我们的抓包读的是 `NSURLRequest.allHTTPHeaderFields`，Cookie 通常是
-CFNetwork 在发送前才补的，所以第 4 节的头里看不到它。
+另外，`setApdidTokenCookie:` 说明 APDID 也会以 Cookie 形式写入 cookie 存储。0.0.6 时的
+猜测是它会随着 `fetch(credentials:"include")` 一起发出；0.0.8 实测否定了这条：见第 8 节。
 
 - **假设**：`aluDeviceInfoManager isPrisonBreak` 在本机返回 YES，并经
   `MOBILEAPPGwCommonReq setIsPrisonBreak:` 进入发往服务端的请求；certify 那一步只是
@@ -181,6 +180,26 @@ CFNetwork 在发送前才补的，所以第 4 节的头里看不到它。
   `OPEN_CERTIFY_NEED_AUTHORIZE`），auth 才返回 `DEVICE_NOT_SUPPORT`。所以这个判定不是
   这几个客户端字段的纯函数，order 状态或账号/设备的历史状态参与了判断。
 
+## 8. 0.0.8：出站摘要（mtop / cookie）
+
+- **假设**：本次会话里，客户端会从 MTOP/openapi 等通道把设备字段（含 `isPrisonBreak`）
+  发给服务端；certify 请求也可能带 APDID Cookie。
+- **验证**：在 `NSURLSession` 入口记录发往 `mobilegw`/`mgw`/`openapi`/`mdap`/`anx` 的
+  请求摘要（命中哪些字段名、`isPrisonBreak` 后面的值），以及 `custweb`/`certify` 请求的
+  头和体。摘要模式下：query 一律 redacted；头里的 `Cookie`、含 `token`/`session`/`sign`/
+  `auth` 的键一律 redacted；不记 body 原文之外的任何内容；每个进程最多 80 条。
+- **观察**：
+  - 整个会话经 `NSURLSession` 的 MTOP 请求只有一条：`POST https://mobilegw.alipay.com/mgw.htm`，
+    body 里没有任何设备字段标记（`keys=[]`）。
+  - 四条 `custweb` 请求（dispatch / entrance / query / auth）**都没有 Cookie 头**。
+    `setApdidTokenCookie:` 被调 7 次（同一个 token），但没有出现在这几条请求上。
+  - `module/query` 与 `module/auth` 的 `clientInfo` 仍然逐字段相同。
+- **推论**：至少对 `NSURLSession` 可见的流量，这次会话里客户端没有发送明文越狱标记，
+  也没有把 APDID 放进核身请求的 Cookie。覆盖面限制：支付宝原生 RPC 大部分不走
+  `NSURLSession`，这条结论对原生传输层仍然开口。
+- **下一步**：换一个刷脸入口做对照——若别处原生刷脸能用，说明设备的刷脸能力没问题，
+  失败是 open-certify 这条服务端策略；若同样报不支持，才指向设备/账号级。
+
 ## 结论与仍未解决的问题
 
 已确认：
@@ -188,19 +207,22 @@ CFNetwork 在发送前才补的，所以第 4 节的头里看不到它。
 1. 刷脸失败发生在 `POST /certify/open/module/auth` 这一步，服务端返回 `DEVICE_NOT_SUPPORT`；
    `module/query` 是成功的，订单和商户信息都正常。
 2. 客户端在 `module/auth` 这一条请求里交给服务端的设备信息是完整可枚举的（见第 4 节），
-   其中没有任何越狱标记；但客户端另有通道（MTOP 网关公共请求）携带 `isPrisonBreak`，
-   见第 7 节。
+   其中没有任何越狱标记。客户端确实存在 `isPrisonBreak` 这类字段（见第 7 节），但本次会话
+   里既没有赋值也没有读取；`NSURLSession` 可见的出站流量里也没有出现（见第 8 节）。
 3. 这条链路上，本地 SecurityGuard / DTCTUInfo / ZOLOZ / Toyger / Tecla 越狱判定入口
    都没有被调用；ZOLOZ 从未启动。
+4. `module/query` 与 `module/auth` 携带的 `clientInfo` 逐字段相同，前者被正常处理、
+   后者被拒绝，说明 auth 的判定不是这几个客户端字段的纯函数。
 
 未知：
 
 - 服务端依据哪一项判定「设备不支持」。唯一具备设备唯一性的是 `apdidToken`；
-  服务端可以拿它查自己的设备画像（该画像是否含越狱/环境结论，客户端看不到）。
-  其余字段（机型、系统版本、App 版本、`bioMetaInfo`）更像能力矩阵的输入。
+  服务端可以拿它查自己的设备画像，画像内容客户端看不到。其余字段（机型、系统版本、
+  App 版本、`bioMetaInfo`）更像能力矩阵的输入。
 - `bioMetaInfo` 的第二个字段 `32774` 含义未知。若是能力位掩码，也可能直接参与判定。
-- 尚未对照的实验：同一账号在未越狱设备上走同一入口；或抓 mtop 侧设备信息上报
-  （请求体通常加密/压缩，本轮没做）。
+- 服务端画像里的越狱结论（如果有）是什么时候、由哪条通道上传的。携带 `isPrisonBreak`
+  的类集中在登录/风控通道，本次没有走；原生 RPC 传输层也还没有覆盖。
+- 待做的对照：换一个刷脸入口（设备级 vs 订单级）；同一账号在未越狱设备上走同一入口。
 
 ## 复现方式
 

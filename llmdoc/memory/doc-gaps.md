@@ -202,7 +202,9 @@
 
 **现状**：请求体和请求头已经完整抓到（`alipaydiag` 0.0.3 起），可以逐字段枚举：`clientInfo` 里只有 `clientAppName`、`clientAppVersion`、`noBioAuth`、`isiOS`、`bioInfo`（`zimVer`、`appVersion`、`bioMetaInfo`、`appName`、`deviceType`、`osVersion`、`apdidToken`、`deviceModel`）、`umidToken`（为空）、`deviceType`，另有 Nebula 的 UA。**没有明文的越狱/root 标记**；本地几个越狱判定入口（`TeclaDeviceInfoAbilityImpl isJailbroken`、`SSAuthServiceImpl isJailbroken`、`RVPBridgeExtension4Jailbroken isJailbroken`、`DTCTUInfo setJailbreaked:`、SecurityGuard RootDetect/SimulatorDetect）在这条链路上零调用，ZOLOZ 从未启动。空 `umidToken` 已排除：`AccountAuthFrameworkServiceImp getUmidToken` 返回了正常 token，是 `ZimJSApiHandler getMetaInfo` 本身不返回该字段。
 
-**可能的补法（未实施）**：唯一具备设备唯一性的是 `apdidToken`（40 字节，前 32 字节像摘要），服务端可以拿它查自己的设备画像，而那份画像是否含越狱结论，客户端看不到。要区分「设备画像判定」与「能力矩阵判定」，需要对照实验：同一账号在未越狱设备上走同一入口，或换一个商户的 `FA` 订单再试。`bioMetaInfo` 第二个字段 `32774` 的含义也未查明，若它是能力位掩码，同样可能直接参与判定。抓 mtop 侧的设备信息上报（通常加密/压缩）是另一条路，本轮没做。
+客户端确实有越狱标记通道：`aluDeviceInfoManager.isPrisonBreak`（BOOL）、`MOBILEAPPGwCommonReq.isPrisonBreak`（NSNumber）、`ANXRuntimeConfig` 的 `isPrisonBreak`/`isTrojan`，以及 `aluSDK`、`AUGUnifyLoginReq`、`ANXBusVerifyServiceModel`、`AntUserDefaultDelegate`、`MOBILEAPPCOMMONClientUpgradeReq`、`UnifyRegisterAllReqPb`。但 0.0.7 实测这些读写本次会话**全部零调用**；0.0.8 的 `NSURLSession` 出站摘要里只有一条 `mobilegw.alipay.com/mgw.htm`，不含设备字段，四条核身请求也没有 Cookie（`setApdidTokenCookie:` 被调 7 次但没上到这些请求）。`module/query` 与 `module/auth` 的 `clientInfo` 逐字段相同，前者被正常处理、后者被拒绝，说明判定不是这几个字段的纯函数。
+
+**可能的补法（未实施）**：先做「换一个刷脸入口」的对照，区分设备级与订单级；再由 `bioMetaInfo` 第二个字段 `32774` 的生成处入手，确认它是不是能力位掩码。若要覆盖原生 RPC 传输层，得挂支付宝自己的 HTTP 客户端，而不是 `NSURLSession`。同一账号在未越狱设备上走同一入口仍是最终对照，但需要第二台设备。
 
 **详见**：`alipaydiag/analysis.md`、`llmdoc/reference/alipaydiag-detection-vectors.md`。
 

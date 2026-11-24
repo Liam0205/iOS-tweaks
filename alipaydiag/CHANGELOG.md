@@ -2,6 +2,24 @@
 
 只读诊断插件，不改任何返回值。每个版本对应 `analysis.md` 里的一轮实验。
 
+## 0.0.8
+
+- 新增 MTOP/openapi/mdap/anx 出站摘要：只记命中的字段名与 `isPrisonBreak` 的值，
+  query 与 cookie/token/session/sign 一律 redacted，不记 body 原文。
+- 结论：本次会话只有一条 mtop 走 `NSURLSession`，无设备字段；核身四条请求都没有 Cookie。
+
+## 0.0.7
+
+- 改用 `method_copyReturnType` / `method_copyArgumentType` 判断签名，`B` 与 `@` 两种形态都挂。
+- 结论：`isPrisonBreak` 一系列入口本次会话零调用；APDID cookie 被设置 7 次。
+
+## 0.0.6
+
+- 新增 `aluDeviceInfoManager`、`MOBILEAPPGwCommonReq`、`ANXRuntimeConfig`、
+  `ANXBusVerifyServiceModel`、`aluSDK`、`AUGUnifyLoginReq`、`AntUserDefaultDelegate` 的
+  `isPrisonBreak` 类型编码打印。
+- 类型编码判断写成了字面量，未挂上钩子；只拿到编码。
+
 ## 0.0.5
 
 - 新增 `AccountAuthFrameworkServiceImp getUmidToken` / `getApdidToken`、

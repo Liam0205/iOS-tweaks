@@ -9,6 +9,7 @@ TWEAK_NAME = AlipayDiag
 AlipayDiag_FILES = Tweak.x
 AlipayDiag_CFLAGS = -fobjc-arc
 AlipayDiag_FRAMEWORKS = Foundation UIKit
+AlipayDiag_LIBRARIES = z
 ifeq ($(shell uname),Linux)
 AlipayDiag_LDFLAGS = -B$(THEOS)/toolchain/linux/iphone/bin -fuse-ld=$(THEOS)/toolchain/linux/iphone/bin/ld
 endif
