@@ -246,3 +246,9 @@ ssh -p <port> mobile@localhost "cat /var/mobile/Containers/Data/Application/<UUI
 静态分析用到的两个脚本在 `tools/`：`findstr.py` 按 Mach-O section 定位 UTF-8 /
 UTF-16LE 字符串，`parse_objc.py` 解析 `__objc_classlist` → `class_ro_t` → 相对方法表，
 输出「类名 + 方法名」清单。
+
+## 收尾
+
+2026-11-24：插件已从设备卸载（`dpkg -r page.0x01.alipaydiag`），`/var/jb/tmp` 下的安装包
+和 App 容器里的 `alipaydiag.log` 都已删除。已卸载的 dylib 在下一次启动支付宝时不再注入。
+插件保留在仓库里作为可复用的只读诊断工具，版本停在 0.0.8。
