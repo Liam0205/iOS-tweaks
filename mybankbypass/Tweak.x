@@ -8,6 +8,7 @@
 #import <signal.h>
 #import <dirent.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <string.h>
@@ -921,15 +922,18 @@ static int hooked_raise(int sig) {
 //   0x3c2ac7c  bl   _exit
 // 把 0x3c2ac30 换成 nop，失败时也走正常返回，启动流程照常走完。
 //
-// 这是按版本写死的偏移。其它版本必须先用同样的方法重新定位，不能直接沿用。
-typedef struct {
-    const char *version;   // CFBundleShortVersionString
-    uint64_t    offset;    // cbnz 相对 Mach-O 头的偏移
-} MybPatchEntry;
+// 这里不再按版本写死偏移。4.7.49 把这段代码整体后移了一页（0x4000），函数本身
+// 一个字节都没改：只要还按旧偏移读，读到的就是别的指令，核对不上，补丁被跳过。
+// 改成运行时在 __text 里按指令特征定位，代码整体搬家就不需要改插件。
+//
+// 特征由两部分组成，两部分都要求，命中数必须恰好为 1：
+//   函数入口：sub sp,sp,#0x30 / stp x20,x19 / stp x29,x30 / add x29,sp,#0x20
+//   bl <检查> / mov x19,x0
+//   分支与收尾：cbnz w19,+0x14 / ldp x29,x30 / ldp x20,x19 / add sp,sp,#0x30 / ret
+// 只认分支加收尾的话，放宽寄存器后两版各有上百处命中；两段一起要求，两版都只有 1 处。
 
-static const MybPatchEntry kStartupExitPatches[] = {
-    { "4.7.48", 0x3c2ac30ULL },
-};
+static const uint32_t kGuardBranch = 0x350000b3u; // cbnz w19, +0x14
+static const uint32_t kGuardNop    = 0xd503201fu;
 
 // 版本比较：把 "x.y.z" 解析成三段，v >= (maj, min, pat) 返回 1。
 static int versionAtLeast(const char *v, int maj, int min, int pat) {
@@ -939,6 +943,44 @@ static int versionAtLeast(const char *v, int maj, int min, int pat) {
     if (a != maj) return a > maj;
     if (b != min) return b > min;
     return c >= pat;
+}
+
+// 在 __text 里找包装函数末尾的那道分支。返回相对 Mach-O 头的偏移；
+// 没有命中或命中不止一处都返回 0，命中数写进 out_hits 供日志区分。
+static uint64_t scanStartupExitGuard(const struct mach_header_64 *mh, int *out_hits) {
+    if (out_hits) *out_hits = 0;
+    const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(*mh));
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                const struct section_64 *sect = (const struct section_64 *)((const uint8_t *)seg + sizeof(*seg));
+                for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
+                    if (strcmp(sect->sectname, "__text") != 0) continue;
+                    const uint32_t *p = (const uint32_t *)((const uint8_t *)mh + (uintptr_t)sect->offset);
+                    size_t n = (size_t)(sect->size / sizeof(uint32_t));
+                    int hits = 0;
+                    uint64_t found = 0;
+                    for (size_t k = 13; k + 4 < n; k++) {
+                        if (p[k] != kGuardBranch) continue;
+                        if (p[k + 1] != 0xa9427bfdu || p[k + 2] != 0xa9414ff4u ||
+                            p[k + 3] != 0x9100c3ffu || p[k + 4] != 0xd65f03c0u) continue;
+                        // 分支在函数入口之后 0x34 字节；核对入口 5 条，最后一条是 mov x19,x0。
+                        if (p[k - 13] != 0xd100c3ffu || p[k - 12] != 0xa9014ff4u ||
+                            p[k - 11] != 0xa9027bfdu || p[k - 10] != 0x910083fdu ||
+                            p[k - 8]  != 0xaa0003f3u) continue;
+                        hits++;
+                        found = (uint64_t)((const uint8_t *)&p[k] - (const uint8_t *)mh);
+                        if (hits > 1) break;
+                    }
+                    if (out_hits) *out_hits = hits;
+                    return hits == 1 ? found : 0;
+                }
+            }
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return 0;
 }
 
 // 补丁没打上时写一行记录。插件没有别的日志通道，只在异常时留痕，正常启动不写。
@@ -995,26 +1037,32 @@ static int applyStartupExitPatch(void) {
     if (!ver) return -1;
     const char *v = [ver UTF8String];
     if (!v) return -1;
-    // 从新到旧找第一条适用的：要求当前版本 >= 该条目的起始版本。
-    // 起点是 4.7.48，所以 4.7.48 及其后的版本都会按同一个偏移去试；
-    // 试之前会核对那 4 个字节是不是预期的 cbnz，不一致就不动。
-    for (int i = (int)(sizeof(kStartupExitPatches) / sizeof(kStartupExitPatches[0])) - 1; i >= 0; i--) {
-        int maj = 0, min = 0, pat = 0;
-        if (sscanf(kStartupExitPatches[i].version, "%d.%d.%d", &maj, &min, &pat) < 3) continue;
-        if (!versionAtLeast(v, maj, min, pat)) continue;
-        // 0x350000b3 = cbnz w19, +0x14；0xd503201f = nop
-        int rc = (int)patchMainExec(kStartupExitPatches[i].offset, 0x350000b3U, 0xd503201fU);
-        if (rc != 0) {
-            const struct mach_header_64 *mh = findMainExec();
-            uint32_t got = mh ? *(volatile uint32_t *)((uintptr_t)mh + kStartupExitPatches[i].offset) : 0;
-            notePatchFailure(v, rc, got);
-        } else {
-            g_startupExitPatched = 1;
-        }
+
+    const struct mach_header_64 *mh = findMainExec();
+    if (!mh) {
+        notePatchFailure(v, -1, 0);
+        return -1;
+    }
+
+    int hits = 0;
+    uint64_t offset = scanStartupExitGuard(mh, &hits);
+    if (offset == 0) {
+        // 4.7.48 之前本来就不需要这段补丁，找不到属于正常情况，不留记录。
+        if (!versionAtLeast(v, 4, 7, 48)) return 0;
+        // hits == 0：这段代码的形状变了；hits > 1：特征不够独特，不能确定改哪一处。
+        int rc = (hits > 1) ? -3 : -2;
+        notePatchFailure(v, rc, 0);
         return rc;
     }
-    notePatchFailure(v, -2, 0);
-    return -2;   // 版本低于已知起点
+
+    int rc = (int)patchMainExec(offset, kGuardBranch, kGuardNop);
+    if (rc != 0) {
+        uint32_t got = *(volatile uint32_t *)((uintptr_t)mh + offset);
+        notePatchFailure(v, rc, got);
+    } else {
+        g_startupExitPatched = 1;
+    }
+    return rc;
 }
 
 %ctor {
@@ -1029,8 +1077,16 @@ static int applyStartupExitPatch(void) {
         // 这时如果还装着吞掉的钩子，正常关闭 App 会被 watchdog 强杀：UIKit 的
         // _terminateWithStatus: 内部调 exit()，钩子进 runloop 死循环不返回，
         // FrontBoard 等满 5 秒后发 SIGKILL，留下一份 0x8BADF00D。
-        // 所以只在代码补丁没打上（老版本，或者指令与预期不符）时才装这两个。
-        if (!g_startupExitPatched) {
+        //
+        // 补丁没打上时按版本分两种处理：
+        //   4.7.48 之前：检查本身会通过，钩子只在别处兜底，照旧装。
+        //   4.7.48 及之后：启动检查必然调 exit(0)。这时装钩子只会让主线程卡在
+        //   runloop 死循环里，进程既不退出也不继续——用户看到的是启动卡住。
+        //   索性不装：App 会像未越狱时那样立刻退出，配合 mybankbypass.log 里的
+        //   一行记录，问题是能看出来的，而不是挂在那里。
+        NSString *verStr = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        BOOL oldVersion = !versionAtLeast(verStr.UTF8String, 4, 7, 48);
+        if (!g_startupExitPatched && oldVersion) {
             MSHookFunction((void *)exit, (void *)hooked_exit, (void **)&orig_exit);
             MSHookFunction((void *)_exit, (void *)hooked__exit, (void **)&orig__exit);
         }
