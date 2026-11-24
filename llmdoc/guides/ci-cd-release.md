@@ -54,6 +54,7 @@ Release workflow 由 tag push 触发，tag 格式：`<tweak目录名>_<版本号
 ## CI 矩阵与 workflow 配置要点
 
 - **`strategy.fail-fast: false` 是硬性要求**：`build.yml` 对多个 tweak 做矩阵构建，默认 `fail-fast: true` 会让某一个 tweak 失败时直接取消其余所有任务（显示为 "cancelled"，视觉上和"失败"混在一起，无法分辨哪个 tweak 真正出了问题）。必须设为 `false`，让每个 tweak 独立构建、独立报告结果。
+- **不发布的目录放 `NO_CI` 文件跳过矩阵**：`discover` 只收录同时有 `control` 和 `Makefile`、且没有 `NO_CI` 的目录。只读诊断插件（如 `alipaydiag`）虽然需要 Theos 文件才能本地构建，但不该占用 CI 的 macOS 任务，放一个 `NO_CI` 即可；删掉该文件就重新进入矩阵。
 - **新增 GitHub Action 时要核对其自身 Node 运行时版本**，不能只看主版本号升级就认为已跟上最新 runtime。例如 `actions/cache` v4 仍停留在 node20，即使是"新加入"的 action 也可能引入 Node 20 弃用警告。已知需要 node24 的稳定版本：`actions/checkout` v5、`actions/upload-artifact` v6+（v5 仍是 node20）、`softprops/action-gh-release` v3、`actions/cache` v5。
 
 ## Logos 跨平台注意事项

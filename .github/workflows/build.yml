@@ -32,10 +32,12 @@ jobs:
       - name: Find tweak directories
         id: find
         run: |
-          # Find directories containing both Makefile and control (Theos tweaks)
+          # Find directories containing both Makefile and control (Theos tweaks).
+          # A NO_CI file in the directory opts it out of CI builds (one-off
+          # diagnostic tools that are never published).
           TWEAKS=$(find . -maxdepth 2 -name "control" -path "*/control" | while read f; do
             dir=$(dirname "$f")
-            if [ -f "$dir/Makefile" ]; then
+            if [ -f "$dir/Makefile" ] && [ ! -f "$dir/NO_CI" ]; then
               basename "$dir"
             fi
           done | jq -R -s -c 'split("\n") | map(select(. != ""))')
