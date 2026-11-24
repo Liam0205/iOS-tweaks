@@ -131,13 +131,65 @@ function R() {                       // ClientInfo
   但 `getMetaInfo` 的返回里根本没有 `umidToken` 键，页面按 `e.umidToken || ""` 补空。
 - **推论**：空 UMID 是这个接口的固定构造，不是环境异常。假设排除。
 
+## 7. 0.0.6：越狱标记的取值与上传（进行中）
+
+第 6 节的结论被推翻了一半：certify 的 POST 确实不带越狱标记，但**客户端另有通道**。
+静态方法表里可以看到：
+
+| 类 | 相关方法 |
+|---|---|
+| `aluDeviceInfoManager` | `isPrisonBreak`、`setIsPrisonBreak:`、`apdidToken`、`apdidTokenByMode:`、`setApdidTokenCookie:`、`umid`、`utdid`、`tid`、`imei`/`imsi`、`idfa` |
+| `MOBILEAPPGwCommonReq`（MTOP 网关公共请求） | `apdId`、`utdid`、`tid`、`ttid`、`umidToken`、`IMEI`/`IMSI`、`userAgent`、`mobileBrand`/`mobileModel`、`isPrisonBreak` |
+| `ANXRuntimeConfig` | `isPrisonBreak`、`isTrojan` |
+| `ANXBusVerifyServiceModel`、`aluSDK`、`AUGUnifyLoginReq`、`AntUserDefaultDelegate`、`MOBILEAPPCOMMONClientUpgradeReq`、`UnifyRegisterAllReqPb` | 各自的 `isPrisonBreak` / `prisonBreak` |
+
+`isPrisonBreak` / `prisonBreak` 也作为字符串出现在主二进制里，说明它是会被序列化的字段名，
+不是纯内部状态。也就是说：设备是否越狱，客户端会算，并且会随 MTOP 网关请求上传；
+certify 的 POST 只是没带它，服务端仍然可以在同一账号、同一 UDID/APDID 的画像里读到。
+
+另外，`setApdidTokenCookie:` 说明 APDID 也走 Cookie。`fetch(..., credentials:"include")`
+会带上 Cookie，而我们的抓包读的是 `NSURLRequest.allHTTPHeaderFields`，Cookie 通常是
+CFNetwork 在发送前才补的，所以第 4 节的头里看不到它。
+
+- **假设**：`aluDeviceInfoManager isPrisonBreak` 在本机返回 YES，并经
+  `MOBILEAPPGwCommonReq setIsPrisonBreak:` 进入发往服务端的请求；certify 那一步只是
+  没重复携带，服务端早已从别的请求里知道这台设备越狱。
+- **验证**：0.0.6 先按类型编码校验再挂钩（`c@:`/`B@:` 才挂 getter，`v@:c`/`v@:B` 才挂
+  setter，其余只打印编码不挂），记录 `aluDeviceInfoManager`、`MOBILEAPPGwCommonReq`、
+  `ANXRuntimeConfig` 等类的取值与赋值时机，并记录 `setApdidTokenCookie:` 的参数。
+- **观察（0.0.6，只看类型编码）**：实际编码带偏移，不是字面的 `B@:`：
+  `aluDeviceInfoManager isPrisonBreak` = `B16@0:8`（BOOL），`setIsPrisonBreak:` = `v20@0:8B16`；
+  `MOBILEAPPGwCommonReq isPrisonBreak` = `@16@0:8`（**NSNumber 对象**），`setIsPrisonBreak:` = `v24@0:8@16`；
+  `ANXRuntimeConfig isPrisonBreak`/`isTrojan` 同样是 `@`；`aluSDK`、`AntUserDefaultDelegate`
+  的是 `B`；`ANXBusVerifyServiceModel`、`AUGUnifyLoginReq` 的是 `@`。
+  0.0.6 的比较写成了字面量，全部没挂上，只有编码打印——这一轮等于没测到值。
+- **0.0.7**：改用 `method_copyReturnType` / `method_copyArgumentType` 判断，`B`/`c` 与 `@`
+  两种形态分别挂钩，重新测取值与时机。
+- **观察（0.0.7）**：`setApdidTokenCookie:` 命中 9 次，参数始终是同一个 APDID token
+  （`JLI/VU4a…AAA==`），说明 APDID 会以 Cookie 形式随请求发出。但
+  `aluDeviceInfoManager.isPrisonBreak` / `setIsPrisonBreak:`、
+  `MOBILEAPPGwCommonReq.isPrisonBreak` / `setIsPrisonBreak:`、`ANXRuntimeConfig` 的
+  `isPrisonBreak`/`isTrojan`，以及 `ANXBusVerifyServiceModel`、`aluSDK`、`AUGUnifyLoginReq`、
+  `AntUserDefaultDelegate` 的 `isPrisonBreak`，**全部零调用**。
+- **推论**：在「已登录、直接走核身」这段稳态里，客户端没有读取或写入 `isPrisonBreak`。
+  携带该字段的类集中在登录与风控通道（`aluSDK loginAsync:`、`AUGUnifyLoginReq`、
+  `ANXRuntimeConfig`），这些路径本次没有走。MTOP 网关请求模型上的 getter 零调用还不足以
+  证明字段没被发送（protobuf 序列化可能直接读成员），但 setter 也没被调用，说明本次会话
+  里这个字段根本没有被赋值。
+- **另一个关键观察**：`module/query` 与 `module/auth` 的请求体里 `clientInfo` **逐字段相同**
+  （同一个 apdidToken、同一份 bioInfo）。query 被服务端正常处理（返回业务错误
+  `OPEN_CERTIFY_NEED_AUTHORIZE`），auth 才返回 `DEVICE_NOT_SUPPORT`。所以这个判定不是
+  这几个客户端字段的纯函数，order 状态或账号/设备的历史状态参与了判断。
+
 ## 结论与仍未解决的问题
 
 已确认：
 
 1. 刷脸失败发生在 `POST /certify/open/module/auth` 这一步，服务端返回 `DEVICE_NOT_SUPPORT`；
    `module/query` 是成功的，订单和商户信息都正常。
-2. 客户端在这一步交给服务端的设备信息是完整可枚举的（见第 4 节），其中没有任何越狱标记。
+2. 客户端在 `module/auth` 这一条请求里交给服务端的设备信息是完整可枚举的（见第 4 节），
+   其中没有任何越狱标记；但客户端另有通道（MTOP 网关公共请求）携带 `isPrisonBreak`，
+   见第 7 节。
 3. 这条链路上，本地 SecurityGuard / DTCTUInfo / ZOLOZ / Toyger / Tecla 越狱判定入口
    都没有被调用；ZOLOZ 从未启动。
 

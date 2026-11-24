@@ -1,6 +1,6 @@
 Package: page.0x01.alipaydiag
 Name: AlipayDiag-刷脸诊断-rootless
-Version: 0.0.5
+Version: 0.0.7
 Architecture: iphoneos-arm64
 Description: 只读诊断插件。记录 SecurityGuard 越狱/模拟器检测、UT 设备信息里的越狱标记、x-sign/WUA 生成，以及 ZOLOZ 刷脸入口的调用情况，写入支付宝 Documents/alipaydiag.log。
 Maintainer: Liam

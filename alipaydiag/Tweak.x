@@ -273,6 +273,100 @@ static void scanJailbreak(NSData *body, NSString *where) {
 }
 %end
 
+#pragma mark - 越狱标记的取值与落点（先校验类型编码再挂钩）
+
+static void jbHookGetter(Class cls, const char *name) {
+    if (!cls) {
+        dlog(@"JB 缺类：%s", name);
+        return;
+    }
+    SEL sel = sel_registerName(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        dlog(@"JB 无方法：%s", name);
+        return;
+    }
+    char *rt = method_copyReturnType(m);
+    dlog(@"JB 类型 %s = %s", name, method_getTypeEncoding(m));
+    if (!rt) {
+        return;
+    }
+    IMP orig = method_getImplementation(m);
+    if (rt[0] == 'B' || rt[0] == 'c') {
+        IMP repl = imp_implementationWithBlock(^BOOL(id self) {
+            BOOL r = ((BOOL (*)(id, SEL))orig)(self, sel);
+            dlog(@"JB %s -> %d", name, (int)r);
+            return r;
+        });
+        MSHookMessageEx(cls, sel, repl, NULL);
+    } else if (rt[0] == '@') {
+        IMP repl = imp_implementationWithBlock(^id(id self) {
+            id r = ((id (*)(id, SEL))orig)(self, sel);
+            dlog(@"JB %s -> %@", name, jdump(r));
+            return r;
+        });
+        MSHookMessageEx(cls, sel, repl, NULL);
+    }
+    free(rt);
+}
+
+static void jbHookSetter(Class cls, const char *name) {
+    if (!cls) {
+        return;
+    }
+    SEL sel = sel_registerName(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        dlog(@"JB 无方法：%s", name);
+        return;
+    }
+    char *at = method_copyArgumentType(m, 2);
+    dlog(@"JB 类型 %s = %s", name, method_getTypeEncoding(m));
+    if (!at) {
+        return;
+    }
+    IMP orig = method_getImplementation(m);
+    if (at[0] == 'B' || at[0] == 'c') {
+        IMP repl = imp_implementationWithBlock(^(id self, BOOL v) {
+            dlog(@"JB %s(%d)", name, (int)v);
+            ((void (*)(id, SEL, BOOL))orig)(self, sel, v);
+        });
+        MSHookMessageEx(cls, sel, repl, NULL);
+    } else if (at[0] == '@') {
+        IMP repl = imp_implementationWithBlock(^(id self, id v) {
+            dlog(@"JB %s(%@)", name, jdump(v));
+            ((void (*)(id, SEL, id))orig)(self, sel, v);
+        });
+        MSHookMessageEx(cls, sel, repl, NULL);
+    }
+    free(at);
+}
+
+static void jbHookObjArg(Class cls, const char *name) {
+    if (!cls) {
+        return;
+    }
+    SEL sel = sel_registerName(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        dlog(@"JB 无方法：%s", name);
+        return;
+    }
+    char *at = method_copyArgumentType(m, 2);
+    dlog(@"JB 类型 %s = %s", name, method_getTypeEncoding(m));
+    if (!at || at[0] != '@') {
+        free(at);
+        return;
+    }
+    free(at);
+    IMP orig = method_getImplementation(m);
+    IMP repl = imp_implementationWithBlock(^(id self, id arg) {
+        dlog(@"JB %s(%@)", name, jdump(arg));
+        ((void (*)(id, SEL, id))orig)(self, sel, arg);
+    });
+    MSHookMessageEx(cls, sel, repl, NULL);
+}
+
 #pragma mark - 刷脸链路入口
 
 %hook ZolozIdentityManager
@@ -317,9 +411,30 @@ static void scanJailbreak(NSData *body, NSString *where) {
         @"DTCTUInfo", @"TBSDKSecurity", @"ZolozIdentityManager", @"ZolozBiometricCPServiceImpl",
         @"BioAuthFacade", @"APBToygerFacade", @"AlipayVIAdapter", @"TeclaZimIdentityAbilityImpl",
         @"ZimJSApiHandler", @"ZimJSApiAdapter", @"TeclaDeviceInfoAbilityImpl",
-        @"SSAuthServiceImpl", @"RVPBridgeExtension4Jailbroken", @"AccountAuthFrameworkServiceImp", @"NativeUmidTokenProvider"
+        @"SSAuthServiceImpl", @"RVPBridgeExtension4Jailbroken", @"AccountAuthFrameworkServiceImp", @"NativeUmidTokenProvider",
+        @"aluDeviceInfoManager", @"MOBILEAPPGwCommonReq", @"ANXRuntimeConfig",
+        @"ANXBusVerifyServiceModel", @"aluSDK", @"AUGUnifyLoginReq", @"AntUserDefaultDelegate"
     ];
     for (NSString *n in names) {
         dlog(@"class %@ = %p", n, NSClassFromString(n));
     }
+
+    Class alu = NSClassFromString(@"aluDeviceInfoManager");
+    jbHookGetter(alu, "isPrisonBreak");
+    jbHookSetter(alu, "setIsPrisonBreak:");
+    jbHookObjArg(alu, "setApdidTokenCookie:");
+
+    Class gw = NSClassFromString(@"MOBILEAPPGwCommonReq");
+    jbHookGetter(gw, "isPrisonBreak");
+    jbHookSetter(gw, "setIsPrisonBreak:");
+
+    Class anx = NSClassFromString(@"ANXRuntimeConfig");
+    jbHookGetter(anx, "isPrisonBreak");
+    jbHookSetter(anx, "setIsPrisonBreak:");
+    jbHookGetter(anx, "isTrojan");
+
+    jbHookGetter(NSClassFromString(@"ANXBusVerifyServiceModel"), "isPrisonBreak");
+    jbHookGetter(NSClassFromString(@"aluSDK"), "isPrisonBreak");
+    jbHookGetter(NSClassFromString(@"AUGUnifyLoginReq"), "isPrisonBreak");
+    jbHookGetter(NSClassFromString(@"AntUserDefaultDelegate"), "isPrisonBreak");
 }
