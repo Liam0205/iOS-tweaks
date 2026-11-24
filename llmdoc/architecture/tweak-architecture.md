@@ -191,6 +191,10 @@ App 可能通过 dyld 枚举或 `dladdr` 识别注入环境。当前架构使用
 - `4.7.48` 之前：本来就不需要这段补丁，照旧安装钩子，不写日志。
 - `4.7.48` 及之后：检查必然调 `exit(0)`，装了钩子只会让主线程卡在死循环里。索性不装，让 App 像未越狱时那样直接退出，并在 `mybankbypass.log` 写一行 `rc=-2`（形状变了）或 `rc=-3`（命中多处）。退出是能看懂的失败，卡死不是。
 
+**启动检查的判定来源**（1.2.6 起查清）。包装函数调用的检查函数会先读远程配置 `ma_jbcheck_use_new`（通过混淆类 `kerXbsLCpwutSJRB` 的 `jijAqkNCsUONJSwu:`），再分发到 `_MASecurityUtilImpl` 或 `_APSecurityUtilImpl` 的 `+shared` 返回的函数指针。新实现把一段异或加密的 Base64 解成路径数组（设备上是 `["/bin/ssh","/private/var/jb/usr/bin/ssh"]`），对每条路径做 `fileExistsAtPath:` 加 `unlink`，按返回值和 `errno` 累计；只要某条路径存在且 `unlink` 的 `errno` 不是 `ENOENT`，就判失败。
+
+对应的修法是：路径表补 `/private/var/jb` 前缀，并新增 `unlink` / `unlinkat` / `remove` 钩子对越狱路径返回 `ENOENT`。只藏文件不够——`unlink` 以 `EACCES` 失败时检查同样算异常。补上这两点后 4.7.49 上检查返回 0，代码补丁不再是启动的必要条件；补丁仍保留，因为远程配置可以追加新路径或新检查。
+
 两条施工约束（踩过才知道）：
 
 - **定位主程序不能用 `_dyld_get_image_header(0)`**。注入后索引 0 不是主程序，`base + 偏移` 落进未映射空洞，读取即 `SIGSEGV`。用 `[[NSBundle mainBundle] executablePath]` 与镜像路径比对。

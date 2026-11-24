@@ -77,6 +77,7 @@ static const char *jb_paths[] = {
     "/usr/bin/zorrodaemon.dylib",
     "/var/jb/usr/sbin/frida-server",
     "/bin/ssh",
+    "/private/var/jb",
     NULL
 };
 
@@ -231,6 +232,29 @@ static int (*orig_access)(const char *path, int mode);
 static int hooked_access(const char *path, int mode) {
     if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
+}
+
+// 4.7.48 起的启动检查会对它自己的路径列表逐个做「存在性检查 + unlink」：
+// 先 fileExistsAtPath:，再 unlink。只要 unlink 的 errno 不是 ENOENT，它就把
+// 这个条目记成异常（EACCES 之类都算），整轮累计非零就判失败。
+// 所以光把文件藏起来不够，删除动作本身也要装作「这个文件不存在」。
+// 顺带这也挡住了它在有权限时真的删掉 /var/jb 下文件。
+static int (*orig_unlink)(const char *path);
+static int hooked_unlink(const char *path) {
+    if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
+    return orig_unlink(path);
+}
+
+static int (*orig_unlinkat)(int dirfd, const char *path, int flags);
+static int hooked_unlinkat(int dirfd, const char *path, int flags) {
+    if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
+    return orig_unlinkat(dirfd, path, flags);
+}
+
+static int (*orig_remove)(const char *path);
+static int hooked_remove(const char *path) {
+    if (is_jb_path_c(path)) { errno = ENOENT; return -1; }
+    return orig_remove(path);
 }
 
 static int (*orig_open)(const char *path, int flags, ...);
@@ -1098,6 +1122,9 @@ static int applyStartupExitPatch(void) {
         MSHookFunction((void *)stat, (void *)hooked_stat, (void **)&orig_stat);
         MSHookFunction((void *)lstat, (void *)hooked_lstat, (void **)&orig_lstat);
         MSHookFunction((void *)access, (void *)hooked_access, (void **)&orig_access);
+        MSHookFunction((void *)unlink, (void *)hooked_unlink, (void **)&orig_unlink);
+        MSHookFunction((void *)unlinkat, (void *)hooked_unlinkat, (void **)&orig_unlinkat);
+        MSHookFunction((void *)remove, (void *)hooked_remove, (void **)&orig_remove);
         MSHookFunction((void *)open, (void *)hooked_open, (void **)&orig_open);
         MSHookFunction((void *)fopen, (void *)hooked_fopen, (void **)&orig_fopen);
         MSHookFunction((void *)realpath, (void *)hooked_realpath, (void **)&orig_realpath);

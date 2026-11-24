@@ -305,3 +305,82 @@ startup-exit patch skipped: version=4.7.49 rc=1 instr=0xaa1d03fd
 
 插件现在 hook 的是 `MASecurityUtil`（无下划线），检查走的却是带下划线的实现类。
 如果判定是从后者漏出来的，改掉它的返回值就能完全不要代码补丁。这条还没开始查。
+
+---
+
+## 4.7.48 起的新检查：路径存在性 + unlink
+
+### 怎么找到的
+
+启动检查的包装函数调用一个本地检查函数，后者先问远程配置：
+
+```
+[kerXbsLCpwutSJRB sharedInstance] jijAqkNCsUONJSwu:@"ma_jbcheck_use_new"
+    → 与 @"true" 比较
+    → 真：调 _MASecurityUtilImpl +shared 返回结构体里 +8 处的函数
+    → 假：调 _APSecurityUtilImpl +shared 返回结构体里 +0x28 处的函数
+```
+
+两个实现类的 `+shared` 返回的都是运行时才填的全局结构体（落在 `__bss`，文件里是零），
+所以静态看不出来。用一个临时诊断构建在设备上读出来：
+
+- `_MASecurityUtilImpl` 的结构体前两项是代码指针，被调用的那个在 `+0x2077634`
+- `_APSecurityUtilImpl` 的结构体是十几项函数指针，被调用的那个在 `+0x10d6298`
+
+设备上 `ma_jbcheck_use_new` 返回 `"true"`，走的是 `_MASecurityUtilImpl` 那条。
+
+### 检查函数在做什么
+
+反汇编 `+0x2077634`，前段先解密一段字节：
+
+```
+0x1083a87da 起 0x38 字节，逐字节异或 0x67
+→ 'WyIvYmluL3NzaCIsIi9wcml2YXRlL3Zhci9qYi91c3IvYmluL3NzaCJd'
+```
+
+这是 Base64，解出来是：
+
+```json
+["/bin/ssh","/private/var/jb/usr/bin/ssh"]
+```
+
+后面的循环对每个路径：
+
+1. `[[NSFileManager defaultManager] fileExistsAtPath:path]` → 记下是否存在
+2. `unlink(path)` → 记下返回值和 `errno`
+3. 按 `errno` 是不是 `EACCES`(13)、`EROFS`(30)、`ENOENT`(2) 组合出一个值
+4. 累加到总和
+
+循环结束后 `总和 == 0` 才继续，否则返回 1。也就是说：**只要有一条路径存在，
+并且删除时 `errno` 不是 `ENOENT`，检查就判失败**。
+
+注意它不只是检查，还会真的删除。设备上 `/private/var/jb/usr/bin/ssh` 属于 root，
+App 删不掉，`unlink` 返回 `EACCES`，于是累计非零——这就是 4.7.48 起判定失败的来源。
+
+### 为什么只藏文件不够
+
+原来的路径表里有 `/var/jb`，没有 `/private/var/jb`。设备上检查用的是
+`/private/var` 这种写法，前缀匹配不上；即使补上前缀让 `fileExistsAtPath:` 返回 NO，
+`unlink` 仍然以 `EACCES` 失败，检查照样判非零。必须连删除动作一起假装文件不存在。
+
+### 修法（1.2.6）
+
+- 路径表补上 `/private/var/jb` 前缀
+- 新增 `unlink` / `unlinkat` / `remove` 钩子，对越狱路径返回 `-1` 且 `errno = ENOENT`
+- 扫描定位的代码补丁保留，作为远程配置追加新路径或新检查时的兜底
+
+### 验证
+
+诊断构建里 hook 了检查函数本身，只记录返回值、不改变行为：
+
+| 配置 | 检查返回值 |
+|---|---|
+| 1.2.5（无 `/private/var/jb`，无 unlink 钩子） | 1 |
+| 补上 `/private/var/jb` | 1 |
+| 再补 unlink/unlinkat 钩子 | 0 |
+| 同上，并**去掉**代码补丁 | 0，App 正常启动、主界面可用 |
+
+最后一行说明语义绕过已经足够，代码补丁不再是启动的必要条件。实际发布的 1.2.6
+仍然保留补丁：远程下发的路径表可以变，补丁是不依赖具体路径的兜底。
+
+副产物：`/private/var/jb/usr/bin/ssh` 在验证前后都存在，说明 App 没有删成。
