@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.1",
+  "headerImage": "",
+  "tintColor": "#2196F3",
+  "tabs": [
+    {
+      "tabname": "详情",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\u7ed5\u8fc7\u4e2d\u56fd\u519c\u4e1a\u94f6\u884c\u7684\u8d8a\u72f1\u73af\u5883\u68c0\u6d4b\uff0c\u4f7f\u5176\u5728\u8d8a\u72f1\u8bbe\u5907\u4e0a\u6b63\u5e38\u8fd0\u884c\u3002\u5728\u519c\u4e1a\u94f6\u884c 11.1.0 \u7248\u672c\u9a8c\u8bc1\u53ef\u7528\uff0c\u9002\u7528\u4e8e rootless \u8d8a\u72f1\uff08Dopamine \u7b49\uff09\u3002"}],
+      "class": "DepictionStackView"
+    },
+    {
+      "tabname": "更新日志",
+      "views": [{"class": "DepictionMarkdownView", "markdown": "\n## 1.0.1\n\n- \u8865\u5145\u9a8c\u8bc1\u4fe1\u606f\uff1a\u5728\u519c\u4e1a\u94f6\u884c 11.1.0 \u7248\u672c\u9a8c\u8bc1\u53ef\u7528\n\n## 1.0.0\n\n- \u5b8c\u5168\u7ed5\u8fc7\u4e2d\u56fd\u519c\u4e1a\u94f6\u884c\u7684\u8d8a\u72f1\u68c0\u6d4b\u4e0e\u68c0\u6d4b\u540e exit \u6740\u8fdb\u7a0b\u94fe\u8def\n- \u6838\u5fc3\u65b9\u6848\uff1aswizzle `-[DTFrameworkInterface initRiskManage]` \u4ece\u6e90\u5934\u6d88\u9664\u68c0\u6d4b\u9000\u51fa\uff0c\u7eaf ObjC swizzle \u4e0d\u89e6\u53d1\u5b8c\u6574\u6027\u81ea\u68c0\n- \u4e2d\u548c SecureUtilityPlus / SmAntiFraud / IOSSecuritySuite \u53ca\u519c\u884c\u4e13\u6709\u8d8a\u72f1\u68c0\u6d4b\u65b9\u6cd5\n- \u9690\u85cf\u8d8a\u72f1\u6587\u4ef6\u8def\u5f84\u3001\u5c4f\u853d\u8d8a\u72f1 App URL scheme\u3001\u6291\u5236\u8d8a\u72f1\u5f39\u7a97\u3001\u6e05\u7406\u6ce8\u5165\u73af\u5883\u53d8\u91cf\n- \u5df2\u9a8c\u8bc1\uff1a\u519c\u884c 11.1.0 / iPhone 13 Pro / iOS 15.4.1\uff0c\u519c\u884c 11.2.0 / iPhone 14 Pro Max / iOS 16.3.1\uff0c\u5747\u8fdb\u5165\u9996\u9875\u4e14\u4ea4\u4e92\u6b63\u5e38"}],
+      "class": "DepictionStackView"
+    }
+  ],
+  "class": "DepictionTabView"
+}

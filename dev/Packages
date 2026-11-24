@@ -1,0 +1,33 @@
+Package: page.0x01.icbcbypass
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Maintainer: Liam
+Installed-Size: 108
+Depends: mobilesubstrate (>= 0.9.5000)
+Filename: debs/page.0x01.icbcbypass_1.0.0_iphoneos-arm64.deb
+Size: 14116
+MD5sum: b37beee14d73d4856acc39513b9f9d56
+SHA1: 219a16443c62e03cb88ced3c4f85a17779640b6a
+SHA256: b7a9cda04ab206c2c82be9e0c34abdeee02530d0736a784bd179dea98a151f00
+Section: 反检测
+Description: 绕过中国工商银行的越狱环境检测，使其在越狱设备上正常运行。适用于 rootless 越狱（Dopamine 等）。
+Author: Liam
+Name: ICBCBypass-工商银行反检测-rootless
+Sileodepiction: https://tweaks.0x01.page/depictions/page.0x01.icbcbypass.json
+
+Package: page.0x01.sshtunnel
+Version: 1.3.1-2+debug
+Architecture: iphoneos-arm64
+Maintainer: Liam
+Installed-Size: 412
+Depends: openssh-client, sshpass, grep
+Recommends: autossh
+Filename: debs/page.0x01.sshtunnel_1.3.1-2+debug_iphoneos-arm64.deb
+Size: 63290
+MD5sum: 60f689690b5c875322dc2269446f670b
+SHA1: d5db3015982a59c05a86f94f4a1216def4e23e51
+SHA256: 03a2c0c32507bd6e694701fd85b64002ada89c95efe58c9922fd9ad7bbe65d32
+Section: Utilities
+Description: SSH reverse tunnel manager. Establishes a reverse SSH tunnel from this device to a remote server, enabling remote access to the device. Supports autossh for automatic reconnection.
+Author: Liam
+Name: SSHTunnel
