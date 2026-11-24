@@ -204,7 +204,7 @@
 
 客户端确实有越狱标记通道：`aluDeviceInfoManager.isPrisonBreak`（BOOL）、`MOBILEAPPGwCommonReq.isPrisonBreak`（NSNumber）、`ANXRuntimeConfig` 的 `isPrisonBreak`/`isTrojan`，以及 `aluSDK`、`AUGUnifyLoginReq`、`ANXBusVerifyServiceModel`、`AntUserDefaultDelegate`、`MOBILEAPPCOMMONClientUpgradeReq`、`UnifyRegisterAllReqPb`。但 0.0.7 实测这些读写本次会话**全部零调用**；0.0.8 的 `NSURLSession` 出站摘要里只有一条 `mobilegw.alipay.com/mgw.htm`，不含设备字段，四条核身请求也没有 Cookie（`setApdidTokenCookie:` 被调 7 次但没上到这些请求）。`module/query` 与 `module/auth` 的 `clientInfo` 逐字段相同，前者被正常处理、后者被拒绝，说明判定不是这几个字段的纯函数。
 
-**可能的补法（未实施）**：先做「换一个刷脸入口」的对照，区分设备级与订单级；再由 `bioMetaInfo` 第二个字段 `32774` 的生成处入手，确认它是不是能力位掩码。若要覆盖原生 RPC 传输层，得挂支付宝自己的 HTTP 客户端，而不是 `NSURLSession`。同一账号在未越狱设备上走同一入口仍是最终对照，但需要第二台设备。
+**可能的补法（未实施）**：「换一个刷脸入口」的对照在 12.12.56 上做不了——生物识别、生物支付、实名认证、安全中心等处都唤不起人脸认证，入口已收敛到 open-certify 这一条 H5 链路。剩下能验证的是登录链路：退出登录重登一次，看 `aluSDK` / `AUGUnifyLoginReq` 是否把 `isPrisonBreak` 置 1 并发出去（会动账号状态，需用户同意）。另外可以从 `bioMetaInfo` 第二个字段 `32774` 的生成处确认它是不是能力位掩码。要覆盖原生 RPC 传输层，得挂支付宝自己的 HTTP 客户端，而不是 `NSURLSession`。同一账号在未越狱设备上走同一入口仍是最终对照，但需要第二台设备。
 
 **详见**：`alipaydiag/analysis.md`、`llmdoc/reference/alipaydiag-detection-vectors.md`。
 
